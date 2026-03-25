@@ -5251,6 +5251,626 @@ log.Error("get index result fail", zap.Error(err))
 
 ---
 
+## 10. Core Libraries & Utilities
+
+This section documents the foundational library modules that support the core application components.
+
+---
+
+### 10.1 lib/record (Core Data Structure)
+
+**Directory:** `lib/record/`
+
+**Architecture Responsibility:** Provides the fundamental `Record` type for representing time-series data chunks with column-oriented storage, schema definitions, and pooling.
+
+#### 10.1.1 Core Structures
+
+| Structure | Lines | Purpose |
+|-----------|-------|---------|
+| `Record` | 1552 | Primary time-series data container with schema and column values |
+| `ColVal` | 668 | Individual column values with bitmap for null tracking |
+| `Field` | 112 | Schema definition for a column (name + type) |
+| `RecMeta` | 195 | Record metadata (interval index, times, pre-agg info) |
+| `ColMeta` | 195 | Column metadata for pre-aggregation (min, max, first, last, sum, count) |
+
+#### 10.1.2 Record Type
+
+```go
+type Record struct {
+    ColVals []ColVal   // Column values
+    Schema  Schemas    // Column schema
+    RecMeta *RecMeta   // Record metadata
+}
+```
+
+**Supported Field Types:**
+- `Field_Type_Int` - Integer
+- `Field_Type_Float` - Float64
+- `Field_Type_String` - String
+- `Field_Type_Boolean` - Boolean
+- `Field_Type_Tag` - Tag (stored as string)
+
+#### 10.1.3 Record Pool System
+
+```go
+// Object pooling for different record types
+IntervalRecordPool, FileCursorPool, AggPool, TsmMergePool, SeriesPool
+```
+
+#### 10.1.4 Key Files
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `record.go` | 1552 | Core Record struct |
+| `column.go` | 668 | ColVal with bitmap operations |
+| `record_sort.go` | 408 | Sorting algorithms |
+| `column_util.go` | 364 | Column utilities |
+| `record_trans.go` | 318 | Transformation operations |
+
+---
+
+### 10.2 lib/metaclient (Meta Client RPC)
+
+**Directory:** `lib/metaclient/`
+
+**Architecture Responsibility:** RPC client for communicating with ts-meta cluster. Handles all cluster metadata operations including databases, retention policies, users, shards, and node coordination.
+
+#### 10.2.1 Client Architecture
+
+```go
+type MetaClient interface {
+    MetadataManager
+    DatabaseManager
+    NodeManager
+    ShardManager
+    UserManager
+    SystemManager
+    SubscriptionManager
+    ContinuousQueryManager
+    DownSampleManager
+    MeasurementManager
+    StreamManager
+}
+```
+
+#### 10.2.2 Authentication
+
+```go
+type UserAuthCache struct {
+    AuthCache       // TTL-based credential cache
+    Role            // Enum: SQL, STORE, META
+}
+// Password: PBKDF2 with multiple algorithm versions (ver01, ver02, ver03)
+```
+
+#### 10.2.3 Command Types
+
+40+ command types via `applyFunc` map:
+- Database: Create, Drop, MarkDelete
+- Retention Policy: Create, Drop, Update, SetDefault
+- Shard: CreateShardGroup, DeleteShardGroup, ReSharding
+- User: CreateUser, DropUser, UpdateUser, SetPrivilege
+- Node: CreateMetaNode, CreateDataNode, CreateSqlNode
+
+#### 10.2.4 Key Files
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `meta_client_impl.go` | 4179 | Main client implementation |
+| `meta_callback.go` | 521 | RPC callback handlers |
+| `auth.go` | 419 | Authentication & password |
+| `metaclient_cq.go` | 147 | Continuous query support |
+
+---
+
+### 10.3 lib/netstorage (Network Storage Interface)
+
+**Directory:** `lib/netstorage/`
+
+**Architecture Responsibility:** Network interface for SQL-Store communication. Provides `Storage` interface for DDL operations, data writes, and queries across the cluster.
+
+#### 10.3.1 Storage Interface
+
+```go
+type Storage interface {
+    WriteRows(ctx *WriteContext, nodeID uint64, pt uint32, ...) error
+    DropShard(nodeID uint64, database, rpName string, ...) error
+    
+    TagValues(nodeID uint64, db string, ptIDs []uint32, ...) (influxql.TablesTagSets, error)
+    ShowTagKeys(nodeID uint64, db string, ptId []uint32, ...) ([]string, error)
+    ShowSeries(nodeID uint64, db string, ptId []uint32, ...) ([]string, error)
+    DropSeries(nodeID uint64, db string, ptId []uint32, ...) error
+    
+    MigratePt(nodeID uint64, data transport.Codec, cb transport.Callback) error
+    TransferLeadership(database string, nodeId uint64, ...) error
+}
+```
+
+#### 10.3.2 Integration Points
+
+- **MetaClient**: Uses `meta.MetaClient` for ShardOwner lookup
+- **Spdy**: Uses SPDY transport for network communication
+- **Record**: MarshalRows converts records to wire format
+
+---
+
+### 10.4 lib/config (Configuration System)
+
+**Directory:** `lib/config/`
+
+**Architecture Responsibility:** TOML-based configuration for all openGemini binaries with validation and environment variable overrides.
+
+#### 10.4.1 Binary-Specific Configurations
+
+| Binary | Structure | Key Components |
+|--------|-----------|----------------|
+| TS-SQL | `TSSql` | HTTP, Coordinator, Meta, Data, Sherlock, Limits |
+| TS-Store | `TSStore` | Data, Index, Retention, HierarchicalStore, Stream |
+| TS-Meta | `TSMeta` | Meta, Data, Logging, Gossip, Spdy |
+
+#### 10.4.2 Key Config Structures
+
+```go
+type Meta struct {
+    RetentionAutoCreate bool
+    HTTPBindAddress     string
+    RPCBindAddress      string
+    RaftBindAddress     string
+    DefaultNumOfShards  int
+    DefaultPtNumPerNode int
+    DefaultHaPolicy     string
+}
+
+type Store struct {
+    Merge       MergeConfig
+    MemTable    MemTableConfig
+    Wal         WalConfig
+    ReadCache   ReadCacheConfig
+    Consume     ConsumeConfig
+    Fence       FenceConfig
+}
+
+type Coordinator struct {
+    WriteTimeout         toml.Duration
+    MaxConcurrentQueries int
+    QueryTimeout         toml.Duration
+    ShardWriterTimeout   toml.Duration
+}
+```
+
+#### 10.4.3 Key Files
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `store.go` | 609 | TSStore configuration |
+| `sql.go` | 331 | TSSql and Coordinator |
+| `meta.go` | 366 | TSMeta and Meta structs |
+| `spdy.go` | 215 | SPDY transport config |
+| `sherlock.go` | 152 | Sherlock self-monitoring |
+
+---
+
+### 10.5 lib/fileops (File Operations)
+
+**Directory:** `lib/fileops/`
+
+**Architecture Responsibility:** Virtual file system (VFS) abstraction supporting local filesystem and Huawei Cloud OBS.
+
+#### 10.5.1 Core Interface
+
+```go
+type VFS interface {
+    Open(name string) (File, error)
+    Create(name string) (File, error)
+    List(dir string) ([]string, error)
+    Remove(name string) error
+    Rename(old, new string) error
+    // 30+ methods for file/directory operations
+}
+
+type File interface {
+    io.Closer, io.Reader, io.Seeker, io.Writer, io.ReaderAt
+    Sync() error
+    Stat() (os.FileInfo, error)
+    Truncate(size int64) error
+}
+```
+
+#### 10.5.2 Storage Backends
+
+| Type | Constant | Description |
+|------|----------|-------------|
+| Local | `Local = 1` | Local filesystem (default) |
+| OBS | `Obs = 2` | Huawei Cloud Object Storage |
+| HDFS | `Hdfs = 3` | Planned |
+
+#### 10.5.3 OBS Integration
+
+```go
+type obsFs struct {
+    client *obsClient
+    bucket string
+}
+// Supports multipart range reads via StreamFS protocol
+```
+
+#### 10.5.4 Key Files
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `file_ops.go` | 630 | Core VFS interface |
+| `obs_fs.go` | 911 | OBS filesystem implementation |
+| `os_fs.go` | 353 | Local filesystem implementation |
+
+---
+
+### 10.6 lib/bufferpool (Memory Buffer Pooling)
+
+**Directory:** `lib/bufferpool/`
+
+**Architecture Responsibility:** Efficient byte buffer pooling to reduce GC pressure.
+
+#### 10.6.1 Pool Structure
+
+```go
+type Pool struct {
+    defaultSize    int
+    bytebufferpool.Pool
+    localCache     chan *bytes.Buffer
+}
+// maxDefaultSize = 1MB, minDefaultSize = 64 bytes
+```
+
+#### 10.6.2 Get/Put Mechanics
+
+```
+Get() → localCache → bytebufferpool.Pool → allocate
+Put() → if > 32MB → shared pool, else → localCache
+```
+
+---
+
+### 10.7 lib/bloomfilter (Bloom Filter)
+
+**Directory:** `lib/bloomfilter/`
+
+**Architecture Responsibility:** Probabilistic data structure for fast set membership testing.
+
+#### 10.7.1 Versions
+
+| Version | Hash Distribution | Entries |
+|---------|-------------------|---------|
+| V0 | `tableLow/tableHigh` (256 entries) | Legacy |
+| V2 | `tableV2` (496 entries) | Current |
+| V3 | `tableV3` (512 entries) | Latest |
+
+#### 10.7.2 Key Files
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `bloomfilter.go` | 209 | All bloom filter implementations |
+
+---
+
+### 10.8 lib/compress (Compression)
+
+**Directory:** `lib/compress/`
+
+**Architecture Responsibility:** Multiple compression algorithms for time-series data with adaptive selection.
+
+#### 10.8.1 Float Compression Algorithms
+
+| Algorithm | Code | Description |
+|-----------|------|-------------|
+| Null | 0 | No compression |
+| OldGorilla | 1 | Legacy |
+| Snappy | 2 | Snappy |
+| Gorilla | 3 | Standard gorilla |
+| Same | 4 | RLE same value |
+| RLE | 5 | Run-length encoding |
+| MLF | 6 | Multi-Level Format |
+
+#### 10.8.2 Adaptive Selection
+
+```
+1. If valueCount ≤ 4 → No compression
+2. If all same → RLE Same
+3. If distinctCount ≤ 8 → RLE
+4. If MLF enabled → MLF
+5. Else → Gorilla
+6. If compressed > 90% original → revert to null
+```
+
+#### 10.8.3 Key Files
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `compress.go` | 187 | RLE, Snappy, Gorilla |
+| `float.go` | 269 | Adaptive float with MLF |
+| `mlf/compressor.go` | 314 | MLF compression |
+
+---
+
+### 10.9 lib/encoding (Data Encoding)
+
+**Directory:** `lib/encoding/`
+
+**Architecture Responsibility:** Type-specific encoding/decoding for time-series blocks.
+
+#### 10.9.1 Block Types
+
+| Type | Code | Description |
+|------|------|-------------|
+| Float64 | 1 | 64-bit float |
+| Integer | 2 | 64-bit integer |
+| Boolean | 3 | Boolean bitpack |
+| String | 4 | Compressed string |
+| Tag | 5 | Tag value |
+
+#### 10.9.2 Integer Encoding
+
+| Algorithm | Code | Description |
+|-----------|------|-------------|
+| ConstDelta | 1 | Constant delta |
+| Simple8b | 2 | 8b for small deltas |
+| ZSTD | 3 | Zstandard |
+| Uncompressed | 4 | Raw int64 |
+
+#### 10.9.3 Key Files
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `encoding.go` | 623 | Core interfaces, block encoding |
+| `int.go` | 386 | Integer encoding (ZigZag, Simple8b) |
+| `timestamp.go` | 324 | Time encoding |
+
+---
+
+### 10.10 lib/logger (Logging System)
+
+**Directory:** `lib/logger/`
+
+**Architecture Responsibility:** High-performance structured logging with Zap and log suppression.
+
+#### 10.10.1 SuppressLogger
+
+```go
+type SuppressLogger struct {
+    log      *zap.Logger
+    rounds   int           // force output every N rounds
+    interval time.Duration // indulgence interval
+}
+// Singleton pattern with automatic suppression
+```
+
+#### 10.10.2 Integration
+
+- Uses Uber's Zap for structured logging
+- Dual output: normal + `.error` suffix file
+- Integrates with `lib/errno` for error code generation
+
+---
+
+### 10.11 lib/errno (Error Number System)
+
+**Directory:** `lib/errno/`
+
+**Architecture Responsibility:** Unified error code system across all modules and node types.
+
+#### 10.11.1 Error Code Ranges
+
+| Range | Category |
+|-------|----------|
+| 6400-6414 | HTTP errors |
+| 1001-1028 | Network module |
+| 1101-1135 | Query engine |
+| 2101-2140 | Store engine |
+| 4001-4058 | Meta |
+| 5001-5045 | Write process |
+| 6001-6023 | Index |
+
+#### 10.11.2 Error Code Format
+
+```
+{node}{module}{level}{errno}
+Example: 40114001 → Sql(4) + Index(1) + Warn(1) + 4001
+```
+
+---
+
+### 10.12 lib/tracing (Distributed Tracing)
+
+**Directory:** `lib/tracing/`
+
+**Architecture Responsibility:** OpenTelemetry-compatible distributed tracing.
+
+#### 10.12.1 Core Structures
+
+```go
+type Trace struct {
+    trace *tracing.Trace
+    subs  map[uint64]*Trace  // Sub-traces by SpanID
+}
+
+type Span struct {
+    span     *tracing.Span
+    start    time.Time
+    elapsed  int64  // Nanoseconds
+    counters map[string]*SpanCounter
+}
+```
+
+#### 10.12.2 PP (Pretty-Print) Tracking
+
+```go
+StartPP() / EndPP()  // Manual operation timing
+AddPP()               // Atomic accumulation
+```
+
+---
+
+### 10.13 coordinator (Write Coordination)
+
+**Directory:** `coordinator/`
+
+**Architecture Responsibility:** Write coordination, shard routing, statement execution, and subscription management.
+
+#### 10.13.1 PointsWriter (Write Coordination)
+
+```go
+type PointsWriter struct {
+    metaClient PWMetaClient
+    store     TSDBStores
+    // Shard routing and retry logic
+}
+
+func (p *PointsWriter) RetryWritePointRows(...) error {
+    // 1. Map rows to shards
+    // 2. Write to local/remote nodes
+    // 3. Retry on failure
+}
+```
+
+#### 10.13.2 ClusterShardMapper (Query Routing)
+
+```go
+type ClusterShardMapper struct {
+    metaClient meta.MetaClient
+    // Maps SELECT to shards based on time range
+}
+
+func (m *ClusterShardMapper) MapShards(...) ([]*ClusterShardMapping, error) {
+    // 1. Get shard groups by time range
+    // 2. Filter by condition
+    // 3. Return node→partition→shards mapping
+}
+```
+
+#### 10.13.3 Key Files
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `points_writer.go` | 1025 | Write coordination |
+| `shard_mapper.go` | 948 | Query shard routing |
+| `write_helper.go` | 876 | Schema caching, write assist |
+| `record_writer.go` | 547 | Arrow record writing |
+| `subscriber.go` | 390 | Subscription delivery |
+
+#### 10.13.4 Module Dependencies
+
+```
+coordinator/
+├── points_writer.go → netstorage, meta, stream, fence, statistics
+├── shard_mapper.go → executor, hybridqp, meta, netstorage
+├── write_helper.go → meta, record, config, influxql
+├── record_writer.go → engine, meta, obs, record
+└── subscriber.go → meta, config, logger
+```
+
+---
+
+### 10.14 lib/index (Index Type Definitions)
+
+**Directory:** `lib/index/`
+
+**Architecture Responsibility:** Canonical type system for all index implementations.
+
+```go
+type IndexType int
+
+const (
+    MergeSet IndexType = iota  // 0: TSI primary index
+    Text                     // 1: Full-text index
+    Field                    // 2: Field index
+    BloomFilter              // 4: Bloom filter
+    BloomFilterFullText     // 5: Bloom filter + full-text
+    MinMax                   // 6: Min-max for range pruning
+    Set                      // 7: Set index
+    BloomFilterIp            // 9: Bloom filter for IP
+)
+```
+
+---
+
+### 10.15 lib/hashtable (Hash Tables)
+
+**Directory:** `lib/hashtable/`
+
+**Architecture Responsibility:** High-performance hash tables for query execution.
+
+#### 10.15.1 Implementations
+
+| Type | Key | Hash Function |
+|------|-----|---------------|
+| `IntHashMap` | int64 | `mix64` |
+| `StringHashMap` | []byte | xxhash |
+
+#### 10.15.2 Page-Based Array
+
+```go
+ByteDoubleArray   // 16KB pages for byte storage
+Int64DoubleArray  // 256-entry pages for int64
+```
+
+#### 10.15.3 Usage
+
+- Hash JOINs
+- GROUP BY aggregation
+- DISTINCT operations
+
+---
+
+### 10.16 lib/rpn (RPN Calculator)
+
+**Directory:** `lib/rpn/`
+
+**Architecture Responsibility:** Converts InfluxQL WHERE clauses to RPN for index evaluation.
+
+```go
+type RPNExpr struct {
+    Val []interface{}  // Flattened RPN expression
+}
+
+type SKRPNElement struct {
+    RPNOp  Op              // RPN operator
+    Key    string           // Column/key name
+    Value  interface{}      // Comparison value
+    Ty     influxql.DataType
+}
+```
+
+#### Operators
+
+```go
+InRange, NotInRange, InSet, NotInSet, NOT, AND, OR, MATCHPHRASE
+```
+
+---
+
+### 10.17 lib/opentelemetry (OTLP Integration)
+
+**Directory:** `lib/opentelemetry/`
+
+**Architecture Responsibility:** Converts OpenTelemetry protocol to InfluxDB line protocol.
+
+```go
+type OtelContext struct {
+    PtraceWriter  TracesWriter
+    PmetricWriter MetricsWriter
+    PlogWriter    LogsWriter
+    Database      string
+    RetentionPolicy string
+}
+```
+
+#### Supported Types
+
+- Gauge, Sum, Histogram, Summary metrics
+- Trace spans
+- Log records
+
+---
+
 ## 9. Appendix: Directory Structure
 
 ```
