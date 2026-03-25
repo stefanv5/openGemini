@@ -2409,6 +2409,69 @@ app.Run(os.Args[1:], cmdStore, cmdSql)
 
 ---
 
+### 3.16.1 ts-server (All-in-One Single-Node Deployment)
+
+**Directory:** `app/ts-server/`
+
+**Architecture Responsibility:** Provides a complete single-node deployment that combines ts-meta, ts-store, and ts-sql into a single process, enabling full openGemini functionality without external dependencies.
+
+#### 3.16.1.1 Architecture Overview
+
+ts-server combines all three core components (meta, store, sql) into one process:
+
+```mermaid
+graph TB
+    subgraph "ts-server (Single Process)"
+        META["ts-meta Module<br/>(Metadata Service)"]
+        SQL["ts-sql Module<br/>(Query Coordinator)"]
+        STORE["ts-store Module<br/>(Storage Engine)"]
+    end
+    
+    META <--> SQL
+    SQL <--> STORE
+    META -.-> STORE
+```
+
+#### 3.16.1.2 ts-server vs ts-data
+
+| Feature | ts-data | ts-server |
+|---------|---------|-----------|
+| **Components** | ts-sql + ts-store | ts-meta + ts-sql + ts-store |
+| **Meta service** | Not included | Included |
+| **External dependencies** | Requires external meta | None (fully standalone) |
+| **Binary name** | `ts-data` | `ts-server` |
+| **App type** | `AppData` ("data") | `AppSingle` ("single") |
+| **Use case** | Lightweight single-node | Full single-node production |
+
+#### 3.16.1.3 Command Structure (main.go)
+
+```go
+cmdMeta := meta.NewCommand(info, false)      // Metadata service
+cmdStore := store.NewCommand(info, false)    // Storage engine
+cmdSql := ingestserver.NewCommand(info, false)  // Query/ingest
+
+cmdSql.AfterOpen = func() {
+    run.InitStorage(cmdSql.Server, cmdStore.Server)  // Local storage linkage
+}
+app.Run(os.Args[1:], cmdMeta, cmdStore, cmdSql)
+```
+
+#### 3.16.1.4 Deployment
+
+**Startup:**
+```bash
+./ts-server -config conf/openGemini.singlenode.conf
+```
+
+**Ports:**
+| Port | Service | Description |
+|------|---------|-------------|
+| 8086 | ts-sql | HTTP API |
+| 8087 | ts-store | Internal operations |
+| 8091 | ts-meta | Meta RPC |
+
+---
+
 ### 3.17 ts-monitor (Dedicated Monitoring Service)
 
 **Directory:** `app/ts-monitor/`
@@ -2701,6 +2764,194 @@ ts-store (engine/backup.go) → Backup Files → ts-recover → ts-meta (/recove
 | `app/ts-recover/main.go` | CLI entry point |
 | `app/ts-recover/recover/recover.go` | Core recovery logic (417 lines) |
 | `engine/backup.go` | Backup creation (complement) |
+
+---
+
+### 3.21 Kafka Consumer Service (services/consume/)
+
+**Directory:** `services/consume/`
+
+**Architecture Responsibility:** Provides a Kafka-compatible consumer interface for reading time-series data from openGemini. Implements Kafka broker protocol (API versions v1/v2) to allow standard Kafka consumers to query data using SQL translated to topic names.
+
+#### 3.21.1 Supported Kafka APIs
+
+| API Key | Name | Supported Versions |
+|---------|------|-------------------|
+| 1 | Fetch | v2 |
+| 2 | ListOffsets | v1 |
+| 3 | Metadata | v1 |
+| 8 | OffsetCommit | v2 |
+| 12 | HeartBeat | v1 |
+| 18 | ApiVersions | v1 |
+
+#### 3.21.2 Architecture Overview
+
+```mermaid
+flowchart TB
+    subgraph "Kafka Consumer"
+        KC["Standard Kafka Client"]
+    end
+    
+    KC -->|"Fetch Request<br/>(SQL as topic)"| KS["Kafka Server<br/>(services/consume)"]
+    
+    KS --> H["HandlerManager"]
+    H --> FH["FetchHandleV2"]
+    
+    FH --> P["Processor"]
+    P -->|"CreateConsumeIterator()"| E["Engine"]
+    E --> S["Shard<br/>(TSSP files)"]
+    
+    S --> CR["ConsumeIterator"]
+    CR --> P
+    P --> FH
+    FH --> KC
+```
+
+**Key Insight:** The "topic" name in Fetch requests is interpreted as a SQL query string.
+
+#### 3.21.3 Data Flow
+
+1. Client sends **Fetch request** with topic = SQL query
+2. `FetchHandleV2.Handle()` unmarshals request
+3. `Processor.Init()` parses "topic" as SQL, creates iterator via engine
+4. `Processor.Process()` iterates data using `Iterator.Next()`
+5. Each `ConsumeRecord` wrapped in Kafka FetchMessage
+6. Response serialized as Kafka Fetch v2 format
+
+#### 3.21.4 Core Components
+
+| Component | File | Responsibility |
+|-----------|------|----------------|
+| **Service** | `service.go` | Main entry, registers handlers |
+| **Kafka Server** | `kafka/server.go` | TCP listener, request/response loop |
+| **HandlerManager** | `kafka/handle/handler.go` | Routes requests by API key/version |
+| **FetchHandleV2** | `fetch.go` | Handles data read requests |
+| **Processor** | `processor.go` | Parses SQL, creates engine iterators |
+
+#### 3.21.5 Configuration
+
+```toml
+[consume]
+  consume-enabled = false     # Default: disabled
+  consume-host = "127.0.0.1"
+  consume-port = 9092         # Kafka default port
+  consume-max-read-size = "1MB"
+```
+
+---
+
+### 3.22 gRPC Writer Service (services/writer/)
+
+**Directory:** `services/writer/`
+
+**Architecture Responsibility:** Provides a high-performance gRPC-based write path alternative to HTTP/line protocol. Supports binary protobuf records with compression (ZSTD, LZ4, Snappy).
+
+#### 3.22.1 Two Write Modes
+
+| Mode | Description |
+|------|-------------|
+| **Legacy (default)** | Converts records to line protocol, delegates to PointsWriter |
+| **Shelf** | Direct columnar writes via RecordWriter to storage |
+
+#### 3.22.2 Architecture
+
+```mermaid
+flowchart TD
+    A["gRPC Client<br/>(opengemini-client-go)"] -->|"WriteRequest<br/>(protobuf)"| S["WriterService"]
+    S --> D["RecordDecoder"]
+    D -->|"Decompressed Records"| RW["RecordWriter"]
+    RW -->|"BlobGroup"| SH["Shard"]
+    SH --> ST["Storage"]
+```
+
+#### 3.22.3 Legacy vs Shelf Mode
+
+| Aspect | Legacy Mode | Shelf Mode |
+|--------|-------------|------------|
+| **Data format** | Line protocol | Binary protobuf |
+| **Compression** | No | ZSTD/LZ4/Snappy |
+| **Stream support** | Yes | No |
+| **Write path** | PointsWriter | Direct storage |
+
+#### 3.22.4 Core Components
+
+| Component | File | Responsibility |
+|-----------|------|----------------|
+| **Service** | `service.go` | gRPC server, Write/Ping RPC |
+| **RecordWriter** | `record_writer.go` | Shelf-mode shard routing |
+| **Decoder** | `decoder.go` | Protobuf decompression |
+| **Context** | `context.go` | WriteContext, MetaManager |
+
+#### 3.22.5 Configuration
+
+```toml
+[record_writer]
+  enabled = false              # Default: disabled
+  rpc-address = "127.0.0.1:8305"
+  auth-enabled = false
+  shelf-mode = false           # Use RecordWriter path
+  tls-enabled = false
+```
+
+---
+
+### 3.23 engine/mutable (MemTable)
+
+**Directory:** `engine/mutable/`
+
+**Architecture Responsibility:** Provides the in-memory storage layer (L0 of LSM tree). Manages data before flush to TSM files, with support for both row-store (TSSTORE) and column-store (COLUMNSTORE) engines.
+
+#### 3.23.1 MemTable Structure
+
+```go
+type MemTable struct {
+    msInfoMap map[string]*MsInfo    // measurement name → data
+    msInfos   []MsInfo              // pre-allocated slice
+    memSize   int64                 // current memory size (atomic)
+    MTable    MTable                // TSSTORE or COLUMNSTORE
+    idx       *ski.ShardKeyIndex   // shard key index for RANGE mode
+    ref       int32                 // reference count
+}
+```
+
+#### 3.23.2 Flush Trigger Conditions
+
+| Trigger | Condition | Default |
+|---------|-----------|---------|
+| **Size-based** | `memSize > 30MB` | 30 MB per shard |
+| **Time-based (TSSTORE)** | `writeColdDuration` elapsed | 5 seconds |
+| **Time-based (COLUMNSTORE)** | `writeColdDuration` OR `forceSnapShotDuration` | 5s / 20s |
+
+#### 3.23.3 Data Flow: MemTable → TSM
+
+```mermaid
+flowchart TD
+    A["Write Request"] --> B["MemTable.WriteRows()"]
+    B --> C["WriteChunk.appendFields()"]
+    C --> D{"Flush Trigger?"}
+    D -->|"Yes"| E["MemTable.FlushChunks()"]
+    E --> F["Split: ordered vs unordered"]
+    F --> G["MsBuilder.WriteRecord()"]
+    G --> H["immutable.WriteIntoFile()"]
+    H --> I["TSPFile"]
+```
+
+#### 3.23.4 Memory Management
+
+**MemTablePool:**
+- Pools inactive MemTables by "db/rp" key
+- Capacity: 3 per pool
+- Expiration: 120 seconds
+- Background cleanup every 30s
+
+#### 3.23.5 Key Files
+
+| File | Purpose |
+|------|---------|
+| `table.go` | Core MemTable, MsInfo, WriteChunk |
+| `ts_table.go` | TSSTORE flush implementation |
+| `cs_table.go` | COLUMNSTORE with concurrent chunks |
+| `pool.go` | MemTable and record pooling |
 
 ---
 
