@@ -420,31 +420,43 @@ var (
 - The scheduler iterates through the pattern: Level 0 → Level 1 → Level 0 → Level 2 → ...
 - This ensures fair compaction across all levels without starving any level
 
-**Compaction Flow Diagram:**
+**Compaction & Merge Flow (Compactor.run() every 10 seconds):**
 
 ```mermaid
 flowchart TD
-    subgraph "MemTable Flush"
-        A["MemTable<br/>(L0 in-memory)"] --> B["Flush to TSM<br/>Level 0 Files"]
+    subgraph "Compactor.run() - Every 10 seconds"
+        T["Timer<br/>(10s)"]
     end
     
-    subgraph "Level Compaction (Minor)"
-        B --> C["Level 0 → Level 1<br/>8+ files"]
-        C --> D["Level 1 → Level 2<br/>4+ files"]
-        D --> E["Level 2 → Level 3<br/>4+ files"]
-        E --> F["Level 3 → Level 4<br/>4+ files"]
-        F --> G["Level 4 → Level 5<br/>4+ files"]
-        G --> H["Level 5 → Level 6<br/>4+ files"]
+    T --> M["merger()"]
+    T --> C["compact()"]
+    
+    subgraph "Level Compaction (compact())"
+        M --> L["LevelCompact<br/>Levels 0-6"]
+        L --> L1["mmsPlan<br/>Group files by level+seq"]
+        L1 --> L2["CompactGroup<br/>Batch files"]
+        L2 --> L3["NewChunkIterators<br/>Heap merge"]
+        L3 --> L4["MsBuilder<br/>Write TSSP"]
     end
     
-    subgraph "Full Compaction (Major)"
-        H --> I["Level 6 → Level 7<br/>Manual/Scheduled"]
-    end
-    
-    subgraph "Out-of-Order Merge"
-        I --> J["Merge Out-of-Order<br/>Into Ordered"]
+    subgraph "MergeOutOfOrder (merger())"
+        M --> O["GetMstToMerge()<br/>Find measurements with OoO files"]
+        O --> O1{"num >= 4 OR<br/>time since merge >= MinInterval?"}
+        O1 -->|Yes| O2["execMergeContext()"]
+        O1 -->|No| O3["Skip"]
+        O2 --> O4{"MergeSelf mode?"}
+        O4 -->|Yes| S["mergeSelf()<br/>OoO files only → new OoO file"]
+        O4 -->|No| T2["merge()<br/>OoO files INTO ordered files"]
     end
 ```
+
+**Key Point:** `MergeOutOfOrder` and `FullCompact` are **COMPLETELY INDEPENDENT**. They are both triggered every 10 seconds by the same `Compactor.run()` loop but serve different purposes:
+
+| Aspect | Merger (merger()) | Compactor (compact()) |
+|--------|-------------------|----------------------|
+| **Purpose** | Merge out-of-order files | Level compaction |
+| **Files affected** | `OutOfOrder` map | `Order` map |
+| **Output** | OoO → OoO OR OoO → Order | Level N → Level N+1 |
 
 #### 3.6.5.3 File Selection & Grouping (mmsPlan)
 
@@ -608,18 +620,69 @@ func (m *MmsTables) FullCompact(shid uint64) error {
 
 | Type | Description | Trigger |
 |------|-------------|---------|
-| **MergeSelf** | Merges out-of-order files within same level | Out-of-order files exist |
-| **mergeTool** | Merges out-of-order files into ordered files | MergeOutOfOrder called |
-| **MergeOutOfOrder** | Coordinates mergeTool execution | Background goroutine |
+| **MergeOutOfOrder** | Entry point - triggered every 10s by `Compactor.merger()` | Background goroutine |
+| **mergeTool.merge()** | Merges out-of-order files INTO ordered files | When MergeSelf=false |
+| **mergeTool.mergeSelf()** | Merges out-of-order files ONLY into new OoO file | When MergeSelf=true |
+| **MergeSelf** | Fast-path self-merging implementation | Used by mergeTool |
+
+**Triggered Independently from Compaction:**
+
+```mermaid
+flowchart LR
+    subgraph "Compactor.run() every 10s"
+        T["Timer"]
+    end
+    
+    T -->|"merger()"| M["MergeOutOfOrder()"]
+    T -->|"compact()"| C["LevelCompact / FullCompact"]
+    
+    M --> M1["execMergeContext()"]
+    M1 --> M2{"selfMode?"}
+    M2 -->|true| M3["mergeSelf()<br/>OoO → OoO (same level)"]
+    M2 -->|false| M4["merge()<br/>OoO → ordered files"]
+    
+    C --> C1["LevelCompact<br/>Level N → Level N+1"]
+    C --> C2["FullCompact<br/>All levels → Level 7"]
+```
 
 **MergeContext (merge_tool.go:52):**
 ```go
 type MergeContext struct {
     mst       string      // Measurement name
-    order     fileSeqs    // Ordered file sequences
+    order     fileSeqs    // Ordered file sequences (time-overlapped)
     unordered fileSeqs    // Out-of-order file sequences
-    shId      uint64      // Shard ID
+    shId      uint64     // Shard ID
 }
+```
+
+**mergeTool.merge() - OoO INTO Ordered:**
+```go
+func (mt *mergeTool) merge(ctx *MergeContext) {
+    // 1. Find ordered files that overlap with OoO time ranges
+    matchOrderFiles(ctx)
+    
+    // 2. Create UnorderedReader for OoO data
+    // 3. Create ColumnIterator for ordered data
+    // 4. Heap-merge into ordered output
+    // 5. Replace old ordered files with new
+    // 6. Delete OoO files
+}
+```
+
+**mergeTool.mergeSelf() - OoO ONLY:**
+```go
+func (mt *mergeTool) mergeSelf(ctx *MergeContext) {
+    if ctx.UnorderedLen() <= 1 {
+        return  // Nothing to merge
+    }
+    
+    if ctx.MergeSelfFast() {
+        mt.mergeSelfFastMode(ctx)  // Direct: MergeSelf.Merge()
+    } else {
+        mt.mergeSelfStreamMode(ctx)  // Chunked via mergeTool.execute()
+    }
+}
+```
 ```
 
 **MergeSelf Mode (merge_self.go:48-86):**
@@ -870,40 +933,47 @@ func procCompactLog(shardDir string, logDir string, lockPath *string,
 
 #### 3.6.5.10 Compaction & Merge Summary
 
+**Compactor.run() - Every 10 seconds:**
+
 ```mermaid
-flowchart TD
-    subgraph "Trigger Sources"
-        A["MemTable Flush<br/>Level 0"] 
-        B["LevelCompact Timer<br/>Level 1-6"]
-        C["FullCompact Schedule<br/>Cold Tier"]
-        D["MergeOutOfOrder<br/>Out-of-Order Data"]
+flowchart LR
+    subgraph "Compactor.run() every 10s"
+        T["Timer"]
     end
     
-    A --> E["LevelCompact"]
-    B --> E
-    C --> F["FullCompact"]
-    D --> G["MergeSelf<br/>or mergeTool"]
+    T -->|"merger()"| M["MergeOutOfOrder"]
+    T -->|"compact()"| C["LevelCompact / FullCompact"]
     
-    E --> H["mmsPlan<br/>Group files by level+seq"]
-    F --> H
-    G --> I["MergeContext<br/>Build file sequences"]
+    subgraph "MergeOutOfOrder Path"
+        M --> M1["getMstToMerge()<br/>Find OoO measurements"]
+        M1 --> M2["execMergeContext()"]
+        M2 --> M3{"MergeSelf?"}
+        M3 -->|Yes| M4["mergeSelf()<br/>OoO → new OoO file"]
+        M3 -->|No| M5["merge()<br/>OoO → ordered files"]
+    end
     
-    H --> J["CompactGroup<br/>Batch of files"]
-    I --> J
+    subgraph "Compaction Path"
+        C --> C1["LevelCompact<br/>or FullCompact"]
+        C1 --> C2["mmsPlan<br/>Group files by level+seq"]
+        C2 --> C3["CompactGroup"]
+        C3 --> C4["NewChunkIterators"]
+        C4 --> C5["Heap Merge"]
+        C5 --> C6["MsBuilder"]
+    end
     
-    J --> K["NewChunkIterators<br/>Create heap"]
-    J --> L["MsBuilder<br/>Write merged output"]
-    
-    K --> M["Heap Merge<br/>Multi-way merge"]
-    M --> N["record.Next()<br/>Sorted records"]
-    N --> L
-    
-    L --> O["NewTSSPFile<br/>Rename to final"]
-    O --> P["ReplaceFiles<br/>Update file index"]
-    
-    P --> Q["writeCompactedFileInfo<br/>Write compact log"]
-    Q --> R["(Optional) Delete old files"]
+    M4 --> R["ReplaceFiles<br/>Update index"]
+    M5 --> R
+    C6 --> R
 ```
+
+**Key Distinctions:**
+
+| Aspect | MergeOutOfOrder | LevelCompact | FullCompact |
+|--------|-----------------|--------------|-------------|
+| **Trigger** | `merger()` every 10s | `compact()` every 10s | Manual/scheduled |
+| **Files** | `OutOfOrder` map | `Order` map | `Order` map |
+| **Output** | OoO merged into OoO or Order | Level N → Level N+1 | All → Level 7 |
+| **Concurrency** | Limited by `compLimiter` | Limited by `compLimiter` | Limited by `fullCompactor` |
 
 **Key Files:**
 
