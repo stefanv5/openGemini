@@ -1071,12 +1071,17 @@ func InitQueryFileCache(cap uint32, enable bool) {
 }
 
 type QueryfileCache struct {
-	cache    chan TSSPFile
-	cacheCap uint32
+	cache      chan TSSPFile
+	cacheCap   uint32
+	closeQueue chan TSSPFile // async close queue
+	closed     chan struct{}  // shutdown signal
 }
 
 // ResetQueryFileCache used to reset the file cache for ut
 func ResetQueryFileCache() {
+	if fileQueryCache != nil {
+		fileQueryCache.Close()
+	}
 	fileQueryCache = nil
 }
 
@@ -1085,23 +1090,55 @@ func GetQueryfileCache() *QueryfileCache {
 }
 
 func NewQueryfileCache(cap uint32) *QueryfileCache {
+	cacheCap := cap
 	if cap == 0 {
-		return &QueryfileCache{
-			cache:    make(chan TSSPFile, cpu.GetCpuNum()*8),
-			cacheCap: uint32(cpu.GetCpuNum() * 8),
+		cacheCap = uint32(cpu.GetCpuNum() * 8)
+	}
+	qfc := &QueryfileCache{
+		cache:      make(chan TSSPFile, cacheCap),
+		cacheCap:   cacheCap,
+		closeQueue: make(chan TSSPFile, cacheCap*2),
+		closed:     make(chan struct{}),
+	}
+	go qfc.backgroundCloser()
+	return qfc
+}
+
+func (qfc *QueryfileCache) backgroundCloser() {
+	for {
+		select {
+		case <-qfc.closed:
+			close(qfc.closeQueue)
+			for f := range qfc.closeQueue {
+				f.FreeFileHandle()
+			}
+			return
+		case f := <-qfc.closeQueue:
+			f.FreeFileHandle()
 		}
-	} else {
-		return &QueryfileCache{
-			cache:    make(chan TSSPFile, cap),
-			cacheCap: cap,
-		}
+	}
+}
+
+func (qfc *QueryfileCache) Close() {
+	select {
+	case <-qfc.closed:
+		return
+	default:
+		close(qfc.closed)
 	}
 }
 
 func (qfc *QueryfileCache) Put(f TSSPFile) {
 	if f.GetFileReaderRef() > 1 {
-		f.UnrefFileReader()
-		return
+		// file is still in use by other queries, send to async close queue
+		select {
+		case qfc.closeQueue <- f:
+			return
+		default:
+			// queue full, fall back to sync close (rare case)
+			f.UnrefFileReader()
+			return
+		}
 	}
 	for {
 		select {
@@ -1116,7 +1153,13 @@ func (qfc *QueryfileCache) Put(f TSSPFile) {
 func (qfc *QueryfileCache) Get() {
 	select {
 	case f := <-qfc.cache:
-		f.UnrefFileReader()
+		select {
+		case qfc.closeQueue <- f:
+			return
+		default:
+			f.UnrefFileReader()
+			return
+		}
 	default:
 		return
 	}
