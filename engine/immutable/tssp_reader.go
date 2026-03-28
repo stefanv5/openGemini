@@ -371,7 +371,6 @@ type tsspFile struct {
 	ref  int32
 	flag uint32 // flag > 0 indicates that the files is need close.
 	lock *string
-	closed uint32 // 1 = file is being closed, read operations should abort without waiting for lock
 
 	pkInfo    *colstore.PKInfo
 	pkColumns map[string]int
@@ -529,12 +528,10 @@ func (f *tsspFile) FreeFileHandle() error {
 		f.mu.Unlock()
 		return nil
 	}
-	// Mark as closing under write lock, so readers can check without blocking
-	atomic.StoreUint32(&f.closed, 1)
 	f.mu.Unlock()
 
-	// OS fd close (potentially slow: close + mmap unmap) runs outside the write lock.
-	// Readers that see closed=1 before acquiring RLock will abort immediately.
+	// OS fd close (close + mmap unmap) runs outside the write lock,
+	// so readers holding RLock are not blocked for the duration of the syscall.
 	if err := f.reader.FreeFileHandle(); err != nil {
 		return err
 	}
@@ -697,9 +694,6 @@ func (f *tsspFile) FileSize() int64 {
 }
 
 func (f *tsspFile) Contains(id uint64) (contains bool, err error) {
-	if atomic.LoadUint32(&f.closed) == 1 {
-		return false, errFileClosed
-	}
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	if f.stopped() {
@@ -712,9 +706,6 @@ func (f *tsspFile) Contains(id uint64) (contains bool, err error) {
 }
 
 func (f *tsspFile) ContainsValue(id uint64, tr util.TimeRange) (contains bool, err error) {
-	if atomic.LoadUint32(&f.closed) == 1 {
-		return false, errFileClosed
-	}
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
@@ -727,9 +718,6 @@ func (f *tsspFile) ContainsValue(id uint64, tr util.TimeRange) (contains bool, e
 }
 
 func (f *tsspFile) ContainsByTime(tr util.TimeRange) (contains bool, err error) {
-	if atomic.LoadUint32(&f.closed) == 1 {
-		return false, errFileClosed
-	}
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	if f.stopped() {
