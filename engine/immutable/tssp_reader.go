@@ -21,6 +21,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/openGemini/openGemini/engine/immutable/colstore"
 	"github.com/openGemini/openGemini/lib/config"
@@ -33,6 +34,14 @@ import (
 	"github.com/openGemini/openGemini/lib/util"
 	"go.uber.org/zap"
 )
+
+// leaseDuration is the default Lease reuse window for files with ref==0.
+// It is set by InitLeaseCacheConfig or defaults to 30 seconds.
+var leaseDuration = 30 * time.Second
+
+func SetLeaseDuration(d time.Duration) {
+	leaseDuration = d
+}
 
 const (
 	unorderedDir   = "out-of-order"
@@ -375,6 +384,8 @@ type tsspFile struct {
 	pkInfo    *colstore.PKInfo
 	pkColumns map[string]int
 	reader    FileReader
+
+	leaseCache *ShardLeaseCache // per-shard Lease cache
 }
 
 func OpenTSSPFile(name string, lockPath *string, isOrder bool) (TSSPFile, error) {
@@ -414,6 +425,10 @@ func (f *tsspFile) Inuse() bool {
 	return atomic.LoadInt32(&f.ref) > 1
 }
 
+func (f *tsspFile) SetLeaseCache(lc *ShardLeaseCache) {
+	f.leaseCache = lc
+}
+
 func (f *tsspFile) Ref() {
 	if f.stopped() {
 		return
@@ -447,6 +462,12 @@ func (f *tsspFile) UnrefFileReader() {
 		return
 	}
 	if f.reader.Unref() > 0 {
+		return
+	}
+
+	// ref == 0: hand off to Lease cache for reuse window instead of immediate close
+	if f.leaseCache != nil {
+		f.leaseCache.Add(f, time.Now().Add(leaseDuration))
 		return
 	}
 
