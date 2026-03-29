@@ -293,10 +293,23 @@ func (s *shard) createImmutableReader(mm string, hasTimeFilter bool, tr util.Tim
 	var immutableReader immutable.MmsReaders
 
 	immutableReader.Orders, immutableReader.OutOfOrders, flushed = s.immTables.GetBothFilesRef(mm, hasTimeFilter, tr, snapshotTblFlushed)
+	s.setLeaseCacheForFiles(immutableReader.Orders)
+	s.setLeaseCacheForFiles(immutableReader.OutOfOrders)
 	immutable.RefFilesReader(immutableReader.Orders...)
 	immutable.RefFilesReader(immutableReader.OutOfOrders...)
 
 	return &immutableReader, flushed
+}
+
+// setLeaseCacheForFiles sets the per-shard LeaseCache on each TSSPFile.
+// This enables Layer 2 (ShardLeaseCache) for files obtained during queries.
+func (s *shard) setLeaseCacheForFiles(files []immutable.TSSPFile) {
+	if s.leaseCache == nil {
+		return
+	}
+	for _, f := range files {
+		f.SetLeaseCache(s.leaseCache)
+	}
 }
 
 func (s *shard) GetTSSPFiles(mm string, isOrder bool) (*immutable.TSSPFiles, bool) {

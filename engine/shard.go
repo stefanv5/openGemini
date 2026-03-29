@@ -228,6 +228,7 @@ type shard struct {
 	snapshotTbl        *mutable.MemTable
 	snapshotWg         sync.WaitGroup
 	immTables          immutable.TablesStore
+	leaseCache        *immutable.ShardLeaseCache // per-shard Lease reuse window
 	indexBuilder       *tsi.IndexBuilder
 	skIdx              *ski.ShardKeyIndex
 	pkIndexReader      sparseindex.PKIndexReader
@@ -473,6 +474,20 @@ func (s *shard) writeCols(cols *record.Record, binaryCols []byte, mst string) er
 		return err
 	}
 	return nil
+}
+
+func (s *shard) initLeaseCache() {
+	pool := immutable.GetNodeFilePool()
+	if pool == nil {
+		return
+	}
+	// onExpired: try to put into NodeFilePool, close if pool full
+	s.leaseCache = immutable.NewShardLeaseCache(immutable.GetLeaseDuration(), func(f immutable.PoolFile) {
+		if !pool.Put(f) {
+			f.FreeFileHandle()
+		}
+	})
+	s.leaseCache.Start()
 }
 
 func (s *shard) initSeriesLimiter(limit uint64) {
@@ -1134,6 +1149,11 @@ func (s *shard) Close() error {
 
 	// wait snapshot
 	s.waitSnapshot()
+	// drain LeaseCache before closing immutables
+	if s.leaseCache != nil {
+		s.leaseCache.Stop()
+		s.leaseCache = nil
+	}
 	log.Info("close immutables", zap.Uint64("id", s.ident.ShardID))
 	if err := s.immTables.Close(); err != nil {
 		log.Error("close table store fail", zap.Uint64("id", s.ident.ShardID), zap.Error(err))
@@ -1290,6 +1310,9 @@ func (s *shard) Open(client metaclient.MetaClient) error {
 	s.setMaxTime(maxTime)
 	s.log.Info("open immutable done", zap.Uint64("id", s.ident.ShardID), zap.Duration("time used", time.Since(start)),
 		zap.Int64("maxTime", maxTime), zap.Uint64("opId", s.opId))
+
+	// Initialize per-shard Lease cache for file handle reuse
+	s.initLeaseCache()
 
 	s.initSeriesLimiter(s.seriesLimit)
 	s.setMergeIndex2ImmTables()

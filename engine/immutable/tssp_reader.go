@@ -43,6 +43,10 @@ func SetLeaseDuration(d time.Duration) {
 	leaseDuration = d
 }
 
+func GetLeaseDuration() time.Duration {
+	return leaseDuration
+}
+
 const (
 	unorderedDir   = "out-of-order"
 	tsspFileSuffix = ".tssp"
@@ -159,6 +163,10 @@ type TSSPFile interface {
 
 	SetPkInfo(pkInfo *colstore.PKInfo)
 	GetPkInfo() *colstore.PKInfo
+
+	// SetLeaseCache sets the per-shard Lease cache for this file.
+	// Called when the file is obtained from a shard's file set.
+	SetLeaseCache(lc *ShardLeaseCache)
 }
 
 type TSSPFiles struct {

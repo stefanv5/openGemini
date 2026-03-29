@@ -88,16 +88,14 @@ func (f *TSIndexInfoImpl) UnRefMemTables() {
 }
 
 func (f *TSIndexInfoImpl) unRefFiles(files immutable.TableReaders) {
-	fileCacheManager := immutable.GetQueryfileCache()
-	if fileCacheManager != nil && len(files) <= int(fileCacheManager.GetCap()) {
-		for _, file := range files {
-			fileCacheManager.Put(file)
-			file.Unref()
-		}
-	} else {
-		for _, file := range files {
-			file.UnrefFileReader()
-			file.Unref()
-		}
+	for _, file := range files {
+		// UnrefFileReader: when ref reaches 0, delegates to ShardLeaseCache
+		// (Lease timer starts). If no LeaseCache is set, closes directly.
+		file.UnrefFileReader()
+		// Decrement ref counter (tsspFile.ref).
+		// LeaseCache owns the file lifecycle from here:
+		// - If reused within Lease window: ref++ and RemoveFromLease is called
+		// - If Lease expires: returned to NodeFilePool or closed
+		file.Unref()
 	}
 }
