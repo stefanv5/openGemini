@@ -128,8 +128,9 @@ func (trans *SparseIndexScanTransform) Release() error {
 		for _, shardFrags := range trans.frags {
 			for _, fileFrags := range shardFrags.FileMarks {
 				file := fileFrags.GetFile()
-				file.UnrefFileReader()
-				file.Unref()
+				if !file.UnrefFileReader() {
+					file.Unref()
+				}
 			}
 		}
 	})

@@ -1126,9 +1126,14 @@ func FileOperation(f TSSPFile, op func()) {
 
 	f.Ref()
 	f.RefFileReader()
+	// UnrefFileReader returns true if the file entered the Lease window.
+	// In that case, the Lease owns the file lifecycle and Unref() must NOT
+	// be called here to avoid double-decrement of tsspFile ref.
+	leaseEntered := f.UnrefFileReader()
 	defer func() {
-		f.UnrefFileReader()
-		f.Unref()
+		if !leaseEntered {
+			f.Unref()
+		}
 	}()
 	op()
 }

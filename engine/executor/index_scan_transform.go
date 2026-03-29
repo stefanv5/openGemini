@@ -420,16 +420,18 @@ func (trans *IndexScanTransform) Release() error {
 			for _, shardFrags := range trans.frags {
 				for _, fileFrags := range shardFrags.FileMarks {
 					file := fileFrags.GetFile()
-					file.UnrefFileReader()
-					file.Unref()
+					if !file.UnrefFileReader() {
+						file.Unref()
+					}
 				}
 			}
 		}
 		if trans.indexInfo != nil {
 			files := trans.indexInfo.Files()
 			for i := range files {
-				files[i].UnrefFileReader()
-				files[i].Unref()
+				if !files[i].UnrefFileReader() {
+					files[i].Unref()
+				}
 			}
 		}
 		if trans.tsIndexInfo != nil {

@@ -228,7 +228,7 @@ type shard struct {
 	snapshotTbl        *mutable.MemTable
 	snapshotWg         sync.WaitGroup
 	immTables          immutable.TablesStore
-	leaseCache        *immutable.ShardLeaseCache // per-shard Lease reuse window
+	leaseCache         *immutable.ShardLeaseCache // per-shard Lease reuse window
 	indexBuilder       *tsi.IndexBuilder
 	skIdx              *ski.ShardKeyIndex
 	pkIndexReader      sparseindex.PKIndexReader
@@ -1699,8 +1699,9 @@ func (s *shard) StartDownSample(taskID uint64, level int, sdsp *meta.ShardDownSa
 			var filesSlice []immutable.TSSPFile
 			for _, f := range files.Files() {
 				filesSlice = append(filesSlice, f)
-				f.UnrefFileReader()
-				f.Unref()
+				if !f.UnrefFileReader() {
+					f.Unref()
+				}
 			}
 			mstNames = append(mstNames, nameWithVer)
 			originFiles = append(originFiles, filesSlice)
@@ -1714,8 +1715,9 @@ func (s *shard) StartDownSample(taskID uint64, level int, sdsp *meta.ShardDownSa
 	} else {
 		for _, v := range filesMap {
 			for _, f := range v.Files() {
-				f.UnrefFileReader()
-				f.Unref()
+				if !f.UnrefFileReader() {
+					f.Unref()
+				}
 			}
 		}
 		s.DeleteDownSampleFiles(allDownSampleFiles)
@@ -1873,8 +1875,9 @@ func (s *shard) StartDownSampleTaskBySchema(start int, filesMap map[int]*immutab
 		e := s.StartDownSampleTask(start+i, mstName, files, ch, schemas[i].(*executor.QuerySchema), info.DbName, info.RpName)
 		if e != nil {
 			for _, v := range files.Files() {
-				v.UnrefFileReader()
-				v.Unref()
+				if !v.UnrefFileReader() {
+					v.Unref()
+				}
 			}
 			err = e
 			logger.Warn(e.Error(), zap.Any("shardId", info.ShardId))
@@ -2147,8 +2150,9 @@ func (s *shard) GetIndexInfo(schema *executor.QuerySchema) (*executor.AttachedIn
 			pkInfos = append(pkInfos, pkInfo)
 			files = append(files, dataFiles[i])
 		} else {
-			dataFiles[i].UnrefFileReader()
-			dataFiles[i].Unref()
+			if !dataFiles[i].UnrefFileReader() {
+				dataFiles[i].Unref()
+			}
 		}
 	}
 	return executor.NewAttachedIndexInfo(files, pkInfos), nil
@@ -2173,14 +2177,16 @@ func (s *shard) ScanWithSparseIndex(ctx context.Context, schema *executor.QueryS
 	fileFrags, skipFileIdx, err := s.scanWithSparseIndex(dataFiles, schema, mst)
 	if err != nil {
 		for i := range dataFiles {
-			dataFiles[i].UnrefFileReader()
-			dataFiles[i].Unref()
+			if !dataFiles[i].UnrefFileReader() {
+				dataFiles[i].Unref()
+			}
 		}
 		return nil, err
 	}
 	for _, idx := range skipFileIdx {
-		dataFiles[idx].UnrefFileReader()
-		dataFiles[idx].Unref()
+		if !dataFiles[idx].UnrefFileReader() {
+			dataFiles[idx].Unref()
+		}
 	}
 	return fileFrags, nil
 }
