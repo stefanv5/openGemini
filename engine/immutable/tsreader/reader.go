@@ -34,7 +34,9 @@ type TSSPReader interface {
 
 func UnrefTSSPFile(readers ...immutable.TSSPFile) {
 	for _, reader := range readers {
-		reader.UnrefFileReader()
+		if reader.UnrefFileReader() {
+			continue
+		}
 		reader.Unref()
 	}
 }

@@ -36,14 +36,22 @@ import (
 )
 
 // leaseDuration is the default Lease reuse window for files with ref==0.
-// It is set by InitLeaseCacheConfig or defaults to 30 seconds.
-var leaseDuration = 30 * time.Second
+// It is set by SetLeaseDuration and read by GetLeaseDuration.
+// Access is protected by leaseDurationMu.
+var (
+	leaseDuration   = 30 * time.Second
+	leaseDurationMu sync.RWMutex
+)
 
 func SetLeaseDuration(d time.Duration) {
+	leaseDurationMu.Lock()
+	defer leaseDurationMu.Unlock()
 	leaseDuration = d
 }
 
 func GetLeaseDuration() time.Duration {
+	leaseDurationMu.RLock()
+	defer leaseDurationMu.RUnlock()
 	return leaseDuration
 }
 
@@ -122,7 +130,7 @@ type TSSPFile interface {
 	Ref()
 	Unref()
 	RefFileReader()
-	UnrefFileReader()
+	UnrefFileReader() bool
 	Stop()
 	Inuse() bool
 	MetaIndexAt(idx int) (*MetaIndex, error)
@@ -167,6 +175,10 @@ type TSSPFile interface {
 	// SetLeaseCache sets the per-shard Lease cache for this file.
 	// Called when the file is obtained from a shard's file set.
 	SetLeaseCache(lc *ShardLeaseCache)
+
+	// Leased returns true if this file entered the Lease reuse window
+	// (UnrefFileReader was called with ref==0 and leaseCache is set).
+	Leased() bool
 }
 
 type TSSPFiles struct {
@@ -394,6 +406,7 @@ type tsspFile struct {
 	reader    FileReader
 
 	leaseCache *ShardLeaseCache // per-shard Lease cache
+	leased     int32            // set to 1 when entering lease; cleared by RefFileReader on reuse
 }
 
 func OpenTSSPFile(name string, lockPath *string, isOrder bool) (TSSPFile, error) {
@@ -437,6 +450,10 @@ func (f *tsspFile) SetLeaseCache(lc *ShardLeaseCache) {
 	f.leaseCache = lc
 }
 
+func (f *tsspFile) Leased() bool {
+	return atomic.LoadInt32(&f.leased) == 1
+}
+
 func (f *tsspFile) Ref() {
 	if f.stopped() {
 		return
@@ -458,31 +475,52 @@ func (f *tsspFile) Unref() {
 
 func (f *tsspFile) RefFileReader() {
 	f.mu.RLock()
+	defer f.mu.RUnlock()
 	f.reader.Ref()
-	f.mu.RUnlock()
+	// If file was in Lease (ref==0 path), cancel the Lease so it is not
+	// expired while we are reusing it. The leased flag is set only when
+	// UnrefFileReader entered the Lease path; clear it here.
+	// Use f.reader.FileName() (not f.Path()) because f.Path() would
+	// try to acquire f.mu.RLock again and deadlock.
+	if atomic.SwapInt32(&f.leased, 0) == 1 && f.leaseCache != nil {
+		f.leaseCache.Remove(f.reader.FileName())
+	}
 }
 
-func (f *tsspFile) UnrefFileReader() {
+// UnrefFileReader decrements the reader ref.
+// Returns true if the file entered the Lease reuse window (caller must NOT call
+// file.Unref() in this case, to avoid double-decrement of tsspFile ref).
+// Returns false for all other paths (caller SHOULD call file.Unref()).
+func (f *tsspFile) UnrefFileReader() bool {
 	if f.stopped() {
-		return
+		return false
 	}
 	if f.reader == nil {
-		return
+		return false
 	}
 	if f.reader.Unref() > 0 {
-		return
+		return false
 	}
 
-	// ref == 0: hand off to Lease cache for reuse window instead of immediate close
+	// readerRef == 0: hand off to Lease cache for reuse window instead of immediate close.
+	// tsspFile ref is NOT decremented here — caller (unRefFiles) must skip file.Unref()
+	// when this function returns true, because the Lease "owns" the file lifecycle:
+	// - If reused within Lease window: RefFileReader cancels the lease via c.Remove()
+	// - If Lease expires: onExpired callback returns file to NodeFilePool or closes it
 	if f.leaseCache != nil {
-		f.leaseCache.Add(f, time.Now().Add(leaseDuration))
-		return
+		leaseDurationMu.RLock()
+		expiry := time.Now().Add(leaseDuration)
+		leaseDurationMu.RUnlock()
+		atomic.StoreInt32(&f.leased, 1)
+		f.leaseCache.Add(f, expiry)
+		return true
 	}
 
 	err := f.FreeFileHandle()
 	if err != nil {
 		log.Error("freeFile failed", zap.Error(err))
 	}
+	return false
 }
 
 func (f *tsspFile) LevelAndSequence() (uint16, uint64) {
@@ -1112,7 +1150,7 @@ type QueryfileCache struct {
 	cache      chan TSSPFile
 	cacheCap   uint32
 	closeQueue chan TSSPFile // async close queue
-	closed     chan struct{}  // shutdown signal
+	closed     chan struct{} // shutdown signal
 }
 
 // ResetQueryFileCache used to reset the file cache for ut

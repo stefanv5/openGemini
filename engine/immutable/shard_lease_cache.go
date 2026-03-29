@@ -29,9 +29,9 @@ type LeaseEntry struct {
 
 // LeaseStats holds ShardLeaseCache statistics.
 type LeaseStats struct {
-	Size     int
-	Active   int
-	Expired  int64
+	Size      int
+	Active    int
+	Expired   int64
 	Cancelled int64
 }
 
@@ -41,18 +41,20 @@ type LeaseStats struct {
 // If the file is reused (ref++) during the Lease window, it is removed
 // from the cache immediately.
 type ShardLeaseCache struct {
-	entries  map[string]*LeaseEntry
-	mu       sync.Mutex
-	duration time.Duration
+	entries   map[string]*LeaseEntry
+	mu        sync.Mutex
+	duration  time.Duration
 	onExpired func(PoolFile)
-	stopCh   chan struct{}
-	ticker   *time.Ticker
+	stopCh    chan struct{}
+	ticker    *time.Ticker
+	expireWg  sync.WaitGroup // tracks in-flight onExpired goroutines
 }
 
 // NewShardLeaseCache creates a new ShardLeaseCache.
 // duration: the Lease reuse window (e.g., 30 seconds).
 // onExpired: called when a Lease expires and the file should be
-//   returned to the NodeFilePool or closed.
+//
+//	returned to the NodeFilePool or closed.
 func NewShardLeaseCache(duration time.Duration, onExpired func(PoolFile)) *ShardLeaseCache {
 	return &ShardLeaseCache{
 		entries:   make(map[string]*LeaseEntry),
@@ -80,15 +82,28 @@ func (c *ShardLeaseCache) Remove(key string) {
 
 // CheckExpired scans entries and calls onExpired for any that have passed their expiry.
 // Called by the background goroutine or for testing.
+// Note: onExpired callbacks are launched as goroutines and tracked via expireWg
+// so that Stop() can wait for all in-flight callbacks before returning.
 func (c *ShardLeaseCache) CheckExpired() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	now := time.Now()
+	var expired []*LeaseEntry
 	for key, entry := range c.entries {
 		if !entry.expiry.After(now) {
 			delete(c.entries, key)
-			go c.onExpired(entry.file)
+			expired = append(expired, entry)
 		}
+	}
+	c.mu.Unlock()
+
+	// Launch callbacks after releasing the lock to avoid holding mu
+	// while callbacks run, and to avoid callback -> mu races.
+	for _, entry := range expired {
+		c.expireWg.Add(1)
+		go func(e *LeaseEntry) {
+			defer c.expireWg.Done()
+			c.onExpired(e.file)
+		}(entry)
 	}
 }
 
@@ -107,16 +122,22 @@ func (c *ShardLeaseCache) Start() {
 }
 
 // Stop stops the background goroutine and drains remaining entries
-// by calling onExpired for each.
+// by calling onExpired for each, then waits for all in-flight callbacks.
 func (c *ShardLeaseCache) Stop() {
 	close(c.stopCh)
 	c.ticker.Stop()
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	for _, entry := range c.entries {
-		c.onExpired(entry.file)
+		c.expireWg.Add(1)
+		go func(e *LeaseEntry) {
+			defer c.expireWg.Done()
+			c.onExpired(e.file)
+		}(entry)
 	}
 	c.entries = make(map[string]*LeaseEntry)
+	c.mu.Unlock()
+	// Wait for all in-flight onExpired callbacks before returning.
+	c.expireWg.Wait()
 }
 
 // Stats returns current cache statistics.
