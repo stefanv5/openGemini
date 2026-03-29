@@ -322,6 +322,14 @@ func OpenStorage(path string, node *metaclient.Node, cli *metaclient.Client, con
 	}
 
 	immutable.InitQueryFileCache(conf.Data.MaxQueryCachedFileHandles, conf.Data.EnableQueryFileHandleCache)
+	if conf.Data.EnableFileHandleCache {
+		immutable.SetLeaseDuration(time.Duration(conf.Data.LeaseDuration))
+		maxHandles := conf.Data.MaxFileHandles
+		if maxHandles <= 0 {
+			maxHandles = 65536 // default: conservative server-level limit
+		}
+		immutable.InitNodeFilePool(maxHandles)
+	}
 
 	executor.IgnoreEmptyTag = conf.Common.IgnoreEmptyTag
 

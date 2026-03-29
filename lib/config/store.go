@@ -270,8 +270,13 @@ type Store struct {
 	MaxDownSampleTaskConcurrency int           `toml:"max-downsample-task-concurrency"`
 
 	// for query
-	EnableQueryFileHandleCache bool   `toml:"enable_query_file_handle_cache"`
-	MaxQueryCachedFileHandles  uint32 `toml:"max_query_cached_file_handles"`
+	EnableQueryFileHandleCache bool          `toml:"enable_query_file_handle_cache"`
+	MaxQueryCachedFileHandles  uint32        `toml:"max_query_cached_file_handles"`
+	// for file handle manager (Layer 2 + Layer 3)
+	MaxFileHandles            int           `toml:"max_file_handles"`
+	LeaseDuration             toml.Duration `toml:"lease_duration"`
+	LeaseCheckInterval        toml.Duration `toml:"lease_check_interval"`
+	EnableFileHandleCache     bool          `toml:"enable_file_handle_cache"`
 	// config for lazy load shard
 	LazyLoadShardEnable       bool          `toml:"lazy-load-shard-enable"`
 	ThermalShardStartDuration toml.Duration `toml:"thermal-shard-start-duration"`
@@ -349,6 +354,10 @@ func NewStore() Store {
 		OpenShardLimit:               0,
 		DownSampleWriteDrop:          true,
 		EnableQueryFileHandleCache:   true,
+		MaxFileHandles:               0,             // 0 means auto-detect (ulimit/2)
+		LeaseDuration:                toml.Duration(30 * time.Second),
+		LeaseCheckInterval:           toml.Duration(5 * time.Second),
+		EnableFileHandleCache:        true,
 		LazyLoadShardEnable:          true,
 		InterruptQuery:               true,
 		InterruptSqlMemPct:           DefaultInterruptSqlMemPct,

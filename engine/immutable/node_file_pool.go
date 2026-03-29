@@ -141,3 +141,18 @@ func (p *NodeFilePool) evictOneLocked() {
 		}
 	}
 }
+
+var nodeFilePool *NodeFilePool
+
+// InitNodeFilePool initializes the global NodeFilePool singleton.
+// Must be called once at startup before any query runs.
+func InitNodeFilePool(maxHandles int) {
+	nodeFilePool = NewNodeFilePool(maxHandles, func(f PoolFile) error {
+		return f.FreeFileHandle()
+	})
+}
+
+// GetNodeFilePool returns the global NodeFilePool singleton.
+func GetNodeFilePool() *NodeFilePool {
+	return nodeFilePool
+}
