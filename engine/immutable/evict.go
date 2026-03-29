@@ -43,8 +43,20 @@ func init() {
 	go nodeTableStoreGC.GC()
 }
 
+// UnrefFiles decrements tsspFile ref for each file.
+// If skip map is provided (from UnrefFilesReader return value), files in the map
+// are skipped because their tsspFile ref was already 0 (they entered the Lease).
 func UnrefFiles(files ...TSSPFile) {
+	UnrefFilesWithLease(nil, files...)
+}
+
+// UnrefFilesWithLease decrements tsspFile ref for each file, skipping files in the
+// optional leased map (typically returned by UnrefFilesReader).
+func UnrefFilesWithLease(leased map[TSSPFile]bool, files ...TSSPFile) {
 	for _, f := range files {
+		if leased != nil && leased[f] {
+			continue // file entered Lease, tsspFile ref already 0
+		}
 		f.Unref()
 	}
 }
@@ -55,10 +67,17 @@ func RefFilesReader(files ...TSSPFile) {
 	}
 }
 
-func UnrefFilesReader(files ...TSSPFile) {
+// UnrefFilesReader decrements the reader ref for each file.
+// Returns a map of files that entered the Lease window (tsspFile ref is already 0
+// for these files, so UnrefFiles must skip Unref() for them to avoid double-decrement).
+func UnrefFilesReader(files ...TSSPFile) map[TSSPFile]bool {
+	leased := make(map[TSSPFile]bool)
 	for _, f := range files {
-		f.UnrefFileReader()
+		if f.UnrefFileReader() {
+			leased[f] = true
+		}
 	}
+	return leased
 }
 
 var (

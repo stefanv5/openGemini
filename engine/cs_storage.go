@@ -311,8 +311,8 @@ func (storage *ColumnStoreImpl) getAllFiles(s *shard, mstName string) ([]immutab
 	csFiles, existCsFiles := s.immTables.GetCSFiles(mstName)
 	csFiles.RLock()
 	defer csFiles.RUnlock()
-	immutable.UnrefFilesReader(csFiles.Files()...)
-	immutable.UnrefFiles(csFiles.Files()...)
+	leased := immutable.UnrefFilesReader(csFiles.Files()...)
+	immutable.UnrefFilesWithLease(leased, csFiles.Files()...)
 	// has no both order and out of order files
 	if !existCsFiles {
 		return nil, nil, nil

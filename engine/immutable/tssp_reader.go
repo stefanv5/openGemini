@@ -322,8 +322,8 @@ func (f *TSSPFiles) GetFilesAndUnref() []TSSPFile {
 	f.RLock()
 	defer f.RUnlock()
 	allFiles = append(allFiles, f.files...)
-	UnrefFilesReader(f.Files()...)
-	UnrefFiles(f.Files()...)
+	leased := UnrefFilesReader(f.Files()...)
+	UnrefFilesWithLease(leased, f.Files()...)
 	return allFiles
 }
 

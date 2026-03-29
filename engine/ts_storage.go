@@ -204,8 +204,8 @@ func (storage *tsstoreImpl) getAllFiles(s *shard, mstName string) ([]immutable.T
 	if existOrderFiles {
 		orderTsspFiles.RLock()
 		allFiles, coldTmpFilesPath, err = genAllFiles(s, orderTsspFiles.Files(), allFiles, coldTmpFilesPath)
-		immutable.UnrefFilesReader(orderTsspFiles.Files()...)
-		immutable.UnrefFiles(orderTsspFiles.Files()...)
+		leased := immutable.UnrefFilesReader(orderTsspFiles.Files()...)
+		immutable.UnrefFilesWithLease(leased, orderTsspFiles.Files()...)
 		orderTsspFiles.RUnlock()
 		if err != nil {
 			return nil, nil, err
@@ -215,8 +215,8 @@ func (storage *tsstoreImpl) getAllFiles(s *shard, mstName string) ([]immutable.T
 	if existOutOfOrderFiles {
 		outOfOrderTsspFiles.RLock()
 		allFiles, coldTmpFilesPath, err = genAllFiles(s, outOfOrderTsspFiles.Files(), allFiles, coldTmpFilesPath)
-		immutable.UnrefFilesReader(outOfOrderTsspFiles.Files()...)
-		immutable.UnrefFiles(outOfOrderTsspFiles.Files()...)
+		leased := immutable.UnrefFilesReader(outOfOrderTsspFiles.Files()...)
+		immutable.UnrefFilesWithLease(leased, outOfOrderTsspFiles.Files()...)
 		outOfOrderTsspFiles.RUnlock()
 		if err != nil {
 			return nil, nil, err
