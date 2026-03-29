@@ -1103,6 +1103,11 @@ func InitQueryFileCache(cap uint32, enable bool) {
 	}
 }
 
+// QueryfileCache is DEPRECATED.
+// It is kept for backward compatibility only.
+// The new file handle manager uses ShardLeaseCache + NodeFilePool.
+// Do not add new functionality here.
+
 type QueryfileCache struct {
 	cache      chan TSSPFile
 	cacheCap   uint32
