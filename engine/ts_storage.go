@@ -18,6 +18,7 @@ package engine
 
 import (
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -72,7 +73,7 @@ func (storage *tsstoreImpl) writeIndex(idx *tsi.IndexBuilder, mw *mstWriteCtx) e
 			if !writeIndexRequired {
 				ri.SeriesId, err = mergeSet.GetSeriesIdBySeriesKey(ri.IndexKey)
 				if err != nil {
-					return err
+					return fmt.Errorf("failed to get series ID by series key: %w", err)
 				}
 				// PrimaryId is equal to SeriesId by default.
 				ri.PrimaryId = ri.SeriesId
@@ -87,11 +88,11 @@ func (storage *tsstoreImpl) writeIndex(idx *tsi.IndexBuilder, mw *mstWriteCtx) e
 	failpoint.Inject("SlowDownCreateIndex", nil)
 	if writeIndexRequired {
 		if err = idx.CreateIndexIfNotExists(mmPoints, true); err != nil {
-			return err
+			return fmt.Errorf("failed to create primary index: %w", err)
 		}
 	} else {
 		if err = idx.CreateSecondaryIndexIfNotExist(mmPoints); err != nil {
-			return err
+			return fmt.Errorf("failed to create secondary index: %w", err)
 		}
 	}
 	atomic.AddInt64(&statistics.PerfStat.WriteIndexDurationNs, time.Since(start).Nanoseconds())

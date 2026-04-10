@@ -18,6 +18,7 @@ package engine
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -203,12 +204,12 @@ func (storage *ColumnStoreImpl) WriteCols(s *shard, cols *record.Record, mst str
 		err := errors.New("can not write cols to downSampled shard")
 		log.Error("write into shard failed", zap.Error(err))
 		if !getDownSampleWriteDrop() {
-			return err
+			return fmt.Errorf("shard is readonly and drop is disabled: %w", err)
 		}
 		if !syscontrol.IsWriteColdShardEnabled() {
 			err = errors.New("forbid by shard moving")
 			log.Error("write into shard failed", zap.Error(err))
-			return err
+			return fmt.Errorf("shard is readonly and cold write is disabled: %w", err)
 		}
 		return nil
 	}
@@ -223,7 +224,7 @@ func (storage *ColumnStoreImpl) WriteCols(s *shard, cols *record.Record, mst str
 	atomic.AddInt64(&statistics.PerfStat.WriteGetTokenDurationNs, time.Since(start).Nanoseconds())
 	if err != nil {
 		s.log.Info("Alloc resource failed, need retry", zap.Int64("current mem size", curSize))
-		return err
+		return fmt.Errorf("failed to allocate mutable resource: %w", err)
 	}
 
 	var indexErr error
@@ -242,7 +243,7 @@ func (storage *ColumnStoreImpl) WriteCols(s *shard, cols *record.Record, mst str
 	err = s.writeCols(cols, binaryCols, mst)
 	indexWg.Wait()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to write cols: %w", err)
 	}
 	s.activeTbl.AddMemSize(curSize)
 	return indexErr

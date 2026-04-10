@@ -464,14 +464,14 @@ func (s *shard) writeCols(cols *record.Record, binaryCols []byte, mst string) er
 	err := cs.writeCols(s, cols, mst)
 	if err != nil {
 		log.Error("write cols rec to memory table fail", zap.Uint64("shard", s.ident.ShardID), zap.Error(err))
-		return err
+		return fmt.Errorf("failed to write cols to memtable: %w", err)
 	}
 	atomic.AddInt64(&statistics.PerfStat.WriteRowsDurationNs, time.Since(start).Nanoseconds())
 
 	// write wal
 	if err = s.wal.Write(binaryCols, WriteWalArrowFlight, 0); err != nil {
 		log.Error("write cols rec to wal fail", zap.Uint64("shard", s.ident.ShardID), zap.Error(err))
-		return err
+		return fmt.Errorf("failed to write cols to WAL: %w", err)
 	}
 	return nil
 }
@@ -628,14 +628,14 @@ func (s *shard) writeRows(mw *mstWriteCtx, binaryRows []byte, curSize int64) err
 	err := s.activeTbl.MTable.WriteRows(s.activeTbl, mmPoints, ctx)
 	if err != nil {
 		log.Error("write rows to memory table fail", zap.Uint64("shard", s.ident.ShardID), zap.Error(err))
-		return err
+		return fmt.Errorf("failed to write rows to memtable: %w", err)
 	}
 
 	atomic.AddInt64(&statistics.PerfStat.WriteRowsDurationNs, time.Since(start).Nanoseconds())
 
 	if err = s.wal.Write(binaryRows, WriteWalLineProtocol, mw.maxTime); err != nil {
 		log.Error("write rows to wal fail", zap.Uint64("shard", s.ident.ShardID), zap.Error(err))
-		return err
+		return fmt.Errorf("failed to write rows to WAL: %w", err)
 	}
 
 	return nil
@@ -651,7 +651,7 @@ func (s *shard) WriteCols(mst string, cols *record.Record, binaryCols []byte) er
 	if err := s.storage.WriteCols(s, cols, mst, binaryCols); err != nil {
 		log.Error("write buffer failed", zap.Error(err))
 		atomic.AddInt64(&statistics.PerfStat.WriteReqErrors, 1)
-		return err
+		return fmt.Errorf("failed to write cols to storage: %w", err)
 	}
 	s.addRowCounts(int64(cols.RowNums()))
 	atomic.AddInt64(&statistics.PerfStat.WriteRowsBatch, 1)
