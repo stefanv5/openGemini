@@ -20,6 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 
 	"github.com/openGemini/openGemini/lib/errno"
 	"github.com/openGemini/openGemini/lib/fileops"
@@ -45,6 +47,13 @@ type mergePerformer struct {
 	// The remaining unordered data that does not intersect the series
 	// needs to be written into this file
 	lastFile bool
+
+	// splitDisabled is set when an in-progress split attempt cannot proceed
+	// (candidate exact-next path already has a .tssp.init, or extent would
+	// overflow MaxUint16). Once set, the current G run continues to EOF
+	// without further rotation attempts. Sticky for the lifetime of this
+	// performer run.
+	splitDisabled bool
 
 	// The series of the current ordered data does not exist in the unordered data
 	noUnorderedSeries bool
@@ -83,6 +92,7 @@ func (p *mergePerformer) Reset(sw *StreamWriteFile, last bool) {
 	p.sw = sw
 	p.cw = newColumnWriter(sw, GetMaxRowsPerSegment4TsStore())
 	p.lastFile = last
+	p.splitDisabled = false
 }
 
 func (p *mergePerformer) Handle(col *record.ColVal, times []int64, lastSeg bool) error {
@@ -111,6 +121,16 @@ func (p *mergePerformer) SeriesChanged(sid uint64, orderTimes []int64) error {
 	p.stat.OrderSeriesCount++
 
 	if err := p.finishSeries(sid); err != nil {
+		return err
+	}
+	// Lazy split boundary (47.6 SeriesChanged + last-remaining→ordered):
+	// the previous series (and any remaining unordered data with sid <
+	// nextSID, drained inside finishSeries via writeRemain) is fully
+	// flushed. Probe rotation before starting the new series. This single
+	// call covers both the ordered/prev→ordered/current boundary and the
+	// final remaining-A→ordered/current boundary (finishSeries is the
+	// common tail of both paths).
+	if err := p.maybeRotateBefore(sid); err != nil {
 		return err
 	}
 	if len(orderTimes) == 0 {
@@ -192,9 +212,168 @@ func (p *mergePerformer) Finish() error {
 		return err
 	}
 
-	p.AppendMergedFile(file)
+	// F-04: nil guard. NewTSSPFile may return (nil, nil) when the stream is
+	// empty (errEmptyFile is already cleaned up inside NewTSSPFile). Skip
+	// appending in that case to avoid nil-deref downstream.
+	if file != nil {
+		p.AppendMergedFile(file)
+	}
 
 	return nil
+}
+
+// maybeRotateBefore is the lazy split boundary for the G (global-last) file.
+// It is invoked at series-change points (SeriesChanged and writeRemain
+// callback) AFTER the previous series has been fully flushed to the current
+// writer and BEFORE the next series (nextSID) is started.
+//
+// Pre-flight (47.5): the current writer is still writable when we probe the
+// candidate exact-next path, so on a soft-stop (.init exists / extent
+// overflow) we can keep appending to the current file. Only after the
+// pre-flight passes do we seal the current file and create the exact-next.
+//
+// Sticky: once splitDisabled is set, this method becomes a no-op for the
+// remainder of the performer run.
+//
+// nextSID is accepted for symmetry/documentation; the decision to rotate is
+// based only on file size and path availability, not on the SID value.
+func (p *mergePerformer) maybeRotateBefore(nextSID uint64) error {
+	_ = nextSID
+	if !p.lastFile || p.splitDisabled {
+		return nil
+	}
+
+	// Size gate: only consider rotation when the current writer has reached
+	// its configured file-size limit. Read the limit from p.sw.Conf (the
+	// writer's own config) rather than the process-global TsStoreConfig: the
+	// writer may have been constructed with a per-store Config copy that
+	// diverges from the global, and the gate must reflect what the writer
+	// actually enforces.
+	if p.sw.Size() < p.sw.Conf.GetFileSizeLimit() {
+		return nil
+	}
+
+	// Build the candidate exact-next file name from the current writer's
+	// live fileName: (seq, level, merge, extent+1). NewFile(addFileExt=true)
+	// will later increment extent, so we probe extent+1 here to detect
+	// collisions before committing.
+	cur := p.sw.fileName
+	if cur.extent == math.MaxUint16 {
+		// extent would overflow; give up on splitting for this run.
+		p.splitDisabled = true
+		return nil
+	}
+	candidate := cur
+	candidate.extent++
+
+	dir := filepath.Join(p.sw.dir, p.sw.name)
+	initPath := candidate.Path(dir, true)   // .tssp.init
+	finalPath := candidate.Path(dir, false) // .tssp
+
+	// Pre-flight order (49.2): probe the FINALIZED .tssp path first, then the
+	// in-progress .init path. A sealed .tssp at the exact-next slot is a hard
+	// failure (ambiguous lineage — we must not shadow or overwrite a sealed
+	// file) and must be surfaced even if a stale .init also happens to be
+	// present; checking .init first would soft-stop and silently hide the
+	// harder conflict. Only when the .tssp slot is clear do we check .init
+	// for a soft-stop (concurrent writer mid-creation).
+	if _, err := fileops.Stat(finalPath); err == nil {
+		return fmt.Errorf("file(%s) exist", finalPath)
+	} else if !os.IsNotExist(err) {
+		// Genuine IO error probing the finalized path — surface it.
+		return err
+	}
+
+	// .tssp slot is clear. Probe the .init path. Existence means another
+	// writer (or a crashed prior run) is mid-creation of this exact-next
+	// file; soft-stop so we keep appending to the current writer.
+	if _, err := fileops.Stat(initPath); err == nil {
+		p.splitDisabled = true
+		return nil
+	} else if !os.IsNotExist(err) {
+		// Genuine IO error probing the path — surface it.
+		return err
+	}
+
+	// Pre-flight passed. Seal the current writer into a TSSPFile and append
+	// it to the merged set. NewTSSPFile(true) Flush+CreateTSSPFileReader on
+	// the current fd; the returned file carries the pre-rotation fileName
+	// (the current extent, pre-increment).
+	sealed, err := p.sw.NewTSSPFile(true)
+	if err != nil {
+		return err
+	}
+	if sealed != nil {
+		p.AppendMergedFile(sealed)
+	}
+
+	// Reset stale file-level state from the just-sealed file BEFORE
+	// initializing the next file. StreamWriteFile.NewFile (called inside
+	// InitMergedFile) only resets the embedded TableData (trailerData,
+	// bloomFilter, metaIndexItems, inMemBlock) and sets trailer.name; it
+	// leaves trailer (struct fields like idCount/minTime/maxId), mIndex,
+	// pair, cmOffset, currentCMOffset, chunkRows, maxChunkRows, fileSize,
+	// dstMeta, schema, and rowCount carrying stale values from the sealed
+	// file. Those would corrupt the next file's meta/offset index if left
+	// in place.
+	//
+	// Ordering rationale (49.3): NewFile is the LAST file-level
+	// initialization for the new fd/trailer/measurement name. It must run
+	// AFTER the stale-state reset, so the reset cannot clobber anything
+	// NewFile established. The mirror reference is StreamIterators.reset in
+	// stream_compact.go (consecutive-file rotation on a stream writer),
+	// which follows the same "clear-then-init" shape.
+	resetStreamWriteFileForRotation(p.sw)
+
+	// Create the exact-next file in-place on the same StreamWriteFile.
+	// InitMergedFile(sealed, {addFileExt:true}) sets c.fileName = sealed's
+	// name (== pre-rotation extent) and then NewFile(true) increments
+	// extent, yielding exactly the candidate path we just probed.
+	if err := p.sw.InitMergedFile(sealed, initMergedFileOptions{addFileExt: true}); err != nil {
+		// Current file is already sealed; we cannot recover this run.
+		return err
+	}
+
+	// Reset merge-performer writer-local state for the fresh file. The new
+	// writer has a clean fd/trailer, so the column writer must be replaced
+	// (the old cw holds remain/remainTime segments for the sealed file) and
+	// all active-series state must be cleared.
+	p.cw = newColumnWriter(p.sw, GetMaxRowsPerSegment4TsStore())
+	p.sid = 0
+	p.ref = nil
+	p.unorderedSchemas = nil
+	p.noUnorderedSeries = false
+	p.noUnorderedColumn = false
+	p.mergedTimes = p.mergedTimes[:0]
+	p.mergedTimeCol.Init()
+	p.nilCol.Init()
+
+	return nil
+}
+
+// resetStreamWriteFileForRotation clears the StreamWriteFile file-level
+// fields that NewFile (and its internal TableData.reset) does not touch.
+// Without this, a second file created on the same StreamWriteFile inherits
+// stale trailer / currentCMOffset / pair / chunkRows / dstMeta state from
+// the previously-sealed file, corrupting the new file's chunk-meta offsets
+// and id/time index.
+//
+// This is the merge-rotation analogue of StreamIterators.reset
+// (stream_compact.go:430). It lives here rather than in stream_downsample.go
+// to keep the general NewFile/InitMergedFile path unchanged for compaction
+// and downsample callers.
+func resetStreamWriteFileForRotation(c *StreamWriteFile) {
+	c.trailer.reset()
+	c.mIndex.reset()
+	c.pair.Reset(c.name)
+	c.cmOffset = c.cmOffset[:0]
+	c.currentCMOffset = 0
+	c.chunkRows = 0
+	c.maxChunkRows = 0
+	c.fileSize = 0
+	c.dstMeta = ChunkMeta{}
+	c.schema = c.schema[:0]
+	c.rowCount = make(map[string]int)
 }
 
 func (p *mergePerformer) finishSeries(sid uint64) error {
@@ -258,6 +437,12 @@ func (p *mergePerformer) writeRemain(maxSid uint64) error {
 	err := p.ur.ReadRemain(maxSid, func(sid uint64, ref record.Field, col *record.ColVal, times []int64) error {
 		if lastSid != sid {
 			if err := p.sw.WriteCurrentMeta(); err != nil {
+				return err
+			}
+			// Lazy split boundary (47.6 remaining-A→remaining-B):
+			// the previous remaining sid is sealed via WriteCurrentMeta
+			// above. Probe rotation before starting the new remaining sid.
+			if err := p.maybeRotateBefore(sid); err != nil {
 				return err
 			}
 			p.sid = sid

@@ -93,32 +93,29 @@ func (m *MmsTables) Listen(signal chan struct{}, onClose func()) {
 	}()
 }
 
-func (m *MmsTables) replaceMergedFiles(name string, lg *zap.Logger, old []TSSPFile, new []TSSPFile) error {
-	needReplaced := make(map[string]TSSPFile, len(old))
-	for _, of := range old {
-		for _, nf := range new {
-			_, s1 := of.LevelAndSequence()
-			_, s2 := nf.LevelAndSequence()
-
-			if s1 == s2 && of.FileNameExtend() == nf.FileNameExtend() {
-				needReplaced[of.Path()] = of
-			}
-		}
-	}
-
-	old = old[:0]
-	for _, f := range needReplaced {
-		old = append(old, f)
-		newFileName := new[len(old)-1].FileName()
-		oldFileName := f.FileName()
+// replaceMergedFiles swaps the order files that were actually processed by
+// execute (processedOld) with the newly produced merged files (producedNew).
+//
+// Unlike the previous (seq, extent) reverse-matching implementation, this
+// trusts the processedOld list assembled by execute — only files that entered
+// the itr.Run path (and succeeded) are passed in. Skipped order files are
+// excluded, so they survive the merge. ReplaceFiles deletes every file in
+// processedOld and adds every file in producedNew.
+func (m *MmsTables) replaceMergedFiles(name string, lg *zap.Logger, processedOld, producedNew []TSSPFile) error {
+	for _, f := range processedOld {
+		fn := f.FileName()
 		lg.Info("replace merged file",
-			zap.String("old file", oldFileName.String()),
-			zap.Int64("old size", f.FileSize()),
-			zap.String("new file", newFileName.String()),
-			zap.Int64("new size", new[len(old)-1].FileSize()))
+			zap.String("old file", fn.String()),
+			zap.Int64("old size", f.FileSize()))
+	}
+	for _, f := range producedNew {
+		fn := f.FileName()
+		lg.Info("replace merged file",
+			zap.String("new file", fn.String()),
+			zap.Int64("new size", f.FileSize()))
 	}
 
-	return m.ReplaceFiles(name, old, new, true)
+	return m.ReplaceFiles(name, processedOld, producedNew, true)
 }
 
 func (m *MmsTables) getFilesByPath(mst string, path []string, order bool) (*TSSPFiles, error) {
@@ -262,6 +259,73 @@ func (m *MmsTables) matchOrderFiles(ctx *mergeContext) {
 	if ctx.order.Len() == 0 {
 		ctx.order.add(files.Files()[files.Len()-1])
 	}
+}
+
+// selectGlobalLast identifies G — the global-last live ordered file for ctx.mst
+// (the file with the largest (seq, extent) in the full live ordered set, not
+// just the time-matched subset in ctx.order) — and records its exact path in
+// ctx.globalLastPath. execute compares against this path (instead of
+// i == order.Len()-1) so that G always carries lastFile semantics for the
+// maxOrderTime=MaxInt64 split, even when G was de-dup-added to ctx.order after
+// the time-matched files.
+//
+// G is also de-dup-added to ctx.order so that acquire(ctx.order.path) pins it
+// and execute's iteration visits it. A duplicate logical owner — two adjacent
+// live files with the same (seq, extent) but different exact paths — is a hard
+// failure: the lineage is ambiguous and merge must not proceed.
+func (m *MmsTables) selectGlobalLast(ctx *mergeContext) error {
+	files, ok := m.getTSSPFiles(ctx.mst, true)
+	if !ok {
+		return fmt.Errorf("selectGlobalLast: no order files for measurement %s", ctx.mst)
+	}
+
+	// Lock before reading files.Len() (49.5.2): TSSPFiles.files is a slice
+	// that concurrent merge/compact goroutines append to, so an unsynchronized
+	// Len() here races with append and can observe a stale length. Take the
+	// RLock first, then read Len and Files under the same critical section.
+	files.lock.RLock()
+	defer files.lock.RUnlock()
+
+	if files.Len() == 0 {
+		return fmt.Errorf("selectGlobalLast: no order files for measurement %s", ctx.mst)
+	}
+
+	liveFiles := files.Files()
+	if len(liveFiles) == 0 {
+		return fmt.Errorf("selectGlobalLast: empty order file set for measurement %s", ctx.mst)
+	}
+
+	// liveFiles is sorted by (seq, extent). Two adjacent files sharing the same
+	// (seq, extent) but different paths indicate a duplicate logical owner —
+	// the lineage is ambiguous, so fail hard rather than risk a wrong G.
+	// LevelAndSequence returns (level, seq); the logical-owner key is (seq, extent).
+	_, prevSeq := liveFiles[0].LevelAndSequence()
+	prevExt := liveFiles[0].FileNameExtend()
+	prevPath := liveFiles[0].Path()
+	for i := 1; i < len(liveFiles); i++ {
+		_, seq := liveFiles[i].LevelAndSequence()
+		ext := liveFiles[i].FileNameExtend()
+		path := liveFiles[i].Path()
+		if seq == prevSeq && ext == prevExt && path != prevPath {
+			return fmt.Errorf("selectGlobalLast: duplicate logical owner (seq=%d, extent=%d) with distinct paths %q vs %q for measurement %s",
+				seq, ext, prevPath, path, ctx.mst)
+		}
+		prevSeq, prevExt, prevPath = seq, ext, path
+	}
+
+	g := liveFiles[len(liveFiles)-1]
+	ctx.globalLastPath = g.Path()
+
+	// De-dup-add G to ctx.order so its path is pinned by acquire(ctx.order.path)
+	// and execute's iteration visits it. If G was already time-matched it is
+	// already present and we skip the append.
+	for _, p := range ctx.order.path {
+		if p == ctx.globalLastPath {
+			return nil
+		}
+	}
+	ctx.order.add(g)
+	return nil
 }
 
 func (m *MmsTables) deleteUnorderedFiles(mst string, files []TSSPFile) {

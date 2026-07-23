@@ -136,6 +136,11 @@ func (itr *ColumnIterator) Run(p ColumnIteratorPerformer) error {
 	}
 }
 
+type initMergedFileOptions struct {
+	addFileExt bool // Whether to add file extension (increment extent)
+	addMerge   bool // Whether to increment merge counter
+}
+
 func (itr *ColumnIterator) walkColumn(p ColumnIteratorPerformer) error {
 	colIdx, timeIdx := 0, 0
 

@@ -38,6 +38,16 @@ type mergeContext struct {
 	tr        util.TimeRange
 	order     *mergeFileInfo
 	unordered *mergeFileInfo
+
+	// globalLastPath is the exact path of G — the global-last ordered file for
+	// this measurement's live ordered set (the file with the largest
+	// (seq, extent) among all currently-live ordered files, not merely the
+	// last file in ctx.order). execute uses this to decide isGlobalLast
+	// instead of positionally comparing i == order.Len()-1, so that G is
+	// always Run (and always carries the lastFile semantics for the
+	// maxOrderTime=MaxInt64 split) even when it was de-dup-added to ctx.order
+	// after the time-matched files.
+	globalLastPath string
 }
 
 func (ctx *mergeContext) reset() {
@@ -47,6 +57,7 @@ func (ctx *mergeContext) reset() {
 	ctx.tr.Max = math.MinInt64
 	ctx.order.reset()
 	ctx.unordered.reset()
+	ctx.globalLastPath = ""
 }
 
 func (ctx *mergeContext) AddUnordered(f TSSPFile) bool {

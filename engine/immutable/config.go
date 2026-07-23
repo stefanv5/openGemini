@@ -147,6 +147,10 @@ func (c *Config) GetMaxSegmentLimit() int {
 	return c.maxSegmentLimit
 }
 
+func (c *Config) GetFileSizeLimit() int64 {
+	return c.fileSizeLimit
+}
+
 func (c *Config) GetCompactionEnabled() bool {
 	return c.compactionEnabled
 }

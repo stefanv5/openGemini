@@ -597,6 +597,62 @@ func TestMergeTool_PreAgg(t *testing.T) {
 	}
 }
 
+// TestMergeTool_LazySplitRotation exercises the maybeRotateBefore lazy-split
+// boundary (47.5/47.6) by forcing a tiny global fileSizeLimit so that the G
+// writer exceeds the limit mid-run. The merge must:
+//   - succeed,
+//   - produce more than one ordered merged file for G (extent 0 then 1),
+//   - preserve data correctness across the split.
+func TestMergeTool_LazySplitRotation(t *testing.T) {
+	var begin int64 = 1e12
+	defer beforeTest(t, 16)()
+
+	// Force the global tsstore config file-size limit down to its minimum so
+	// maybeRotateBefore (which reads GetTsStoreConfig().GetFileSizeLimit())
+	// triggers at series-change boundaries once the writer has accumulated
+	// enough data.
+	origLimit := immutable.GetTsStoreConfig().GetFileSizeLimit()
+	immutable.GetTsStoreConfig().SetFilesLimit(1 * 1024 * 1024) // minFileSizeLimit
+	defer immutable.GetTsStoreConfig().SetFilesLimit(origLimit)
+
+	mh := NewMergeTestHelper(immutable.NewTsStoreConfig())
+	defer mh.store.Close()
+	rg := newRecordGenerator(begin, defaultInterval, true)
+
+	// A single ordered file (this will be G — global-last) with multiple
+	// series and enough rows to exceed the tiny size limit.
+	mh.addRecord(100, rg.generate(getDefaultSchemas(), 50000))
+	mh.addRecord(101, rg.generate(getDefaultSchemas(), 50000))
+	mh.addRecord(102, rg.generate(getDefaultSchemas(), 50000))
+	require.NoError(t, mh.saveToOrder())
+
+	// Unordered data intersecting the same series so the Run path is taken.
+	rg.setBegin(begin + 1)
+	mh.addRecord(100, rg.generate(getDefaultSchemas(), 500))
+	mh.addRecord(101, rg.generate(getDefaultSchemas(), 500))
+	mh.addRecord(102, rg.generate(getDefaultSchemas(), 500))
+	require.NoError(t, mh.saveToUnordered())
+
+	require.NoError(t, mh.mergeAndCompact(true))
+
+	// Data correctness across the split.
+	assert.NoError(t, compareRecords(mh.readExpectRecord(), mh.readMergedRecord()))
+
+	// Rotation invariant: the ordered set for mst must contain more than one
+	// file (extent 0 + extent 1+), proving maybeRotateBefore fired.
+	orderFiles := mh.store.Order["mst"].Files()
+	assert.Greater(t, len(orderFiles), 1,
+		"lazy split should have produced multiple ordered files for G")
+
+	// Extent contiguity: rotated files must be (seq, extent=0), (seq, extent=1),
+	// ... — same seq, increasing extent — since InitMergedFile(sealed,
+	// {addFileExt:true}) advances extent on each rotation.
+	for i, f := range orderFiles {
+		assert.Equal(t, uint16(0)+uint16(i), f.FileNameExtend(),
+			"ordered file %d has unexpected extent", i)
+	}
+}
+
 func TestMergeTool_CleanTmpFiles(t *testing.T) {
 	var begin int64 = 1e12
 	defer beforeTest(t, 16)()

@@ -17,11 +17,16 @@ limitations under the License.
 package immutable
 
 import (
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
 	"github.com/openGemini/openGemini/lib/config"
 	"github.com/openGemini/openGemini/lib/errno"
+	"github.com/openGemini/openGemini/lib/fileops"
 	"github.com/openGemini/openGemini/lib/logger"
 	"github.com/openGemini/openGemini/lib/record"
 	"github.com/openGemini/openGemini/lib/statisticsPusher/statistics"
@@ -110,10 +115,20 @@ func (mt *mergeTool) mergePrepare(ctx *mergeContext, force bool) bool {
 		return false
 	}
 
+	// Select G (global-last live ordered file) and de-dup-add it to ctx.order
+	// before acquire so its path is pinned. Hard-fail (skip this merge) on a
+	// duplicate logical owner — the lineage is ambiguous and merge must not
+	// proceed against an ambiguous G.
+	if err := mt.mts.selectGlobalLast(ctx); err != nil {
+		mt.zlg.Error("select global last order file failed", zap.Error(err))
+		return false
+	}
+
 	mt.zlg.Info("order file info",
 		zap.Int("order file count", len(ctx.order.seq)),
 		zap.Uint64s("order sequences", ctx.order.seq),
-		zap.Int64("order file size", ctx.order.size))
+		zap.Int64("order file size", ctx.order.size),
+		zap.String("global last file", ctx.globalLastPath))
 
 	if !mt.mts.acquire(ctx.order.path) {
 		mt.zlg.Warn("acquire is false, skip merge")
@@ -155,14 +170,14 @@ func (mt *mergeTool) merge(ctx *mergeContext, force bool) {
 		mt.stat.StatOrderFile(ctx.order.size, ctx.order.Len())
 		mt.stat.StatOutOfOrderFile(ctx.unordered.size, ctx.unordered.Len())
 
-		mergedFiles, err := mt.execute(ctx.mst, order, unordered)
+		mergedFiles, processedOld, err := mt.execute(ctx.mst, ctx.globalLastPath, order, unordered)
 		if err != nil {
 			mt.zlg.Error("failed to merge unordered files", zap.Error(err))
 			return
 		}
 
 		mt.stat.StatMergedFile(SumFilesSize(mergedFiles.Files()), mergedFiles.Len())
-		if err := mt.mts.replaceMergedFiles(ctx.mst, mt.zlg, order.Files(), mergedFiles.Files()); err != nil {
+		if err := mt.mts.replaceMergedFiles(ctx.mst, mt.zlg, processedOld, mergedFiles.Files()); err != nil {
 			mt.zlg.Error("failed to replace merged files", zap.Error(err))
 			return
 		}
@@ -198,24 +213,64 @@ func (mt *mergeTool) contains(ur *UnorderedReader, f TSSPFile) bool {
 	return false
 }
 
-func (mt *mergeTool) execute(mst string, order, unordered *TSSPFiles) (*TSSPFiles, error) {
+func (mt *mergeTool) execute(mst string, globalLastPath string, order, unordered *TSSPFiles) (*TSSPFiles, []TSSPFile, error) {
 	ur := NewUnorderedReader(mt.lg)
 	ur.AddFiles(unordered.Files())
 	p := NewMergePerformer(ur, mt.stat)
 
+	// processedOld records the order files that actually entered the Run path
+	// (and succeeded). Files that were skipped via `continue` (disjoint and
+	// not last) are NOT included. replaceMergedFiles uses this list directly
+	// instead of reverse-matching by (seq, extent), so skipped files are left
+	// untouched.
+	var processedOld []TSSPFile
+
 	var err error
-	for i, f := range order.Files() {
-		last := order.Len() == (i + 1)
-		if !last && !mt.contains(ur, f) {
+	for _, f := range order.Files() {
+		// isGlobalLast is decided by exact identity (G's path), not by
+		// position i == order.Len()-1. G — the global-last live ordered file —
+		// is the only file that carries lastFile semantics (maxOrderTime is
+		// forced to MaxInt64 in mergePerformer.Handle/SeriesChanged so the
+		// remaining unordered data is consumed). G MUST Run even when
+		// contains=false (it has to absorb the unordered tail); non-G files
+		// are skipped when they don't intersect any unordered series.
+		isGlobalLast := f.Path() == globalLastPath
+		if !isGlobalLast && !mt.contains(ur, f) {
 			continue
 		}
 
-		sw := mt.mts.NewStreamWriteFile(mst)
-		if err = sw.InitMergedFile(f); err != nil {
+		// First-output dual-path check (47.4.1). Before creating the first
+		// merged output for this processed old file, verify the exact first
+		// output path — (f.seq, f.level, f.merge+1, f.extent), produced by
+		// InitMergedFile(f, {addMerge:true, addFileExt:false}) — is free at
+		// both the .tssp.init (in-progress) and .tssp (finalized) layers.
+		// A collision here means the merge generation lineage is ambiguous;
+		// hard-fail this merge run rather than shadow or overwrite a sealed
+		// file.
+		if err = mt.checkFirstOutputFree(mst, f); err != nil {
 			break
 		}
 
-		p.Reset(sw, last)
+		sw := mt.mts.NewStreamWriteFile(mst)
+		// First file of a new merge generation: addMerge=true enters the new
+		// merge counter (so replaceMergedFiles can later identify this as a
+		// produced file of the processed old), addFileExt=false inherits the
+		// old extent (keeps the (seq, extent) lineage stable across generations).
+		if err = sw.InitMergedFile(f, initMergedFileOptions{addMerge: true}); err != nil {
+			// Cleanup ownership (49.4): on first-output InitMergedFile failure
+			// the sw is NOT yet handed to the performer (p.Reset below has not
+			// run), so p.CleanTmpFiles at the tail of execute will not touch
+			// it. InitMergedFile may have already created the .init fd (NewFile
+			// opens the fd before any later step can fail), so we must
+			// explicitly release the fd and remove the .init file here to
+			// avoid leaking a file descriptor and a stray .init that would
+			// collide with the next merge attempt's first-output probe
+			// (checkFirstOutputFree hard-fails on an existing .init).
+			sw.Close(true)
+			break
+		}
+
+		p.Reset(sw, isGlobalLast)
 		itr := NewColumnIterator(NewFileIterator(f, mt.lg))
 
 		mt.mts.Listen(itr.signal, func() {
@@ -224,14 +279,50 @@ func (mt *mergeTool) execute(mst string, order, unordered *TSSPFiles) (*TSSPFile
 		if err = itr.Run(p); err != nil {
 			break
 		}
+		processedOld = append(processedOld, f)
 	}
 
 	if err != nil {
 		p.CleanTmpFiles()
-		return nil, err
+		return nil, nil, err
 	}
 
-	return p.MergedFiles(), nil
+	return p.MergedFiles(), processedOld, nil
+}
+
+// checkFirstOutputFree verifies the first merged output path for processed-old
+// file f is free. The first output name is (f.seq, f.level, f.merge+1, f.extent)
+// — mirroring InitMergedFile(f, {addMerge:true, addFileExt:false}) which sets
+// c.fileName = f.FileName() then merge++ (extent untouched).
+//
+// Both the .tssp.init (in-progress) and .tssp (finalized) layers are probed.
+// Either existing is a hard failure: .init means a concurrent writer is mid-
+// creation; .tssp means a sealed file already occupies that lineage slot.
+// merge==MaxUint16 is also a hard failure (merge counter overflow).
+func (mt *mergeTool) checkFirstOutputFree(mst string, f TSSPFile) error {
+	fn := f.FileName()
+	if fn.merge == math.MaxUint16 {
+		return fmt.Errorf("merge counter overflow: file(%s) merge=%d",
+			f.Path(), fn.merge)
+	}
+	first := fn
+	first.merge++
+
+	dir := filepath.Join(mt.mts.path, mst)
+	initPath := first.Path(dir, true)   // .tssp.init
+	finalPath := first.Path(dir, false) // .tssp
+
+	if _, err := fileops.Stat(initPath); err == nil {
+		return fmt.Errorf("file(%s) exist", initPath)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if _, err := fileops.Stat(finalPath); err == nil {
+		return fmt.Errorf("file(%s) exist", finalPath)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func (mt *mergeTool) mergeSelf(ctx *mergeContext, files *TSSPFiles) {

@@ -218,19 +218,22 @@ func (c *StreamWriteFile) InitFile(seq uint64) error {
 	return nil
 }
 
-func (c *StreamWriteFile) InitMergedFile(f TSSPFile) error {
+func (c *StreamWriteFile) InitMergedFile(f TSSPFile, opts initMergedFileOptions) error {
 	c.file = f
-	c.fileName = f.FileName()
-	c.fileName.lock = c.lock
-	c.fileName.merge++
+	fn := f.FileName()
 
-	if err := c.NewFile(false); err != nil {
+	c.fileName = fn
+	c.fileName.lock = c.lock
+
+	if opts.addMerge {
+		c.fileName.merge++
+	}
+	if err := c.NewFile(opts.addFileExt); err != nil {
 		return err
 	}
 
 	return nil
 }
-
 func (c *StreamWriteFile) ChangeSid(sid uint64) {
 	for k := range c.rowCount {
 		delete(c.rowCount, k)
