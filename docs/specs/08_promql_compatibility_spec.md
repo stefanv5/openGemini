@@ -4422,7 +4422,7 @@ type FloatSliceMergeFunc func(prevT, currT []int64, prevV, currV []float64, ts i
 
 #### I.1.3 floatRateReducer（速率 Reducer）
 
-适用于速率类函数（rate/irate/delta/idelta/increase）：
+适用于 irate/idelta（只使用窗口内最后两个点计算速率/差值）：
 
 ```go
 type floatRateReducer struct {
