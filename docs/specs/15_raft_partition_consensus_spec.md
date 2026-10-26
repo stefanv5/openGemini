@@ -1,5 +1,7 @@
 # Module 15: Raft 分区级共识深度审计报告（庖丁解牛版）
 
+> 基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）。本文所有 `file:line` 与代码摘录均以此提交为准。
+
 > openGemini 的 Raft 共识分为两层：**元数据级 Raft**（ts-meta，管理集群元数据）和**分区级 Raft**（ts-store，管理数据副本）。本模块聚焦于分区级 Raft — 它是分布式数据一致性的基石。
 
 ---
@@ -141,6 +143,7 @@ type DBPTInfo struct {
     shards      map[uint64]Shard      // shardID → Shard
     path        string                // 数据目录
     walPath     string                // WAL 目录
+    // ...（其余 30+ 字段略，如 opt、pendingShardDeletes、indexBuilder、lockPath 等）
 }
 ```
 
@@ -284,31 +287,52 @@ sequenceDiagram
 
 ```go
 func (e *EngineImpl) WriteToRaft(db, rp string, ptId uint32, tail []byte) error {
-    // 步骤 1: 包装 DataWrapper
-    wrapper := &raftlog.DataWrapper{
-        Data:      tail,
-        DataType:  raftlog.Normal,
-        Identity:  fmt.Sprintf("%s_%d", database, ptId),
-        ProposeId: node.NextProposeId(),
-    }
-    data := wrapper.Marshal()
+	defer func() {
+		if e := recover(); e != nil {
+			log.Error("runtime panic", zap.String("writeToRaft raise stack:", string(debug.Stack())),
+				zap.Error(errno.NewError(errno.RecoverPanic, e)),
+				zap.String("db", db),
+				zap.Uint32("ptId", ptId))
+		}
+	}()
+	dbpt, err := e.checkAndGetDBPTInfo(db, ptId)
+	if err != nil {
+		return err
+	}
+	// 1.build dataWrapper
+	newTail := make([]byte, 0, len(tail))
+	newTail = append(newTail, tail...)
+	wrapper := &raftlog.DataWrapper{
+		DataType:  raftlog.Normal,
+		Data:      newTail,
+		Identity:  dbpt.node.GetIdentity(),
+		ProposeId: dbpt.node.GenerateProposeId(),
+	}
+	marshal := wrapper.Marshal()
 
-    // 步骤 2: 注册等待 channel
-    ch := node.AddCommittedDataC(wrapper)
+	// 2.add committedDataC
+	var c chan error
+	c, err = dbpt.node.AddCommittedDataC(wrapper)
+	if err != nil {
+		logger.GetLogger().Error("raftNode AddCommitedDataC err", zap.Error(err))
+		return err
+	}
+	defer dbpt.node.RemoveCommittedDataC(wrapper)
 
-    // 步骤 3: 发送到 proposeC
-    dbpt.proposeC <- data
+	// 3.propose
+	dbpt.proposeC <- marshal
 
-    // 步骤 4: 等待提交确认（超时 20 秒）
-    select {
-    case commitedErr := <-ch:
-        if commitedErr != nil {
-            logger.GetLogger().Error("raftNode commitedErr err", zap.Error(commitedErr))
-        }
-        return commitedErr
-    case <-time.After(config.WaitCommitTimeout):
-        return errno.NewError(errno.WriteToRaftTimeoutAfterPropose, wrapper.Identity, wrapper.ProposeId)
-    }
+	// 4.wait committed return
+	timeT := time.After(config.WaitCommitTimeout)
+	select {
+	case commitedErr := <-c:
+		if commitedErr != nil {
+			logger.GetLogger().Error("raftNode commitedErr err", zap.Error(commitedErr))
+		}
+		return commitedErr
+	case <-timeT:
+		return errno.NewError(errno.WriteToRaftTimeoutAfterPropose, wrapper.Identity, wrapper.ProposeId)
+	}
 }
 ```
 
@@ -354,39 +378,77 @@ sequenceDiagram
 
 ### 4.3 核心代码：serveChannels — Raft 事件循环
 
-**代码位置**：`lib/raftconn/node.go`（`serveChannels` 方法）
+**代码位置**：`lib/raftconn/node.go:317-385`（`serveChannels` 方法）
 
 ```go
 func (n *RaftNode) serveChannels() {
-    for {
-        select {
-        case rd := <-n.node.Ready():
-            // Leader: 先发送消息（乐观复制）
-            if n.isLeader() {
-                n.sendMessages(rd.Messages)
-            }
+	var leader bool
 
-            // 保存到磁盘
-            n.Store.Save(rd.HardState, rd.Entries, rd.Snapshot)
+	for {
+		select {
+		case <-n.ctx.Done():
+			n.node.Stop()
+			return
+		case <-n.tick.C:
+			n.node.Tick()
 
-            // Follower: 后发送消息（确保已持久化）
-            if !n.isLeader() {
-                n.sendMessages(rd.Messages)
-            }
+		case rd := <-n.node.Ready():
+			start := time.Now()
+			if rd.SoftState != nil {
+				leader = rd.RaftState == raft.StateLeader
+			}
 
-            // 发布已提交条目
-            n.PublishEntries(rd.CommittedEntries)
+			if leader {
+				// Leader can send messages in parallel with writing to disk.
+				for i := range n.processMessages(rd.Messages) {
+					n.Messages <- &rd.Messages[i]
+				}
+				n.logger.Debug("leader send message successful", zap.Duration("time used", time.Since(start)))
+				start = time.Now()
+			}
 
-            // 处理快照元数据
-            if !raft.IsEmptySnap(rd.Snapshot) {
-                n.confState = rd.Snapshot.Metadata.ConfState
-                n.appliedIndex = rd.Snapshot.Metadata.Index
-            }
+			// wal write
+			n.SaveToStorage(&rd.HardState, rd.Entries, &rd.Snapshot)
+			n.logger.Debug("save to storage successful", zap.Duration("time used", time.Since(start)))
 
-        case <-n.ctx.Done():
-            return
-        }
-    }
+			if raftlog.IsValidSnapshot(rd.Snapshot) {
+				n.confState = &rd.Snapshot.Metadata.ConfState
+				n.appliedIndex = rd.Snapshot.Metadata.Index
+			}
+
+			start = time.Now()
+
+			for rd.MustSync {
+				if err := n.Store.TrySync(); err != nil {
+					n.logger.Error("Error while calling Store.Sync", zap.Error(err))
+					time.Sleep(10 * time.Millisecond)
+					continue
+				}
+				n.logger.Debug("sync store data to disk successful", zap.Duration("time used", time.Since(start)))
+				start = time.Now()
+				break
+			}
+
+			ok := n.PublishEntries(n.entriesToApply(rd.CommittedEntries))
+			if !ok {
+				n.Stop()
+				return
+			}
+
+			n.logger.Debug("publish entries successful", zap.Duration("time used", time.Since(start)))
+			start = time.Now()
+
+			if !leader {
+				// Followers should send messages later.
+				for i := range n.processMessages(rd.Messages) {
+					n.Messages <- &rd.Messages[i]
+				}
+				n.logger.Debug("follower send message successful", zap.Duration("time used", time.Since(start)))
+			}
+
+			n.node.Advance()
+		}
+	}
 }
 ```
 
@@ -472,42 +534,70 @@ raft.meta 就像 Raft 节点的"身份证"。它记录了：我是谁（RaftId�
 
 ### 5.4 RaftDiskStorage.Save() — 核心持久化方法
 
-**代码位置**：`lib/raftlog/storage.go`
+**代码位置**：`lib/raftlog/storage.go:314-329`
 
 ```go
 func (rds *RaftDiskStorage) Save(h *raftpb.HardState, entries []raftpb.Entry, snap *raftpb.Snapshot) error {
-    rds.lock.Lock()
-    defer rds.lock.Unlock()
+	rds.lock.Lock()
+	defer rds.lock.Unlock()
 
-    // 写入日志条目
-    rds.entryLog.AddEntries(entries)
+	if err := rds.entryLog.AddEntries(entries); err != nil {
+		return err
+	}
 
-    // 写入 HardState
-    rds.meta.StoreHardState(h)
-
-    // 写入 Snapshot
-    rds.meta.StoreSnapshot(snap)
-
-    return nil
+	if err := rds.meta.StoreHardState(h); err != nil {
+		return err
+	}
+	if err := rds.meta.StoreSnapshot(snap); err != nil {
+		return err
+	}
+	return nil
 }
 ```
 
 ### 5.5 Sync 策略
 
 ```go
-func (rds *RaftDiskStorage) TrySync() {
-    if rds.firstSync || rds.SyncInterval == 0 {
-        // 立即同步（第一次或配置为 0）
-        rds.meta.Sync()
-        rds.entryLog.current.Sync()
-        rds.firstSync = false
-        return nil
-    }
-    // 当前实现不会为每次 MustSync 启动延迟 goroutine；
-    // SyncInterval 非 0 且不是首次同步时直接返回 nil。
-    return nil
+func (rds *RaftDiskStorage) TrySync() error {
+	if rds.SyncInterval == 0 || rds.firstSync {
+		rds.lock.Lock()
+		defer rds.lock.Unlock()
+
+		if err := rds.meta.meta.TrySync(); err != nil {
+			return errors.Wrapf(err, "while syncing meta")
+		}
+		if err := rds.entryLog.current.entry.TrySync(); err != nil {
+			return errors.Wrapf(err, "while syncing current file")
+		}
+		rds.firstSync = false
+		rds.logger.Info("rds firstSync")
+		return nil
+	}
+	if !rds.syncTaskCount.CompareAndSwap(0, 1) {
+		return nil
+	}
+
+	go func() {
+		rds.backSync()
+	}()
+	return nil
+}
+
+func (rds *RaftDiskStorage) backSync() {
+	time.Sleep(rds.SyncInterval)
+	rds.lock.Lock()
+	if err := rds.meta.meta.TrySync(); err != nil {
+		rds.logger.Error("Error while raftStorage syncing meta", zap.Error(err))
+	}
+	if err := rds.entryLog.current.entry.TrySync(); err != nil {
+		rds.logger.Error("Error while raftStorage syncing current file", zap.Error(err))
+	}
+	rds.lock.Unlock()
+	rds.syncTaskCount.Store(0)
 }
 ```
+
+**行为说明**：`SyncInterval == 0` 或首次同步时立即刷 meta 与当前 entry 文件；否则用 `syncTaskCount` CAS 去重后启动后台 goroutine（`backSync`），延迟 `SyncInterval` 再刷盘，因此 `MustSync` 的语义是「最终落盘」而非「本次调用即落盘」。
 
 ---
 
@@ -519,16 +609,33 @@ func (rds *RaftDiskStorage) TrySync() {
 
 ```go
 func (rds *RaftDiskStorage) CreateSnapshot(i uint64, cs *raftpb.ConfState, data []byte) error {
-    snap := raftpb.Snapshot{
-        Metadata: raftpb.SnapshotMetadata{
-            Index:     i,
-            Term:      term,
-            ConfState: cs,
-        },
-        Data: []byte("snapshot"),  // 占位符，不含实际数据
-    }
-    rds.meta.StoreSnapshot(&snap)
-    return nil
+	rds.lock.Lock()
+	defer rds.lock.Unlock()
+
+	first := rds.firstIndex()
+	if i < first {
+		rds.logger.Error(fmt.Sprintf("i=%d<first=%d, ErrSnapOutOfDate", i, first))
+		return raft.ErrSnapOutOfDate
+	}
+
+	e, err := rds.entryLog.seekEntry(i)
+	if err != nil {
+		return err
+	}
+
+	var snap raftpb.Snapshot
+	snap.Metadata.Index = i
+	snap.Metadata.Term = e.Term()
+	if cs == nil {
+		panic("raft ConfState is nil")
+	}
+	snap.Metadata.ConfState = *cs
+	snap.Data = data
+
+	if err = rds.meta.StoreSnapshot(&snap); err != nil {
+		return err
+	}
+	return nil
 }
 ```
 
@@ -536,6 +643,7 @@ func (rds *RaftDiskStorage) CreateSnapshot(i uint64, cs *raftpb.ConfState, data 
 - 实际数据由存储引擎独立管理（TSSP 文件）
 - Raft 快照只用于**日志压缩** — 记录"这个 index 之前的数据已经全部应用了"
 - 不需要复制大量数据，创建和恢复都非常快
+- `CreateSnapshot` 的 Data 由调用方固定传 `[]byte("snapshot")`（`lib/raftconn/node.go:653`），并校验 `i < firstIndex` 返回 `ErrSnapOutOfDate`
 
 ### 6.2 快照触发流程
 
@@ -662,16 +770,33 @@ sequenceDiagram
 ### 7.3 本地紧急清理
 
 ```go
-func (n *RaftNode) deleteEntryLogBySize() {
-    size := n.Store.EntrySize()
-    if uint64(size) > ClearEntryLogTolerateSize {  // 默认 20GB
-        // 强制本地清理，不通过 Raft
-        n.forceDeleteEntryLogBySize(snapshotIndex)
-    }
+func (n *RaftNode) deleteEntryLogBySize() error {
+	sp, err := n.Store.Snapshot()
+	if err != nil {
+		return err
+	}
+	index := sp.Metadata.Index
+	if index == 0 {
+		return errors.New("dont have a snapshot yet")
+	}
+	return n.forceDeleteEntryLogBySize(index)
+}
+
+func (n *RaftNode) forceDeleteEntryLogBySize(index uint64) error {
+	size := n.Store.EntrySize()
+	if uint64(size) > uint64(config.GetStoreConfig().ClearEntryLogTolerateSize) {
+		logger.GetLogger().Info("clear entry log by size, ", zap.Int("size", size), zap.Uint64("current index is ", index),
+			zap.String("db", n.database), zap.Uint32("pt", n.ptId))
+		err := n.Store.DeleteBefore(index)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 ```
 
-**触发条件**：节点本地日志总大小超过 20GB 时，本节点执行紧急本地清理（不通过 Raft，不限定 Leader）。这条路径直接调用本地 `Store.DeleteBefore(index)`，用于避免单节点磁盘被 EntryLog 撑爆。
+**触发条件**：节点本地日志总大小超过 20GB（`ClearEntryLogTolerateSize`）时，本节点执行紧急本地清理（不通过 Raft，不限定 Leader）。阈值判断在 `forceDeleteEntryLogBySize` 内完成，命中后直接调用本地 `Store.DeleteBefore(index)`，用于避免单节点磁盘被 EntryLog 撑爆。
 
 ---
 
@@ -689,13 +814,15 @@ type SendRaftMessageToStorage interface {
 
 ```go
 func (n *RaftNode) send(msg raftpb.Message) {
-    nodeId := n.peers[GetPtId(msg.To)]  // Raft ID → 物理节点 ID
-    if nodeId == n.store.ID() {          // 目标是本节点时不走网络
-        return
-    }
-    if err := n.ISend.SendRaftMessages(nodeId, n.database, GetPtId(msg.To), msg); err != nil {
-        n.logger.Error("send raft message failed", zap.Error(err))
-    }
+	nodeId := n.peers[GetPtId(msg.To)]
+	if nodeId == n.nodeId {
+		n.logger.Error("sending message to itself")
+		return
+	}
+	err := n.ISend.SendRaftMessages(nodeId, n.database, GetPtId(msg.To), msg)
+	if err != nil {
+		n.logger.Error("send raft message error", zap.Error(err))
+	}
 }
 ```
 
@@ -781,11 +908,9 @@ sequenceDiagram
     Note over Leader: F2 不响应
     Leader->>Leader: 标记 F2 为不可达
 
-    alt SubHealth 上层写入返回策略
-        Leader->>Leader: 只要 F1 确认就提交
-    else Health 模式
-        Leader->>Leader: 等待 F2 恢复
-    end
+    Note over Leader: 提交只需多数派（2/3）：F1 确认即提交，与 RG 状态无关
+    Leader->>Leader: F1 确认 → 提交 Index
+    Note over Leader: Health/SubHealth 由 meta 维护，决定该 RG 的 Pt 是否参与读写路由，不改变 Raft 提交条件
 
     Note over F2: 恢复后
     F2->>Leader: 请求缺失的日志
@@ -793,19 +918,20 @@ sequenceDiagram
     F2->>F2: 追赶日志
 ```
 
-### 10.3 Replication Group 重建
+### 10.3 Replication Group 状态变化与重建
 
-当某个节点长时间不可用时，ts-meta 会触发 RG 重建：
+节点故障会改变 RG 状态（Health → SubHealth/UnFull），但 **`ClearEntryLogTolerateTime`（6h）与 RG 重建无关**——它是 Leader 在 RG 成员不健康时，容忍多久再下发 entry log 清理提议（`ClearEntryLog`）的时间窗口（`lib/raftconn/node.go:786-804`）。RG 的组建/加 peer 由 ts-meta 在新增 DataNode 或建库时完成（`NodeHardChooseRG` / `AzHardChooseRG` → `joinRpGroup`，`lib/util/lifted/influx/meta/replication.go:105-181`）。
 
 ```
 初始状态：Node1(PT0-Master), Node2(PT0-Follower1), Node3(PT0-Follower2)
 Node3 宕机：
-  → RG 状态变为 SubHealth
-  → 等待 ClearEntryLogTolerateTime (6h)
-  → ts-meta 创建新的 RG
-  → Node4 加入 RG
-  → Node4 从 Leader 同步数据
-  → RG 状态恢复为 Health
+  → RG 状态降为 SubHealth/UnFull（由 meta 的 PtView / RG 状态机维护）
+  → 该 RG 中不可用的 Pt 不再参与读写路由（getAliveShardsForRepDB 只选 Health + MasterPt 或 SubHealth + Online）
+  → （6h 的 ClearEntryLogTolerateTime 只影响 entry log 清理提议，不触发 RG 重建）
+Node4 加入集群（新增 DataNode）：
+  → ts-meta 调用 NodeHardChooseRG / AzHardChooseRG
+  → joinRpGroup 把 Node4 的 Pt 加入未满的 RG（UnFull → 逐步补齐）
+  → 成员补齐后 RG 状态恢复为 Health
 ```
 
 ---
@@ -832,7 +958,7 @@ Node3 宕机：
 
 步骤 3: 注册等待 channel
   ch := node.AddCommittedDataC(wrapper)
-  → DataCommittedC[42] = make(chan error, 1)
+  → DataCommittedC[42] = make(chan error)  // 无缓冲，重复 ProposeId 会返回 UsedProposeId
 
 步骤 4: 发送到 proposeC
   proposeC <- marshalledData

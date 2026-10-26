@@ -1,5 +1,7 @@
 # Module 7: State Machine (Raft / Meta) 深度审计报告（庖丁解牛版 v3）
 
+> 代码基线：`origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）。本文所有 `file:line` 均以该提交为准（快照 `snapshots/spec-md-chinese`）。
+
 > 时序图优先，逐步拆解。每个流程都有 Mermaid 时序图 + 核心代码逐行解释。
 
 ---
@@ -65,6 +67,7 @@ func NewStore(c *config.Meta, httpAddr, rpcAddr, raftAddr string) *Store {
         raftAddr:         raftAddr,
         dbStatistics:     make(map[string]*dbInfo),
         notifyCh:         make(chan bool, 1),             // Leader 变更通知
+        // ...（heartbeatInfoList、cqLease 等 CQ 相关字段从略）
     }
     if c.UseIncSyncData {
         s.data.OpsMap = make(map[uint64]*meta.Op)        // 初始化 OpsMap
@@ -72,6 +75,7 @@ func NewStore(c *config.Meta, httpAddr, rpcAddr, raftAddr string) *Store {
         s.data.OpsMapMaxIndex = 0
         s.UseIncSyncData = true
     }
+    // ...（meta.InitSchemaCleanEn、config.MetaEventHandleEn 赋值从略）
     return &s
 }
 ```
@@ -360,8 +364,9 @@ sequenceDiagram
     FSM->>Store: mu.Lock()
     FSM->>FSM: executeCmd(cmd)
 
+    FSM->>Data: 更新 Term/Index（无论 executeCmd 成功与否）
+
     alt 成功
-        FSM->>Data: 更新 Term/Index
         FSM->>OpsMap: AddCmdAsOpToOpMap(cmd, index)
         FSM->>Chan: close(dataChanged)
         FSM->>Chan: dataChanged = make(chan)
@@ -406,6 +411,11 @@ func (fsm *storeFSM) ApplyBatch(logs []*raft.Log) []interface{} {
             panic(fmt.Errorf("cannot marshal command: %s err %+v", string(logs[i].Data), err))
         }
 
+        // 第 53-55 行：VerifyDataNodeCommand 之外打印 BatchApply 日志
+        if cmd.GetType() != proto2.Command_VerifyDataNodeCommand {
+            fsm.Logger.Info(fmt.Sprintf("BatchApply log term %d index %d type %d", logs[i].Term, logs[i].Index, int32(cmd.GetType())))
+        }
+
         // 第 56 行：执行命令
         ret[i] = fsm.executeCmd(cmd)
 
@@ -413,6 +423,10 @@ func (fsm *storeFSM) ApplyBatch(logs []*raft.Log) []interface{} {
         if ret[i] == nil {
             dataChanged = true
             fsm.data.AddCmdAsOpToOpMap(cmd, logs[i].Index)
+            // 第 60-62 行：推进增量同步水位
+            if cmd.GetType() != proto2.Command_UpdateNodeTmpIndexCommand {
+                fsm.data.UpdateNodeTmpIndexCommandStart = logs[i].Index
+            }
         }
     }
 
@@ -442,6 +456,13 @@ func (fsm *storeFSM) Apply(l *raft.Log) interface{} {
     s.mu.Lock()
     defer s.mu.Unlock()
 
+    // 第 87-90 行：增量同步模式下同时持有 cacheMu
+    if fsm.UseIncSyncData {
+        s.cacheMu.Lock()
+        defer s.cacheMu.Unlock()
+    }
+    fsm.Logger.Info(fmt.Sprintf("Apply log term %d index %d type %d", l.Term, l.Index, int32(cmd.GetType())))
+
     // 第 92 行：执行命令
     err := fsm.executeCmd(cmd)
 
@@ -455,6 +476,10 @@ func (fsm *storeFSM) Apply(l *raft.Log) interface{} {
 
     // 第 101 行：记录到 OpsMap（用于增量同步）
     fsm.data.AddCmdAsOpToOpMap(cmd, l.Index)
+    // 第 102-104 行：推进增量同步水位
+    if cmd.GetType() != proto2.Command_UpdateNodeTmpIndexCommand {
+        fsm.data.UpdateNodeTmpIndexCommandStart = l.Index
+    }
 
     // 第 106 行：通知等待者
     close(s.dataChanged)
@@ -473,6 +498,7 @@ func (fsm *storeFSM) Apply(l *raft.Log) interface{} {
 - **第 57-60 行**：成功时把命令记录到 OpsMap，用于 MetaClient 的增量同步
 - **第 69-72 行**：`close(s.dataChanged)` 唤醒 meta Store 内部 snapshot / SnapshotV2 服务，让它们刷新或发送缓存；MetaClient 通过 Snapshot/SnapshotV2 RPC 主动拉取更新，不是被该 channel 直接通知
 - **第 101 行**：`AddCmdAsOpToOpMap` 把命令添加到 OpsMap，保留最近的操作
+- **白名单过滤**：只有 `commandUseForClient` 中的命令类型才会进入 OpsMap（`lib/util/lifted/influx/meta/data.go:484-486`），并非所有成功命令都参与增量同步
 
 **通俗解释**：
 storeFSM.Apply 就像"执行董事会决议"：
@@ -562,7 +588,7 @@ sequenceDiagram
         Handler->>Data: 执行具体操作
         Handler-->>Dispatch: 返回 nil（成功）
     else 未找到
-        Dispatch-->>Apply: 返回错误
+        Dispatch-->>Apply: 打印 Error 日志后返回 nil（上层按成功处理）
     end
 ```
 
@@ -609,6 +635,7 @@ var applyFunc = map[proto2.Command_Type]func(fsm *storeFSM, cmd *proto2.Command)
 
 **逐行解释**：
 - **第 112 行**：`applyFunc` 是一个 map，key 是命令类型，value 是处理函数
+- **第 440-446 行**：`executeCmd` 未命中时打印 `cannot apply command` 日志并 `return nil`；`Apply` / `ApplyBatch` 会把 nil 当作成功，继续写入 OpsMap
 - **共 65 种命令类型**，涵盖：数据库、RP、ShardGroup、Measurement、节点、分区、降采样、流、CQ 等所有元数据操作
 - **设计意图**：使用 map 而不是 switch-case，O(1) 查找，代码更清晰
 
@@ -653,10 +680,10 @@ switch-case 的实现：
   case DropDatabase:    // 比较 2 次
   case CreateRP:        // 比较 3 次
   ...
-  case Command66:       // 比较 66 次
+  case Command65:       // 比较 65 次
   }
 
-  最坏情况：66 次比较（O(n)）
+  最坏情况：65 次比较（O(n)）
   编译器可能优化为跳转表，但不保证
 
 map 的实现：
@@ -761,7 +788,7 @@ MetaClient 请求 "从 index=101 开始的所有操作"：
 
 ### 4.2 ClearOpsMapV2 — 清理旧操作
 
-**核心代码**：`lib/util/lifted/influx/meta/data.go:284-299`
+**核心代码**：`lib/util/lifted/influx/meta/data.go:284-313`
 
 ```go
 // 第 284 行：清理 OpsMap 中的旧操作
@@ -1120,42 +1147,43 @@ MetaClient 的 index = 100
 
 ```mermaid
 sequenceDiagram
-    participant Follower as Follower 节点
+    participant Mc as MetaClient
     participant Leader as Leader 节点
     participant Snap as Snapshot 服务
     participant FSM as storeFSM
     participant OpsMap as OpsMap
 
-    Follower->>Leader: 请求快照
-    Leader->>Snap: 处理快照请求
+    Mc->>Leader: Snapshot / SnapshotV2 RPC
+    Leader->>Snap: Snapshot.Process → getSnapshot / getSnapshotV2
 
     alt V1 模式
-        Snap->>FSM: 获取完整快照
+        Snap->>FSM: 取 cacheDataBytes（全量）
         FSM->>FSM: 序列化所有元数据
-        Snap-->>Follower: 发送完整快照
-        Follower->>Follower: 完全替换本地状态
+        Snap-->>Mc: 发送完整快照
+        Mc->>Mc: 完全替换本地 cacheData
     else V2 模式
         Snap->>OpsMap: 获取增量操作
-        OpsMap->>OpsMap: 查找 index > followerIndex 的操作
+        OpsMap->>OpsMap: 查找 index > Mc.index 的操作
         alt OpsMap 命中
-            Snap-->>Follower: 发送增量操作
-            Follower->>Follower: 合并到本地状态
+            Snap-->>Mc: 发送增量操作
+            Mc->>Mc: 合并到本地 cacheData
         else 旧 index 已被清理
             Snap->>FSM: MarshalV2 全量元数据
-            Snap-->>Follower: 发送 AllClear 全量数据
-            Follower->>Follower: 替换本地状态
+            Snap-->>Mc: 发送 AllClear 全量数据
+            Mc->>Mc: 替换本地 cacheData
         end
     end
 
-    Follower->>Follower: 更新 afterIndex
+    Mc->>Mc: 应用到本地 cacheData
 ```
 
 **通俗解释**：
-- **V1 模式**：发送完整快照，Follower 完全替换本地状态
-- **V2 模式**：增量优先；如果 OpsMap 中仍能覆盖 followerIndex，只发送变更部分，Follower 合并到本地状态
-- **V2 兜底**：如果 followerIndex 早于 `OpsMapMinIndex`，说明增量链已经被清理，`getSnapshotV2` 会返回 `AllClear` 全量数据，让 Follower 替换本地状态
+- **V1 模式**：发送完整快照，MetaClient 完全替换本地 cacheData
+- **V2 模式**：增量优先；如果 OpsMap 中仍能覆盖客户端的 index，只发送变更部分，MetaClient 合并到本地 cacheData
+- **V2 兜底**：如果 followerIndex 早于 `OpsMapMinIndex`，说明增量链已经被清理，`getSnapshotV2` 会返回 `AllClear` 全量数据，让 MetaClient 替换本地 cacheData
 - V2 更高效，减少数据传输量
 - 适用于大规模集群，元数据量大的场景
+- 边界：`getSnapshotV2` 在 `OldIndex == data.Index`、`OldIndex > data.Index`、`OldIndex >= UpdateNodeTmpIndexCommandStart` 时直接返回 nil（无需下发）；`GetOps` 返回 `NoClear` 且无操作时下发空 `DataOps`
 
 **核心代码**：`app/ts-meta/meta/store.go:980-998`
 
@@ -1373,6 +1401,9 @@ sequenceDiagram
 // 第 277 行：BuildRaft — 构建 Raft 配置
 func (c *Meta) BuildRaft() *raft.Config {
     conf := raft.DefaultConfig()                          // 使用默认配置作为基础
+    if c.ClusterTracing {                                 // 第 279-281 行：可选 Raft 日志落盘
+        conf.LogOutput = c.Logging.NewLumberjackLogger(DefaultRaftFileName)
+    }
     conf.HeartbeatTimeout = time.Duration(c.HeartbeatTimeout)   // 心跳超时（默认 1000ms）
     conf.ElectionTimeout = time.Duration(c.ElectionTimeout)     // 选举超时（默认 1000ms）
     conf.LeaderLeaseTimeout = time.Duration(c.LeaderLeaseTimeout) // Leader 租约超时
@@ -1396,32 +1427,53 @@ func (c *Meta) BuildRaft() *raft.Config {
 // 第 474 行：checkLeaderChanged — 监听 Leader 变更
 func (s *Store) checkLeaderChanged() {
     defer s.wg.Done()
+    pushTimer := time.NewTimer(pushInterval)              // 第 476-477 行
+    defer pushTimer.Stop()
     lastState := s.raft.State()                           // 记录初始状态
+    stat.NewMetaStatCollector().Push(&stat.MetaRaftStatItem{Status: int64(lastState),
+        NodeID: strconv.FormatUint(s.Node.ID, 10)})       // 第 479-480 行
     for {
         select {
-        case v := <-s.notifyCh:                           // 接收 Leader 变更通知
+        case v := <-s.notifyCh:                           // 第 483 行：接收 Leader 变更通知
+            stat.NewMetaStatistics().AddLeaderSwitchTotal(1)   // 第 484-485 行
+            s.Logger.Info("accept from notifyCh ", zap.Bool("v", v))
             if v {                                        // v=true 表示成为 Leader
                 s.stepDown = make(chan struct{})
                 if globalService.clusterManager != nil {
+                    s.Logger.Info("accept from notifyCh start msm , cluster manager", zap.Bool("v", v))
                     globalService.msm.Start()             // 启动迁移状态机
                     globalService.balanceManager.Start()  // 启动负载均衡
                     globalService.clusterManager.Start()  // 启动集群管理器
+                    globalService.masterPtBalanceManager.Start()
                 }
                 s.deleteWg.Add(3)
                 go s.checkDelete(DeleteDatabase)          // 启动数据库删除检查
                 go s.checkDelete(DeleteRp)                // 启动 RP 删除检查
                 go s.checkDelete(DeleteMeasurement)       // 启动 Measurement 删除检查
+                go s.RepairPT(time.Minute)                // 第 500 行
                 continue
             }
             // v=false 表示不再是 Leader（降级为 Follower）
-            close(s.stepDown)                             // 通知所有依赖 Leader 的 goroutine 停止
+            stat.NewMetaStatCollector().Clear(stat.TypeMetaStatItem)
+            close(s.stepDown)                             // 第 505 行：通知所有依赖 Leader 的 goroutine 停止
             if globalService.clusterManager != nil {
+                s.Logger.Info("accept from notifyCh stop msm , cluster manager", zap.Bool("v", v))
                 globalService.clusterManager.Stop()       // 停止集群管理器
                 globalService.balanceManager.Stop()       // 停止负载均衡
+                globalService.masterPtBalanceManager.Stop()
+                globalService.msm.Stop()
             }
             s.deleteWg.Wait()                             // 等待删除检查完成
         case <-s.closing:
             return
+        case <-pushTimer.C:                               // 第 516-523 行：定时上报 Raft 状态变化
+            currentState := s.raft.State()
+            if currentState != lastState {
+                stat.NewMetaStatCollector().Push(&stat.MetaRaftStatItem{Status: int64(currentState),
+                    NodeID: strconv.FormatUint(s.Node.ID, 10)})
+                lastState = currentState
+            }
+            pushTimer.Reset(pushInterval)
         }
     }
 }
@@ -1495,7 +1547,7 @@ func StartNode(store *raftlog.RaftDiskStorage, nodeId uint64, database string, i
 **逐行解释**：
 - **第 115 行**：`ElectionTick` 是选举超时 tick 数。如果 Follower 在 ElectionTick 个 tick 内没收到心跳，就发起选举
 - **第 116 行**：`HeartbeatTick` 是心跳间隔 tick 数。Leader 每 HeartbeatTick 个 tick 发送一次心跳
-- **第 147 行**：`tickInterval = 400ms`，所以选举超时 = ElectionTick × 400ms = 10 × 400ms = 4 秒
+- **第 147 行**：`tick: time.NewTicker(tickInterval)`；`tickInterval = 400ms` 定义在 `lib/raftconn/node.go:43`。etcd raft 的选举超时是 [ElectionTick, 2×ElectionTick) 个 tick 的随机值，即 4-8 秒（不是固定的 4 秒）
 - **设计意图**：ts-store 侧使用 etcd Raft（不是 Hashicorp Raft），用于数据分区级别的 Raft 共识
 
 **核心代码**：`lib/raftconn/node.go:316-385`（Raft 消息处理与 Leader 状态检测）
@@ -1564,7 +1616,7 @@ func (n *RaftNode) serveChannels() {
 ```
 初始状态：所有节点都是 Follower，term = 0
 
-Step 1: Node1 选举超时（150ms 没收到心跳）
+Step 1: Node1 选举超时（默认 1000ms 没收到心跳）
   → Node1 状态变为 Candidate
   → Node1.term = 1
   → Node1 给自己投票
@@ -1580,7 +1632,7 @@ Step 3: Node3 收到 RequestVote
 
 Step 4: Node1 获得多数票（2/3）
   → Node1 状态变为 Leader
-  → Node1 开始发送心跳（每 50ms）
+  → Node1 开始发送心跳（默认每 1000ms）
   → Node2, Node3 保持 Follower 状态
 
 Step 5: Node1 发送心跳
@@ -1808,7 +1860,7 @@ type raftWrapper struct {
 
 步骤 4: Node1 获得多数票（2/3）
   → Node1 状态变为 Leader
-  → Node1 开始发送心跳（每 50ms）
+  → Node1 开始发送心跳（默认每 1000ms）
   → Node2, Node3 保持 Follower 状态
 ```
 
@@ -1843,12 +1895,13 @@ sequenceDiagram
     end
 
     New->>Meta: 接管完成
-    Meta->>Meta: 更新 Pt1 状态为 Active
+    Meta->>Meta: 更新 Pt1 状态为 Online
 ```
 
 **通俗解释**：
 - 分区接管用于负载均衡或故障恢复
 - ts-meta 发起接管，通过 Raft 共识传播
+- 代码位置：接管选点与命令下发在 `app/ts-meta/meta/cluster_manager.go`（`checkTakeover` 318 行、`getTakeOverNode` 551 行）；ts-store 侧“检查本地数据、从旧 Owner 拉取数据”的入口本次未确认
 
 **核心代码**：`app/ts-meta/meta/store_fsm.go:336-338, 773-775`
 
@@ -1941,11 +1994,11 @@ Step 3: 所有节点应用命令
 Step 4: Node3 接管 Pt1
   → 检查本地是否有 Pt1 数据
   → 如果没有，从 Node1（旧 Owner）请求数据
-  → 数据传输完成后，Pt1 状态变为 Active
+  → 数据传输完成后，Pt1 状态变为 Online
 
 Step 5: 更新 PtView
   → Pt1.Owner = Node3
-  → Pt1.Status = Active
+  → Pt1.Status = Online
 ```
 
 ### 8.2 核心代码：UpdatePtInfoCommand — 分区信息变更
@@ -1957,11 +2010,13 @@ Step 5: 更新 PtView
 // 定义位置：lib/util/lifted/influx/meta/proto/meta.pb.go:7421
 // Command 类型编号：67（Command_UpdatePtInfoCommand）
 type UpdatePtInfoCommand struct {
-    Db             *string  `protobuf:"bytes,1,req,name=Db" json:"Db,omitempty"`           // 数据库名
-    Pt             *PtInfo  `protobuf:"bytes,2,req,name=Pt" json:"Pt,omitempty"`           // 分区信息（PtId、Owner 等）
-    OwnerNode      *uint64  `protobuf:"varint,3,req,name=OwnerNode" json:"OwnerNode,omitempty"` // 新 Owner 节点 ID
-    Status         *uint32  `protobuf:"varint,4,req,name=Status" json:"Status,omitempty"`  // 分区状态
-    XXX_unrecognized []byte `json:"-"`
+    Db                   *string  `protobuf:"bytes,1,req,name=Db" json:"Db,omitempty"`           // 数据库名
+    Pt                   *PtInfo  `protobuf:"bytes,2,req,name=Pt" json:"Pt,omitempty"`           // 分区信息（PtId、Owner 等）
+    OwnerNode            *uint64  `protobuf:"varint,3,opt,name=OwnerNode" json:"OwnerNode,omitempty"` // 新 Owner 节点 ID
+    Status               *uint32  `protobuf:"varint,4,opt,name=Status" json:"Status,omitempty"`  // 分区状态
+    XXX_NoUnkeyedLiteral struct{} `json:"-"`
+    XXX_unrecognized     []byte   `json:"-"`
+    XXX_sizecache        int32    `json:"-"`
 }
 ```
 
@@ -1988,12 +2043,8 @@ type UpdatePtInfoCommand struct {
 步骤 4: Node3 接管 Pt1
   → 检查本地是否有 Pt1 数据
   → 如果没有，从 Node1（旧 Owner）请求数据
-  → 数据传输完成后，Pt1 状态变为 Active
+  → 数据传输完成后，Pt1 状态变为 Online
 ```
-
----
-- 新 Owner 检查本地是否有数据，没有则从旧 Owner 传输
-- 接管完成后更新 PtView 的 Owner 指向
 
 ---
 
@@ -2018,7 +2069,7 @@ sequenceDiagram
         Follower-->>Client: 返回数据
     end
 
-    Note over Client: 保证读取到最新数据
+    Note over Client: 返回 Leader 已应用 / 缓存已同步到的版本
 ```
 
 **通俗解释**：
@@ -2027,7 +2078,7 @@ sequenceDiagram
 - 读取本地状态机，返回最新数据
 - 这保证了读取到的是最新提交的数据
 
-### 9.2 Leader 本地读实现边界
+### 9.1 Leader 本地读实现边界
 
 **代码位置**：`app/ts-meta/meta/raft_wrapper.go:149-169`（写命令通过 Hashicorp Raft 的 `Apply` 方法提交）
 
@@ -2204,7 +2255,7 @@ func (n *RaftNode) serveChannels() {
 **逐行解释**：
 - **第 326 行**：`n.node.Tick()` 每 400ms 触发一次，驱动选举超时计时器
 - **第 330-332 行**：选举期间 `rd.RaftState` 不是 `StateLeader`，所以 `leader = false`
-- **第 334-341 行**：`leader = false` 时跳过消息发送，只有成为 Leader 后才能发送消息
+- **第 334-341 行**：Leader 先发消息、后写盘；Follower 则先写盘、后发消息（第 374-380 行）
 - **第 344 行**：选举期间日志仍会持久化，但不会有已提交的条目
 - **第 365 行**：`PublishEntries` 返回的条目为空（选举期间没有提交），所以不会触发上层应用
 
@@ -2223,20 +2274,20 @@ Leader 选举期间的服务中断：
 ```
 时间线：
 t=0s: Node1（Leader）故障
-t=0.15s: Node2 选举超时，发起选举
-t=0.2s: Node2 获得多数票，成为 Leader
-t=0.25s: Node2 开始发送心跳
+t=1.0s: Node2 选举超时，发起选举
+t=1.5s: Node2 获得多数票，成为 Leader
+t=1.5s: Node2 开始发送心跳
 
-服务中断时间：0.15s ~ 0.25s = 100ms
+服务中断时间：1.0s ~ 1.5s = 500ms
 
 但如果网络不稳定：
 t=0s: Node1 故障
-t=0.15s: Node2 发起选举，但网络抖动
-t=0.5s: Node2 重试选举
-t=0.8s: Node2 获得多数票
-t=0.85s: Node2 成为 Leader
+t=1.0s: Node2 发起选举，但网络抖动
+t=2.0s: Node2 重试选举
+t=3.0s: Node2 获得多数票
+t=3.1s: Node2 成为 Leader
 
-服务中断时间：0.15s ~ 0.85s = 700ms
+服务中断时间：1.0s ~ 3.1s = 2.1s
 
 最坏情况：
   → 网络分区 + 多个节点同时发起选举
@@ -2245,7 +2296,7 @@ t=0.85s: Node2 成为 Leader
 
 优化方案：
   → 客户端实现重试机制
-  → 设置合理的选举超时（150-300ms）
+  → 设置合理的选举超时（默认 1000ms，按部署规模调整）
   → 避免网络分区时的脑裂
 ```
 
@@ -2329,6 +2380,9 @@ func (data *Data) ClearOpsMapV2(minAliveNodeTmpIndex uint64) {
         data.OpsToMarshalIndex = 0
     } else {
         data.OpsMapMinIndex = next                         // 更新最小 index
+        if data.OpsToMarshalIndex < data.OpsMapMinIndex {
+            data.OpsToMarshalIndex = data.OpsMapMinIndex   // 同步推进待序列化 index
+        }
     }
 }
 ```
@@ -2367,25 +2421,7 @@ func (s *Store) ClearOpsMap() {
 - **第 1012 行**：`ClearOpsMapV2` 删除 index < minAliveNodeTmpIndex 的操作
 - **问题**：如果有一个节点长期离线或处理缓慢，minAliveNodeTmpIndex 会很小，OpsMap 无法清理
 
-**核心代码**：`lib/util/lifted/influx/meta/data.go:269-282`（获取最小存活节点 index）
-
-```go
-// 第 269 行：GetMinAliveNodeTmpIndex — 获取所有存活节点中最小的 index
-func (data *Data) GetMinAliveNodeTmpIndex() uint64 {
-    var ret uint64 = math.MaxUint64
-    for _, sqlNode := range data.SqlNodes {
-        if sqlNode.Index < ret && sqlNode.Status == serf.StatusAlive {
-            ret = sqlNode.Index                            // 找到最小的 sqlNode index
-        }
-    }
-    for _, dataNode := range data.DataNodes {
-        if dataNode.Index < ret && dataNode.Status == serf.StatusAlive {
-            ret = dataNode.Index                           // 找到最小的 dataNode index
-        }
-    }
-    return ret
-}
-```
+**代码同上**：`GetMinAliveNodeTmpIndex` 见本节前文摘录（`lib/util/lifted/influx/meta/data.go:269-282`），此处不再重复。
 
 **逐行解释**：
 - **第 270 行**：初始化 `ret = math.MaxUint64`，表示还没有找到任何存活节点
@@ -2448,6 +2484,7 @@ sequenceDiagram
     participant Node2 as Meta 节点 2
     participant Node3 as Meta 节点 3
     participant Net as 网络分区
+    participant Client as 客户端
 
     Note over Net: 网络分区发生
 
@@ -2460,15 +2497,15 @@ sequenceDiagram
     Node3-->>Node2: VoteGranted
     Node2->>Node2: 状态 → Leader
 
-    Note over Node2,Node3: 少数派分区
-    Note over Node1: 多数派分区
+    Note over Node1: 少数派分区（1/3）
+    Note over Node2,Node3: 多数派分区（2/3）
 
     alt 少数派分区处理写入
-        Node2->>Node2: 无法获得多数派确认
-        Node2-->>Client: 写入失败
+        Node1->>Node1: 无法获得多数派确认
+        Node1-->>Client: 写入失败
     end
 
-    Note over Node1: 多数派分区可以正常工作
+    Note over Node2,Node3: 多数派分区可以正常工作
 ```
 
 **隐患**：
@@ -2629,11 +2666,11 @@ func (n *RaftNode) CheckAllRgMembers() (bool, []uint32) {
 
 ---
 
-## 9. 端到端实战：一次 Raft 命令提交的完整生命周期
+## 11. 端到端实战：一次 Raft 命令提交的完整生命周期
 
 > 以创建数据库命令 `CREATE DATABASE mydb` 为例，追踪它从客户端请求到所有节点同步的完整过程。
 
-### 9.1 初始状态
+### 11.1 初始状态
 
 ```
 Raft 集群状态：
@@ -2647,7 +2684,7 @@ Index 2: CreateNode(node2)
 Index 3: CreateNode(node3)
 ```
 
-### 9.2 Raft 命令提交时序图
+### 11.2 Raft 命令提交时序图
 
 ```mermaid
 sequenceDiagram
@@ -2702,7 +2739,7 @@ sequenceDiagram
     Node1-->>Client: OK: Database created
 ```
 
-### 9.3 Step 1 详解：Leader 接收命令
+### 11.3 Step 1 详解：Leader 接收命令
 
 **代码路径**：`app/ts-meta/meta/raft_wrapper.go:149-169`
 
@@ -2737,7 +2774,7 @@ func (r *raftWrapper) Apply(b []byte) error {
 - `f.Response()`：获取 FSM 应用后的返回值（可能是 error 或 nil）
 - 调用入口在 `app/ts-meta/meta/store.go:1614`：`s.raft.Apply(b)`
 
-### 9.4 Step 2 详解：复制到 Follower
+### 11.4 Step 2 详解：复制到 Follower
 
 **Raft 协议的复制机制**：
 1. Leader 将命令写入本地日志
@@ -2745,9 +2782,9 @@ func (r *raftWrapper) Apply(b []byte) error {
 3. Follower 将日志条目写入本地日志，返回 ACK
 4. Leader 收到多数派 ACK 后，标记为已提交
 
-### 9.5 Step 3 详解：FSM 应用 — applyFunc 分发表
+### 11.5 Step 3 详解：FSM 应用 — applyFunc 分发表
 
-**代码路径**：`app/ts-meta/meta/store_fsm.go:31-178`
+**代码路径**：`app/ts-meta/meta/store_fsm.go:31-178`（storeFSM 与 applyFunc 分发表）；`executeCmd` 在 `440-446`
 
 ```go
 // storeFSM 类型定义（第 31 行）
@@ -2777,11 +2814,11 @@ func (fsm *storeFSM) ApplyBatch(logs []*raft.Log) []interface{} {
 
 // executeCmd 根据命令类型查找并执行处理函数
 func (fsm *storeFSM) executeCmd(cmd proto2.Command) interface{} {
-    fn, ok := applyFunc[cmd.GetType()]
-    if !ok {
-        return nil
+    if handler, ok := applyFunc[cmd.GetType()]; ok {
+        return handler(fsm, &cmd)
     }
-    return fn(fsm, &cmd)
+    fsm.Logger.Error("cannot apply command: %x", zap.Int32("typ", int32(cmd.GetType())))
+    return nil
 }
 
 // applyFunc 命令处理函数映射（第 112 行）
@@ -2796,7 +2833,7 @@ var applyFunc = map[proto2.Command_Type]func(fsm *storeFSM, cmd *proto2.Command)
     proto2.Command_UpdateRetentionPolicyCommand:     applyUpdateRetentionPolicy,
     proto2.Command_CreateShardGroupCommand:          applyCreateShardGroup,
     proto2.Command_DeleteShardGroupCommand:          applyDeleteShardGroup,
-    // ... 共 66 个命令类型
+    // ... 共 65 个命令类型
 }
 ```
 
@@ -2807,7 +2844,7 @@ var applyFunc = map[proto2.Command_Type]func(fsm *storeFSM, cmd *proto2.Command)
 - `applyFunc` 的 key 是 `proto2.Command_Type` 枚举（非 `uint64`）
 - 处理函数签名是 `func(fsm *storeFSM, cmd *proto2.Command) interface{}`（非 `func(*Data, []byte)`）
 
-### 9.6 Step 4 详解：applyCreateDatabase — 创建数据库
+### 11.6 Step 4 详解：applyCreateDatabase — 创建数据库
 
 **代码路径**：`app/ts-meta/meta/store_fsm.go:180-182`
 
@@ -2822,9 +2859,9 @@ func applyCreateDatabase(fsm *storeFSM, cmd *proto2.Command) interface{} {
 - 实际逻辑委托给 `fsm.applyCreateDatabaseCommand(cmd)`
 - 最终调用 `lib/util/lifted/influx/meta/` 包中的 `Data.CreateDatabase()` 方法
 
-### 9.7 Step 5 详解：增量同步 — OpsMap
+### 11.7 Step 5 详解：增量同步 — OpsMap
 
-**代码路径**：`lib/util/lifted/influx/meta/data.go:246-304`
+**代码路径**：`lib/util/lifted/influx/meta/data.go:246-258`（Op/NewOp）与 `284-313`（ClearOpsMapV2）
 
 ```go
 // 第 246 行：Op 结构体 — 单个操作（链表节点）
@@ -2870,8 +2907,13 @@ func (data *Data) ClearOpsMapV2(minAliveNodeTmpIndex uint64) {
     // 更新最小 index
     if next == 0 {
         data.OpsMapMinIndex = math.MaxUint64
+        data.OpsMapMaxIndex = 0
+        data.OpsToMarshalIndex = 0
     } else {
         data.OpsMapMinIndex = next
+        if data.OpsToMarshalIndex < data.OpsMapMinIndex {
+            data.OpsToMarshalIndex = data.OpsMapMinIndex
+        }
     }
 }
 ```
@@ -2883,7 +2925,7 @@ func (data *Data) ClearOpsMapV2(minAliveNodeTmpIndex uint64) {
 - **第 297-302 行**：沿链表遍历删除旧操作（不是简单的 for range，因为 OpsMap 是链表结构）
 - **第 303-307 行**：更新 `OpsMapMinIndex`，指向下一个待消费的操作
 
-### 9.8 MetaClient 增量同步
+### 11.8 MetaClient 增量同步
 
 **代码路径**：`lib/metaclient/meta_client_impl.go:2438-2460`
 
@@ -2925,7 +2967,7 @@ func (c *Client) pollForUpdatesV2(role Role) {
 - `c.applyDataOps(ops, index, maxCQChangeID)`：应用增量操作
 - AllClear 时用 `DataOps.Data` 替换 `cacheData`，作为增量不可用时的全量兜底
 
-### 9.9 完整流程总结
+### 11.9 完整流程总结
 
 ```
 1. 客户端发送 CREATE DATABASE mydb 到 Leader
@@ -2942,6 +2984,6 @@ func (c *Client) pollForUpdatesV2(role Role) {
 
 **关键设计点**：
 - **Raft 共识**：保证所有节点的元数据一致
-- **FSM 分发表**：66 个命令类型，每个命令有对应的处理函数
+- **FSM 分发表**：65 个命令类型，每个命令有对应的处理函数
 - **增量同步**：OpsMap 存储增量操作，MetaClient 通过 Index 增量同步
 - **多数派提交**：只有收到多数派 ACK 才标记为已提交，保证数据不丢失

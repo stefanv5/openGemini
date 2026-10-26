@@ -1,5 +1,7 @@
 # openGemini 核心模块规格文档总览
 
+> 代码基线：origin/docs/spec-md-chinese @ 9717d662（2026-04-11）。
+
 这个目录面向开发者，用来从代码实现角度理解 openGemini 的核心架构、关键流程和模块边界。建议不要按文件编号机械阅读，而是按下面的系统路径进入：
 
 ```mermaid
@@ -39,7 +41,7 @@ flowchart LR
 | [13_tssp_file_format_spec.md](13_tssp_file_format_spec.md) | TSSP 文件格式，解释 data block、chunk/meta index、trailer、bloom、reader/writer 和查询定位。 |
 | [14_compaction_strategy_spec.md](14_compaction_strategy_spec.md) | Compaction 策略，说明 full/level compaction、任务选择、恢复语义和资源限制。 |
 | [16_shelf_wal_spec.md](16_shelf_wal_spec.md) | Shelf WAL 机制，说明可查询 WAL、Processor、SeriesKeyOffsets、IndexBuilder 和可靠性边界。 |
-| [17_shardkey_sparse_index_spec.md](17_shardkey_sparse_index_spec.md) | ShardKey 与稀疏索引，解释按 shard key 路由、sidecar 索引文件和列存裁剪。 |
+| [17_shardkey_sparse_index_spec.md](17_shardkey_sparse_index_spec.md) | ShardKey Index（range shard 分裂点/负载均衡统计）与 Sparse Index（列存 fragment 裁剪），解释 sidecar 索引文件与查询裁剪边界。 |
 | [18_retention_policy_spec.md](18_retention_policy_spec.md) | 保留策略，覆盖 shard/index retention、measurement TTL、LogKeeper 分支和物理删除流程。 |
 | [29_fileops_abstraction_spec.md](29_fileops_abstraction_spec.md) | 文件操作抽象层，解释本地/对象存储文件 API、锁、Remove/Rename/Read 等底层 I/O 边界。 |
 
@@ -54,10 +56,10 @@ flowchart LR
 | [09_udaf_operator_spec.md](09_udaf_operator_spec.md) | UDAF 与算子框架，说明 aggregate operator、iterator、processor、min/max/count/sum 等算子实现。 |
 | [10_stream_processing_spec.md](10_stream_processing_spec.md) | 流计算，覆盖 stream coordinator、ts-store stream task、TaskDataPool/cache 和流任务执行边界。 |
 | [19_column_store_query_spec.md](19_column_store_query_spec.md) | 列存查询路径，解释 sparse index scan、fragment ranges、Location.Contains、segment 映射和 reader 执行。 |
-| [23_query_cache_spec.md](23_query_cache_spec.md) | 查询缓存，说明 `ResultsCache.Do`、cache key、memory cache factory 和当前实现限制。 |
+| [23_query_cache_spec.md](23_query_cache_spec.md) | 查询缓存，说明两层缓存（PromQL 结果缓存与 Block/Page 读缓存）、`ResultsCache.Do`、cache key 和读缓存代际淘汰。 |
 | [24_coprocessor_pushdown_spec.md](24_coprocessor_pushdown_spec.md) | Coprocessor/计算下推，解释下推条件、算子边界、storage scan 与计算层职责划分。 |
-| [25_pre_aggregation_spec.md](25_pre_aggregation_spec.md) | 预聚合，说明可预聚合条件、rewrite、聚合复用和不能命中的场景。 |
-| [26_parquet_export_spec.md](26_parquet_export_spec.md) | Parquet 导出，覆盖 `[data.parquet-task]` 配置、导出任务、merge/compact 影响和文件生成路径。 |
+| [25_pre_aggregation_spec.md](25_pre_aggregation_spec.md) | 预聚合，说明可预聚合条件、类型矩阵、写入/读取路径和不能命中的场景。 |
+| [26_parquet_export_spec.md](26_parquet_export_spec.md) | Parquet 导出，覆盖 `[data.parquet-task]` 配置、Compaction 触发的行存/列存两条导出路径、merge/compact 影响和文件生成路径。 |
 | [27_castor_anomaly_detection_spec.md](27_castor_anomaly_detection_spec.md) | Castor 异常检测，说明 `castor`/`castor_ad` SQL 用法、模型调用、输出字段和边界条件。 |
 
 ## 3. 集群、元数据与一致性
@@ -83,8 +85,8 @@ flowchart LR
 | 文件 | 用途 |
 | --- | --- |
 | [20_kafka_protocol_spec.md](20_kafka_protocol_spec.md) | Kafka 协议兼容层，说明 Metadata/Fetch/HeartBeat、topic-as-SQL、consumer group 限制和低阶 Fetch 用法。 |
-| [21_opentelemetry_spec.md](21_opentelemetry_spec.md) | OpenTelemetry 集成，说明 OTLP metrics 写入、Gauge/Sum/Histogram/Summary 映射、tag 和 field 生成。 |
-| [22_arrow_flight_spec.md](22_arrow_flight_spec.md) | Arrow Flight 协议，说明 `flight-enabled`、auth token、ticket query、Flight SQL 和 handler 分支。 |
+| [21_opentelemetry_spec.md](21_opentelemetry_spec.md) | OpenTelemetry 集成，说明 OTLP Metrics/Traces/Logs 三个写入端点，以及 Gauge/Sum/Histogram/Summary 到 tag/field 的映射。 |
+| [22_arrow_flight_spec.md](22_arrow_flight_spec.md) | Arrow Flight 协议，说明 `flight-enabled`、auth token、ticket query（JSON 的 q/db/rp 等字段）、DoPut/DoGet 和 handler 分支。 |
 
 ## 5. 运维、监控、恢复与运行时控制
 
@@ -103,10 +105,10 @@ flowchart LR
 
 | 想理解的问题 | 阅读链路 |
 | --- | --- |
-| 一条 line protocol 数据如何写入并落盘？ | [01 写入引擎](01_write_engine_spec.md) -> [16 Shelf WAL](16_shelf_wal_spec.md) -> [13 TSSP](13_tssp_file_format_spec.md) -> [14 Compaction](14_compaction_strategy_spec.md) |
-| 一个查询如何从 SQL 变成分布式执行？ | [03 查询引擎](03_query_engine_spec.md) -> [06 集群路由](06_cluster_routing_spec.md) -> [31 netstorage](31_netstorage_spec.md) -> [23 查询缓存](23_query_cache_spec.md) |
-| 列存如何写入、索引和查询？ | [11 列存](11_column_store_spec.md) -> [17 ShardKey/Sparse Index](17_shardkey_sparse_index_spec.md) -> [19 列存查询](19_column_store_query_spec.md) |
-| 集群元数据如何驱动迁移和一致性？ | [30 MetaClient](30_metaclient_spec.md) -> [07 状态机](07_state_machine_spec.md) -> [12 迁移](12_cluster_migration_spec.md) -> [15 分区 Raft](15_raft_partition_consensus_spec.md) |
-| 外部生态如何接入 openGemini？ | [20 Kafka](20_kafka_protocol_spec.md) -> [21 OpenTelemetry](21_opentelemetry_spec.md) -> [22 Arrow Flight](22_arrow_flight_spec.md) |
+| 一条 line protocol 数据如何写入并落盘？ | 默认：[01 写入引擎](01_write_engine_spec.md) -> [13 TSSP](13_tssp_file_format_spec.md) -> [14 Compaction](14_compaction_strategy_spec.md)；Shelf 模式（需开启 shelf-mode）：01 -> [16 Shelf WAL](16_shelf_wal_spec.md) -> 13 -> 14 |
+| 一个查询如何从 SQL 变成分布式执行？ | [03 查询引擎](03_query_engine_spec.md) -> [06 集群路由](06_cluster_routing_spec.md) -> [31 netstorage](31_netstorage_spec.md)（查询缓存见 [23 查询缓存](23_query_cache_spec.md)：结果缓存在 PromQL/HTTP 层，读缓存在 ts-store 侧） |
+| 列存如何写入、索引和查询？ | [11 列存](11_column_store_spec.md) -> [17 Sparse Index](17_shardkey_sparse_index_spec.md) -> [19 列存查询](19_column_store_query_spec.md) |
+| 集群元数据如何驱动迁移和一致性？ | [07 状态机](07_state_machine_spec.md) -> [12 迁移](12_cluster_migration_spec.md) -> [15 分区 Raft](15_raft_partition_consensus_spec.md)（客户端消费/缓存视角见 [30 MetaClient](30_metaclient_spec.md)） |
+| 外部生态如何接入 openGemini？ | [20 Kafka](20_kafka_protocol_spec.md)、[21 OpenTelemetry](21_opentelemetry_spec.md)、[22 Arrow Flight](22_arrow_flight_spec.md)（三者并列，按需阅读） |
 | 线上问题如何定位和恢复？ | [34 监控](34_monitoring_spec.md) -> [36 系统控制](36_system_control_spec.md) -> [37 Sherlock](37_sherlock_profiler_spec.md) -> [35 ts-recover](35_recovery_tool_spec.md) |
 

@@ -1,6 +1,8 @@
 # Module 36: 系统控制模块（syscontrol）深度审计报告
 
-> syscontrol 是 openGemini 的运行时系统控制中心。它通过 HTTP API 暴露一组调试和运维命令，允许管理员在不停机的情况下动态调整数据库的运行行为，包括写入开关、读取开关、节点只读模式、查询并发控制、Compaction 开关、内存限制、日志行过滤等。注意：只有 `ProcessRequest` 中有分支的 mod 才是 `/debug/ctrl` 命令；部分 setter 是内部 API，不能直接当 HTTP 控制命令使用。
+> 代码基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）；本文行号与代码摘录均以 `_spec_verify_20260616/snapshots/spec-md-chinese` 为准。
+
+> syscontrol 是 openGemini 的运行时系统控制中心。它通过 HTTP API 暴露一组调试和运维命令，允许管理员在不停机的情况下动态调整数据库的运行行为，包括写入开关、读取开关、节点只读模式、查询并发控制、Compaction 开关、内存限制、日志行过滤等。注意：`/debug/ctrl` 可达的 mod = `ProcessRequest` 的 25 个分支值 + `serveDebug` 特判的 `backup`（转 `syscontrol.ProcessBackup`）；部分 setter（如 `querySeriesLimit`、层级存储/层级索引开关）没有 HTTP 分支，属内部 API，不能直接当命令使用。
 
 ---
 
@@ -132,7 +134,7 @@ func init() {
 | `flush` | store | 广播 | 触发 MemTable flush |
 | `compen` | store | 广播 | Compaction 开关 |
 | `merge` | store | 广播 | 乱序文件合并开关 |
-| `snapshot` | store | 广播 | 快照控制 |
+| `snapshot` | store | 广播 | 设置冷写（snapshot）时长：读 `duration` 写入各 shard 的 `writeColdDuration`，既不产生快照也不 flush |
 | `downsample_in_order` | store | 广播 | 降采样有序控制 |
 | `readonly` | local | 本地 | 节点只读模式；当前不处理 `host/allnodes` |
 | `disablewrite` | local | 本地 | 禁止写入 |
@@ -162,7 +164,7 @@ func init() {
 
 ```mermaid
 flowchart TD
-    A[ProcessRequest] --> B{req.Mod()}
+    A[ProcessRequest] --> B{"req.Mod()"}
 
     B -->|"flush / compen / merge<br/>snapshot / downsample_in_order<br/>verifynode / memusagelimit<br/>backgroundReadLimiter"| C[广播到所有 store 节点]
 
@@ -197,6 +199,8 @@ flowchart TD
     B -->|"parallelbatch"| R[本地 SetParallelQueryInBatch]
 
     B -->|"write_stream_points_enable"| S[广播到 store]
+
+    H2["serveDebug 特判"] -->|"backup"| B2[syscontrol.ProcessBackup]
 
     B -->|default| T[error: unknown sysctrl mod]
 
@@ -247,9 +251,9 @@ curl -i -XPOST 'http://127.0.0.1:8086/debug/ctrl?mod=disableread&switchon=true'
 ```
 
 **通俗解释**：
-- `DisableWrites = true` 时，所有写入请求会被拒绝
-- `DisableReads = true` 时，所有读取请求会被拒绝
-- 这两个标志位在写入和查询路径中被检查
+- `DisableWrites = true` 时，**该 ts-sql 节点上经 HTTP 入口**的写入请求会被拒绝（`handler.go` 的 serveWrite / Prom / ArrowFlight / logstore 等入口；store、ts-meta 的内部 RPC 写入不受影响）
+- `DisableReads = true` 时，同理只影响该节点经 HTTP 入口的查询
+- 两个标志是进程内变量、不广播，其他节点不受影响
 
 ### 4.2 节点只读模式
 
@@ -304,12 +308,14 @@ curl -i -XPOST 'http://127.0.0.1:8086/debug/ctrl?mod=readonly&switchon=true'
 **代码位置**：`lib/syscontrol/syscontrol.go:160-194`
 
 ```go
-var QueryParallel int32 = -1  // -1 表示使用默认值
+var QueryParallel int32 = -1  // 哨兵：<=0 时并行度取 cpu.GetCpuNum()
 
 func SetQueryParallel(limit int64) {
     atomic.StoreInt32(&QueryParallel, int32(limit))
 }
 ```
+
+该变量位于 `lib/syscontrol/syscontrol.go:159` 起的 `var (...)` 块；ts-sql 启动时会用 `http.chunk-reader-parallel`（默认 CPU 核数）覆盖它（`app/ts-sql/sql/server.go:173`），因此运行时通常不是 -1。
 
 **使用方式**：
 
@@ -321,7 +327,7 @@ curl -i -XPOST 'http://127.0.0.1:8086/debug/ctrl?mod=chunk_reader_parallel&limit
 ### 5.2 查询 Series 限制
 
 ```go
-var querySeriesLimit = 0  // 0 表示不限制
+var querySeriesLimit = 0 // query series upper bound in one shard. See also query-series-limit in config
 
 func SetQuerySeriesLimit(limit int) {
     querySeriesLimit = limit
@@ -332,12 +338,12 @@ func GetQuerySeriesLimit() int {
 }
 ```
 
-`querySeriesLimit` 当前是内部 API：代码里有 setter/getter，但如果没有 `ProcessRequest` 分支，就不能通过 `/debug/ctrl?mod=querySeriesLimit...` 动态设置。
+`querySeriesLimit` 当前是内部 API：代码里有 setter/getter（`lib/syscontrol/syscontrol.go:196-202`），但 `ProcessRequest` 没有对应分支，不能通过 `/debug/ctrl?mod=querySeriesLimit...` 动态设置。它由 ts-store 启动时 `syscontrol.SetQuerySeriesLimit(conf.SelectSpec.QuerySeriesLimit)`（`app/ts-store/run/server.go:117`）注入，消费点在 `engine/index/tsi/mergeset_index.go:1317`——本质是配置项。
 
 ### 5.3 批量并行查询
 
 ```go
-var ParallelQueryInBatch int32 = 0  // 0 表示不启用
+var ParallelQueryInBatch int32 = 0 // this determines whether to use parallel query when a query is combined with multi queries
 
 func SetParallelQueryInBatch(en bool) {
     if en {
@@ -351,7 +357,7 @@ func SetParallelQueryInBatch(en bool) {
 ### 5.4 查询中断
 
 ```go
-// interruptquery 命令：中断正在执行的查询
+// interruptquery：打开"内存超限自动中断查询"开关（本身不会终止任何在跑查询）
 case NodeInterruptQuery:
     switchOn, _ := GetBoolValue(req.Param(), "switchon")
     sysconfig.SetInterruptQuery(switchOn)
@@ -361,16 +367,16 @@ case NodeInterruptQuery:
 **使用方式**：
 
 ```bash
-# 中断所有节点的查询
-curl -i -XPOST 'http://127.0.0.1:8086/debug/ctrl?mod=interruptquery&switchon=true&allnodes=y'
+# 打开自动中断开关；内存超过 uppermemusepct 时，每 100ms 巡检、每轮 kill 最长 5 条查询
+curl -i -XPOST 'http://127.0.0.1:8086/debug/ctrl?mod=interruptquery&switchon=true&uppermemusepct=85'
 ```
 
 **通俗解释**：
 查询并发控制就像"交通管制"：
-- **QueryParallel**：限制同时执行的查询数（类似限制车道数）
+- **QueryParallel**：控制**单条查询内部** chunk reader 的并行度（经 `MaxQueryParallel → MaxParallel → getParallelismNumAndSidNum`），不是并发查询条数上限；真正的并发查询上限是 httpd 的 `MaxConcurrentQueryLimit`/queryThrottler
 - **querySeriesLimit**：限制单个查询扫描的 series 数（类似限制车辆载重）
 - **ParallelQueryInBatch**：批量查询是否并行执行（类似是否允许车队并行）
-- **interruptquery**：紧急中断所有查询（类似交通管制信号）
+- **interruptquery**：启用"内存超限自动中断查询"——内存使用率超过 `uppermemusepct` 时，`ProactiveManager` 每 100ms 巡检一次、每轮 kill 最长执行的 5 条查询
 
 ---
 
@@ -379,37 +385,66 @@ curl -i -XPOST 'http://127.0.0.1:8086/debug/ctrl?mod=interruptquery&switchon=tru
 ### 6.1 内存使用限制
 
 ```go
-case memUsageLimit:
-    // 广播到所有 store 节点
-    dataNodes, _ := SysCtrl.MetaClient.DataNodes()
+case DataFlush, compactionEn, compmerge, snapshot, DownSampleInOrder, verifyNode, memUsageLimit, BackgroundReadLimiter:
+    // store SysCtrl cmd
+    dataNodes, err := SysCtrl.MetaClient.DataNodes()
+    if err != nil {
+        return err
+    }
+    var lock sync.Mutex
+    var wg sync.WaitGroup
     for _, d := range dataNodes {
+        wg.Add(1)
         go sendCmdToStoreAsync(req, resp, d.ID, d.Host, &lock, &wg)
     }
+    wg.Wait()
 ```
 
 **使用方式**：
 
-```bash
-# 设置内存使用限制为 8GB
-curl -i -XPOST 'http://127.0.0.1:8086/debug/ctrl?mod=memusagelimit&limit=8g'
+Store 端用 `GetIntValue` 解析（`engine/sysctrl.go:164-170`）：
+
+```go
+case memUsageLimit:
+    limit, err := syscontrol.GetIntValue(req.Param(), "limit")
+    if err != nil {
+        return nil, err
+    }
+    setMemUsageLimit(int32(limit))
+    return nil, nil
 ```
 
-`memusagelimit` 的 `limit` 是容量值，支持字节以及 `k/m/g` 后缀，不是百分比。百分比上限应使用 `uppermemusepct`。
+```bash
+# 内存使用率超过 85% 时，拒绝新的 partition 分配/加载（MemUsageExceeded）
+curl -i -XPOST 'http://127.0.0.1:8086/debug/ctrl?mod=memusagelimit&limit=85'
+```
+
+`limit` 是**内存使用率百分比**（1-99 的整数；`<1` 或 `>=100` 视为不限制），不是容量值，`limit=8g` 会因 `ParseInt` 失败直接报错。带字节单位的是 `backgroundReadLimiter`（`GetBytesValue`，支持 `k/m/g`）。
 
 ### 6.2 内存使用百分比上限
 
 ```go
 case UpperMemUsePct:
-    upper, _ := GetIntValue(req.Param(), "limit")
-    sysconfig.SetUpperMemPct(upper)  // 本地设置
-    return broadcastCmdToStore(req, resp)  // 广播到 store
+    if err != nil {
+        return err
+    }
+    // update UpperMemUsePct for ts-sql
+    upper, err := GetIntValue(req.Param(), "limit")
+    if err != nil {
+        return err
+    }
+    sysconfig.SetUpperMemPct(upper)
+    // update UpperMemUsePct for all of ts-store
+    return broadcastCmdToStore(req, resp)
 ```
+
+`SetUpperMemPct` 对 `<=0` 或 `>100` 是**静默忽略**（不报错也不生效，`lib/sysconfig/sysconfig.go:88-94`），有效区间是 1-100。
 
 **使用方式**：
 
 ```bash
 # 设置内存使用上限为 99%
-curl -i -XPOST 'http://127.0.0.1:8086/debug/ctrl?mod=uppermemusepct&limit=99&allnodes=y'
+curl -i -XPOST 'http://127.0.0.1:8086/debug/ctrl?mod=uppermemusepct&limit=99'
 ```
 
 ### 6.3 后台读取限速
@@ -427,13 +462,13 @@ curl -i -XPOST 'http://127.0.0.1:8086/debug/ctrl?mod=backgroundReadLimiter&limit
 监控告警：内存使用率 92%，接近 OOM
 
 运维操作：
-  1. 限制内存使用：memusagelimit&limit=8g
-  2. 中断正在执行的大查询：interruptquery&switchon=true
+  1. 设置内存使用率阈值：memusagelimit&limit=85
+  2. 打开自动中断并设置阈值：interruptquery&switchon=true + uppermemusepct&limit=85
   3. 降低后台读取速度：backgroundReadLimiter&limit=50m
 
 效果：
   → 内存使用率从 92% 降到 78%
-  → 大查询被中断，释放内存
+  → 内存超限后最长执行的 5 条查询被中断，释放内存
   → 后台读取减速，减少内存压力
 ```
 
@@ -522,7 +557,7 @@ func SetHierarchicalStorageEnabled(en bool) {
 }
 ```
 
-层级存储开关当前应按内部 API 理解。除非 `ProcessRequest` 增加对应 mod 分支，否则它不是 `/debug/ctrl` HTTP 命令。
+层级存储开关当前应按内部 API 理解。除非 `ProcessRequest` 增加对应 mod 分支，否则它不是 `/debug/ctrl` HTTP 命令。它由 ts-store 启动时的配置注入（`app/ts-store/run/server.go:117-122` 的 `SetHierarchicalStorageEnabled(conf.HierarchicalStore.Enabled)` 等），消费点在 `engine/shard.go:938`、`engine/cs_storage.go:209`、`engine/engine.go:2066`、`engine/index/tsi/mergeset_index.go:1317`。
 
 ### 8.2 层级索引存储开关
 
@@ -561,35 +596,41 @@ func SetIndexHierarchicalStorageEnabled(en bool) {
 
 ```go
 type LogRowsRule struct {
-    Mst  string            // measurement 名称
-    Tags map[string]string // tag 过滤条件
+    Mst  string
+    Tags map[string]string
 }
 
 var (
     LogRowsRuleSwitch int32 // 0: disable, 1: enable
     MuLogRowsRule     sync.RWMutex
-    MyLogRowsRule     = &LogRowsRule{Mst: ""}
+    MyLogRowsRule     = &LogRowsRule{
+        Mst: "",
+    }
 )
 
 func SetLogRowsRuleSwitch(switchon bool, rules string) error {
     MuLogRowsRule.Lock()
     if switchon {
+        // set rules
         rr := strings.Split(rules, ",")
         MyLogRowsRule.Mst = rr[0]
         MyLogRowsRule.Tags = make(map[string]string)
         for _, r := range rr[1:] {
             tkvs := strings.Split(r, "=")
-            if len(tkvs) == 2 {
-                MyLogRowsRule.Tags[tkvs[0]] = tkvs[1]
+            if len(tkvs) != 2 {
+                continue
             }
+            MyLogRowsRule.Tags[tkvs[0]] = tkvs[1]
         }
         atomic.StoreInt32(&LogRowsRuleSwitch, 1)
     } else {
+        // clean rules
         MyLogRowsRule.Mst = ""
         MyLogRowsRule.Tags = make(map[string]string)
         atomic.StoreInt32(&LogRowsRuleSwitch, 0)
     }
     MuLogRowsRule.Unlock()
+    fmt.Println("SetLogRowsRuleSwitch:", switchon)
     return nil
 }
 ```
@@ -650,8 +691,8 @@ curl -i -XPOST 'http://127.0.0.1:8086/debug/ctrl?mod=time_filter_protection&enab
 
 **通俗解释**：
 时间过滤保护就像"安全围栏"：
-- 防止查询的时间范围过大，导致扫描过多数据
-- 开启后，如果查询没有指定时间范围或范围过大，会被拒绝
+- 防止未指定时间范围的查询扫描过多数据
+- 开启后，**Min 与 Max 都为零**（即完全没指定时间范围）的查询会被拒绝；两条豁免：`CREATE STREAM` 语句与含子查询的语句不检查（`lib/util/lifted/influx/query/compile.go:219-225`）。代码里没有「范围过大」的上限比较
 
 ---
 
@@ -826,7 +867,7 @@ func sendCmdToStoreAsync(req msgservice.SysCtrlRequest, resp *bufio.Writer, nid 
 **代码位置**：`lib/syscontrol/syscontrol.go:578-615`
 
 ```go
-func ProcessBackup(req msgservice.SysCtrlRequest, resp *bufio.Writer, sqlHost string) error {
+func ProcessBackup(req msgservice.SysCtrlRequest, resp *bufio.Writer, sqlHost string) (err error) {
     var host string
     s := strings.Split(sqlHost, ":")
     if len(s) > 0 {
@@ -834,21 +875,34 @@ func ProcessBackup(req msgservice.SysCtrlRequest, resp *bufio.Writer, sqlHost st
     }
     params := req.Param()
     isNode := params["isNode"] == "true"
-
-    // 广播到所有 store 节点（或指定节点）
-    dataNodes, _ := SysCtrl.MetaClient.DataNodes()
+    // store SysCtrl cmd
+    dataNodes, err := SysCtrl.MetaClient.DataNodes()
+    if err != nil {
+        return err
+    }
+    var lock sync.Mutex
+    var wg sync.WaitGroup
     for _, d := range dataNodes {
         if !isNode || strings.Contains(d.Host, host) {
+            wg.Add(1)
             go sendCmdToStoreAsync(req, resp, d.ID, d.Host, &lock, &wg)
         }
     }
     wg.Wait()
 
-    // 如果需要备份元数据
+    var metaRes map[string]string
     backupMeta := params["backupMeta"] == "true"
     if backupMeta {
         metaRes, err = SysCtrl.MetaClient.SendBackupToMeta(req.Mod(), req.Param())
     }
+    if err != nil {
+        WriteString(resp, fmt.Sprintf("\n\t%v,", err))
+
+    }
+    for n, s := range metaRes {
+        WriteString(resp, fmt.Sprintf("\n\t%v: %s,", n, s))
+    }
+
     return nil
 }
 ```
@@ -896,7 +950,10 @@ var handlerOnQueryRequest = make(map[queryRequestMod]func(req msgservice.SysCtrl
 
 ```go
 func handleQueryShardStatus(req msgservice.SysCtrlRequest) (string, error) {
-    dataNodes, _ := SysCtrl.MetaClient.DataNodes()
+    dataNodes, err := SysCtrl.MetaClient.DataNodes()
+    if err != nil {
+        return "", err
+    }
     var lock sync.Mutex
     result := make(map[string]interface{})
 
@@ -905,10 +962,17 @@ func handleQueryShardStatus(req msgservice.SysCtrlRequest) (string, error) {
         wg.Add(1)
         go func(d meta2.DataNode) {
             defer wg.Done()
-            nodeRes, _ := SysCtrl.SendQueryRequestOnNode(d.ID, req)
+            nodeRes, err := SysCtrl.SendQueryRequestOnNode(d.ID, req)
+            if err != nil {
+                return
+            }
+
             for k, v := range nodeRes {
                 var vd interface{}
-                json.Unmarshal([]byte(v), &vd)
+                err = json.Unmarshal([]byte(v), &vd)
+                if err != nil {
+                    continue
+                }
                 lock.Lock()
                 result[k] = vd
                 lock.Unlock()
@@ -917,7 +981,10 @@ func handleQueryShardStatus(req msgservice.SysCtrlRequest) (string, error) {
     }
     wg.Wait()
 
-    data, _ := json.Marshal(result)
+    data, err := json.Marshal(result)
+    if err != nil {
+        return "", err
+    }
     return string(data), nil
 }
 ```
@@ -961,7 +1028,7 @@ sequenceDiagram
     Note over Admin: 发现查询瓶颈在 store 2
 
     Note over Admin: ===== 步骤 5: 限制 store 2 的资源 =====
-    Admin->>API: memusagelimit&limit=8g
+    Admin->>API: memusagelimit&limit=85
     API->>Store: 广播内存限制
 
     Note over Admin: ===== 步骤 6: 清理 =====
@@ -982,13 +1049,13 @@ sequenceDiagram
     Monitor->>Admin: 告警：内存使用率 95%！
 
     Note over Admin: ===== 紧急操作 1: 中断查询 =====
-    Admin->>API: interruptquery&switchon=true&allnodes=y
+    Admin->>API: interruptquery&switchon=true（需配合 uppermemusepct）
     API->>SQL: SetInterruptQuery(true)
     API->>Store: 广播中断查询
-    Note over SQL,Store: 所有正在执行的查询被中断
+    Note over SQL,Store: 内存超限后，最长执行的 5 条查询被中断
 
     Note over Admin: ===== 紧急操作 2: 限制内存 =====
-    Admin->>API: memusagelimit&limit=6g
+    Admin->>API: memusagelimit&limit=80
     API->>Store: 广播内存限制
 
     Note over Admin: ===== 紧急操作 3: 禁止写入 =====
@@ -1001,8 +1068,8 @@ sequenceDiagram
 
     Note over Admin: ===== 恢复操作 =====
     Admin->>API: disablewrite&switchon=false
-    Admin->>API: interruptquery&switchon=false&allnodes=y
-    Admin->>API: memusagelimit&limit=8g
+    Admin->>API: interruptquery&switchon=false
+    Admin->>API: memusagelimit&limit=85
 ```
 
 ---
@@ -1023,17 +1090,16 @@ func SetQueryParallel(limit int64) {
 ### 15.2 读写锁
 
 ```go
-var (
-    MuLogRowsRule sync.RWMutex
-    MyLogRowsRule = &LogRowsRule{Mst: ""}
-)
-
 func SetLogRowsRuleSwitch(switchon bool, rules string) error {
-    MuLogRowsRule.Lock()         // 写锁
-    defer MuLogRowsRule.Unlock()
-    // 修改 MyLogRowsRule
+    MuLogRowsRule.Lock()
+    ...
+    MuLogRowsRule.Unlock()
+    fmt.Println("SetLogRowsRuleSwitch:", switchon)
+    return nil
 }
 ```
+
+注意：函数内用的是显式 `Unlock()`（源码第 276 行），**没有 `defer`**——中途 panic 时锁不会释放，后续访问会死锁。
 
 ### 15.3 响应写入锁
 
@@ -1111,6 +1177,7 @@ func broadcastCmdToStore(...) error {
 
 ```go
 func sendCmdToStore(req msgservice.SysCtrlRequest, nid uint64, host string) string {
+    var res string
     _, err := SysCtrl.SendSysCtrlOnNode(nid, req)
     if err != nil {
         res = fmt.Sprintf("\n\t%v: failed,%v,", host, err)

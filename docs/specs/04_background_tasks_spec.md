@@ -1,5 +1,7 @@
 # Module 4: Background Tasks 深度审计报告（庖丁解牛版 v3）
 
+> 基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）；文中 file:line 均以该提交为准。
+
 > 时序图优先，逐步拆解。每个流程都有 Mermaid 时序图 + 核心代码逐行解释。
 
 ---
@@ -41,14 +43,14 @@ sequenceDiagram
 // 第 47 行：Compactor 结构体（简化展示，完整定义见 2.1 节）
 type Compactor struct {
     mu sync.RWMutex               // 读写锁，保护 sources map
-    wg sync.WaitGroup             // 等待所有 shard 注销完成
+    wg sync.WaitGroup             // 仅 Add/Done 计数（代码中没有 Wait 调用点）
 
     sources                  map[uint64]*shard  // shardId → shard 映射
     compactShards            []*shard           // 临时切片，每轮遍历前拷贝
-    outOfOrderMergeNumberMin int                // 乱序文件合并最小数量阈值
-    outOfOrderMergeSizeMin   int                // 乱序文件合并最小大小阈值
+    outOfOrderMergeNumberMin int                // 预留：乱序合并最小数量（当前未使用）
+    outOfOrderMergeSizeMin   int                // 预留：乱序合并最小大小（当前未使用）
 
-    plans map[uint64][immutable.CompactLevels]map[string][][]uint64  // 压缩计划缓存
+    plans map[uint64][immutable.CompactLevels]map[string][][]uint64  // 预留字段（当前未使用）
 }
 
 // 第 59 行：构造函数 — 初始化并启动后台 goroutine
@@ -133,22 +135,22 @@ sequenceDiagram
 // 第 47 行：Compactor 结构体定义
 type Compactor struct {
     mu sync.RWMutex           // 读写锁，保护 sources map 的并发访问
-    wg sync.WaitGroup         // 等待所有 shard 注销完成
+    wg sync.WaitGroup         // 仅 Add/Done 计数（代码中没有 Wait 调用点）
 
     sources                  map[uint64]*shard  // 核心：shardId → shard 的映射表
     compactShards            []*shard           // 临时切片，每轮遍历前从 sources 拷贝
-    outOfOrderMergeNumberMin int                // 乱序文件合并的最小数量阈值
-    outOfOrderMergeSizeMin   int                // 乱序文件合并的最小大小阈值
+    outOfOrderMergeNumberMin int                // 预留：乱序合并最小数量（当前未使用）
+    outOfOrderMergeSizeMin   int                // 预留：乱序合并最小大小（当前未使用）
 
-    plans map[uint64][immutable.CompactLevels]map[string][][]uint64  // 压缩计划缓存
+    plans map[uint64][immutable.CompactLevels]map[string][][]uint64  // 预留字段（当前未使用）
 }
 
 // 第 59 行：构造函数
 func NewCompactor() *Compactor {
     c := &Compactor{
         sources:                  make(map[uint64]*shard, 32),  // 预分配 32 个 shard 的容量
-        outOfOrderMergeNumberMin: 2,                            // 至少 2 个乱序文件才合并
-        outOfOrderMergeSizeMin:   1 * 1024 * 1024,              // 至少 1MB 才合并
+        outOfOrderMergeNumberMin: 2,                            // 预留字段（当前未使用）
+        outOfOrderMergeSizeMin:   1 * 1024 * 1024,              // 预留字段（当前未使用）
         plans:                    make(map[uint64][immutable.CompactLevels]map[string][][]uint64, 8),
     }
 
@@ -160,11 +162,11 @@ func NewCompactor() *Compactor {
 
 **逐行解释**：
 - **第 48 行**：`sync.RWMutex` 读写锁，允许多个读操作并发，但写操作（注册/注销 shard）互斥
-- **第 49 行**：`sync.WaitGroup` 用于进程退出时等待所有 shard 清理完成
+- **第 49 行**：`sync.WaitGroup` 目前只有 `Add/Done` 计数，代码中没有 `Wait()` 调用点
 - **第 51 行**：`sources` 是核心数据结构，存储所有已注册的 shard，key 是 shardId
 - **第 52 行**：`compactShards` 是临时切片，每轮遍历前从 sources 拷贝出来，避免长时间持锁
-- **第 53-54 行**：乱序文件合并的阈值，至少 2 个文件且总大小 >= 1MB 才触发合并
-- **第 61 行**：预分配容量 32，减少 map 扩容开销
+- **第 53-54 行**：`outOfOrderMergeNumberMin` / `outOfOrderMergeSizeMin` 是预留字段——当前只在 `NewCompactor()` 中赋值，全仓库没有读取点，不参与合并判定；真实触发条件见 16.2.2 节（`DefaultLevelMergeFileNum`、`MaxUnorderedFileSize`、`MinInterval`）
+- **第 61 行**：预分配容量 32，减少 map 扩容开销；`plans` 字段（第 56 行）也只在构造函数（第 64 行）初始化，当前没有读写点（预留）
 - **第 67 行**：`go c.run()` 启动后台 goroutine，这是 Compactor 的心跳循环
 
 **具体例子**：
@@ -175,8 +177,8 @@ func NewCompactor() *Compactor {
 Compactor 初始化后：
   sources = {}（空 map）
   compactShards = []（空切片）
-  outOfOrderMergeNumberMin = 2（至少 2 个乱序文件才合并）
-  outOfOrderMergeSizeMin = 1MB（至少 1MB 才合并）
+  outOfOrderMergeNumberMin = 2（预留字段，不参与判定）
+  outOfOrderMergeSizeMin = 1MB（预留字段，不参与判定）
 
 shard 1 注册后：
   sources = {1: shard1}
@@ -317,6 +319,7 @@ func (c *Compactor) run() {
 - **第 176 行**：`for range tm.C` 是 Go 的经典定时循环模式，每次定时器触发时执行循环体
 - **第 177 行**：`merger()` 先执行，因为乱序文件需要先合并成有序文件
 - **第 178 行**：`compact()` 再执行，对有序文件进行层级压缩
+- **第 179 行**：`free()` 最后执行，释放冷 shard 的 sequencer
 
 **具体例子**：
 
@@ -349,7 +352,6 @@ func (c *Compactor) run() {
 3. **最后检查冷数据**（free）：有没有长时间没用的？
 
 就像一个勤劳的清洁工，每 10 秒打扫一次，保持数据库整洁高效！
-- **第 179 行**：`free()` 最后执行，释放冷 shard 的 sequencer
 
 ---
 
@@ -430,6 +432,9 @@ func (c *Compactor) merger() {
 - **第 132 行**：`c.compactShards[:0]` 重置切片长度为 0，但保留底层数组，避免重复分配内存
 - **第 133-136 行**：加读锁遍历 sources，拷贝到 compactShards，然后立即释放锁
 - **第 140 行**：`MergeEnabled()` 检查该 shard 是否允许合并，降采样时会禁用
+- **第 144 行**：`select` 检查 shard 是否已关闭，`Signal()` 返回一个 chan，关闭时会收到信号
+- **第 151-153 行**：计算 `full` 标志，如果 shard 超过 `fullCompColdDuration`（默认 3600s，即 60 分钟）没写入，标记为冷 shard
+- **第 155 行**：`MergeOutOfOrder` 执行实际的合并操作
 
 **具体例子**：
 
@@ -469,9 +474,6 @@ Merger 就像"整理书架"。每隔 10 秒，检查每个书架（shard）：
 1. **检查是否允许整理**：如果书架正在被别人使用（降采样），就跳过
 2. **检查有没有乱序的书**：如果书架上的书摆放混乱（乱序文件），就整理
 3. **整理方式**：把乱序的书重新排列，变成有序的
-- **第 144 行**：`select` 检查 shard 是否已关闭，`Signal()` 返回一个 chan，关闭时会收到信号
-- **第 151-153 行**：计算 `full` 标志，如果 shard 超过 `fullCompColdDuration`（默认 3600s，即 60 分钟）没写入，标记为冷 shard
-- **第 155 行**：`MergeOutOfOrder` 执行实际的合并操作
 
 ---
 
@@ -530,6 +532,8 @@ func (c *Compactor) compact() {
 
 **逐行解释**：
 - **第 161 行**：与 merger 相同的模式：先拷贝 shard 列表，再遍历
+- **第 169 行**：`sh.Compact()` 是 shard 级别的压缩入口，内部会判断冷热状态
+- **补充**：`shard.Compact()` 先判 `isDownsampled()`（已降采样直接返回）；COLUMNSTORE 引擎使用 `LevelCompactRuleForCs`（`[0,1,0,1,0,1]`），不是 `LevelCompactRule`
 
 **具体例子**：
 
@@ -537,30 +541,30 @@ func (c *Compactor) compact() {
 
 ```
 初始状态：
-  L0: 5 个文件（每个 100MB）← 刚 flush 出来的
-  L1: 3 个文件（每个 500MB）
+  L0: 8 个文件（每个 100MB）← 刚 flush 出来的
+  L1: 2 个文件（每个 500MB）
   L2: 2 个文件（每个 1GB）
 
 层级压缩规则：
-  L0：文件数 >= 4 时触发 L0→L1 压缩
-  L1：文件数 >= 8 时触发 L1→L2 压缩
-  L2：文件数 >= 16 时触发 L2→L3 压缩
+  L0：文件数 >= 8 时触发 L0→L1 压缩
+  L1-L5：文件数 >= 4 时触发 L(n)→L(n+1) 压缩
+  L6：文件数 >= 2 时触发
 
 第 1 轮压缩：
-  → 检查 L0：5 个文件 >= 4，触发压缩
-  → 选择 L0 的 5 个文件 + L1 的 3 个文件
-  → 合并成 2 个新文件（每个 1GB）
-  → 结果：L0: 0 个，L1: 2 个，L2: 2 个
+  → 检查 L0：8 个文件 >= 8，触发压缩
+  → 选择 L0 的 8 个文件（同一 level 内成组，不跨 level 取 L1 文件）
+  → 合并成 1 个新文件（约 800MB，level=L1）
+  → 结果：L0: 0 个，L1: 3 个，L2: 2 个
 
 第 2 轮压缩：
   → 检查 L0：0 个文件，不触发
-  → 检查 L1：2 个文件 < 8，不触发
-  → 检查 L2：2 个文件 < 16，不触发
+  → 检查 L1：3 个文件 < 4，不触发
+  → 检查 L2：2 个文件 < 4，不触发
   → 无需压缩
 
-冷 shard（> 1 小时没写入）：
+冷 shard（>= 1 小时没写入）：
   → 触发全量压缩：所有文件 → 最高 level
-  → 结果：L0: 0 个，L1: 0 个，L2: 0 个，L3: 1 个（2.5GB）
+  → 结果：L0: 0 个，L1: 0 个，L2: 0 个，L3: 1 个（3.8GB）
 ```
 
 **通俗解释**：
@@ -569,7 +573,6 @@ func (c *Compactor) compact() {
 2. **L1-L6**：按类别摆放的正式书架
 3. **整理规则**：当某个书架的书太多时，就把书移到下一级书架
 4. **冷书架**：如果某个书架很久没有新书，就把所有书都整理到最里面的书架
-- **第 169 行**：`sh.Compact()` 是 shard 级别的压缩入口，内部会判断冷热状态
 
 ### 4.2 LevelCompactRule 优先级
 
@@ -591,7 +594,7 @@ sequenceDiagram
     Rule->>L0: 再次检查 Level 0
     Rule->>L0: … (Level 0 出现 6 次，最频繁)
 
-    Note over L0,L6: Level 0 检查频率最高（6/18）<br/>Level 6 检查频率最低（1/18）
+    Note over L0,L6: Level 0 检查频率最高（7/18）<br/>Level 6 检查频率最低（1/18）
 ```
 
 **核心代码**：`engine/immutable/compact.go:38-61`
@@ -623,10 +626,10 @@ var (
 **逐行解释**：
 - **第 39 行**：`CompactLevels = 7` 表示有 7 个层级（L0 到 L6）
 - **第 44 行**：`fullCompactingCount` 用 `atomic` 操作，无锁计数
-- **第 45 行**：`maxFullCompactor = CPU/2` 全量压缩很重，限制为 CPU 核数的一半
+- **第 45 行**：`maxFullCompactor = CPU/2` 全量压缩准入上限；`FullCompact` 发现剩余额度 < 1 时直接跳过本轮
 - **第 46 行**：`maxCompactor = CPU` 普通压缩限制为 CPU 核数
 - **第 47 行**：`compLimiter` 是一个带 buffer 的 channel，buffer 大小 = maxCompactor，实现信号量
-- **第 52 行**：`LevelCompactRule` 是压缩调度的核心，18 个条目中 L0 出现 6 次（33%），L6 只出现 1 次（5.5%），确保低 level 优先压缩
+- **第 52 行**：`LevelCompactRule` 是压缩调度的核心，18 个条目中 L0 出现 7 次（38.9%），L6 只出现 1 次（5.6%），确保低 level 优先压缩
 - **第 54 行**：L0 需要 8 个文件才触发，L1-L5 需要 4 个，L6 只需要 2 个
 
 **具体例子**：
@@ -847,11 +850,11 @@ func (t *CompactTask) IncrFull(n int64) {
 ```
 
 **逐行解释**：
-- **第 26 行**：`BaseTask` 提供通用功能：UUID 生成、Key 哈希、OnFinish 回调链
+- **第 26 行**：`BaseTask` 提供通用功能：UUID 自增分配、Key 字符串标识、OnFinish 回调链
 - **第 44 行**：`acquire()` 检查文件路径是否被其他任务占用，是并发控制的关键
 - **第 47-49 行**：`OnFinish` 注册回调，压缩完成时自动执行，无论成功还是失败
 - **第 64 行**：`group.Len() == 1` 表示只有一个文件，只需重命名到目标 level，无需合并
-- **第 72 行**：`IncrFull(1)` 原子递增全量压缩计数，用于控制全量压缩并发数
+- **第 72 行**：`IncrFull(1)` 原子递增全量压缩计数，供 `FullCompact` 的准入判断使用
 - **第 73 行**：`refMmsTable` 增加引用计数，防止压缩期间 measurement 被删除
 - **第 82 行**：`CompactionEnabled()` 再次检查，因为可能在等待期间被禁用
 - **第 94 行**：`NonStreamingCompaction(fi)` 根据内存估算决定使用流式还是非流式压缩
@@ -933,7 +936,7 @@ sequenceDiagram
 
     Note over Caller: 步骤 2: 重命名临时文件
     Caller->>FS: RenameTmpFiles(newFiles)
-    FS->>FS: file.tmp → file.tssp（每个新文件）
+    FS->>FS: file.tssp.init → file.tssp（每个新文件）
 
     Note over Caller: 步骤 3: 查找 measurement 的文件列表
     Caller->>Mms: getFiles(m, isOrder)
@@ -1034,7 +1037,7 @@ func (m *MmsTables) ReplaceFiles(name string, oldFiles, newFiles []TSSPFile, isO
 **逐行解释**：
 - **第 854-858 行**：`defer recover()` 捕获 panic，防止压缩任务崩溃导致整个 Compactor 停止
 - **第 863 行**：`writeCompactedFileInfo` 写压缩日志，这是崩溃恢复的关键 — 如果进程在步骤 2-6 之间崩溃，重启时可以根据日志恢复
-- **第 873 行**：`RenameTmpFiles` 把 `.tmp` 后缀重命名为 `.tssp`，确保数据不丢失
+- **第 873 行**：`RenameTmpFiles` 去掉 `.init` 后缀（`.tssp.init` → `.tssp`），确保数据不丢失
 - **第 886 行**：`fs.lock.Lock()` 是 measurement 级别的锁，防止并发修改同一 measurement 的文件列表
 - **第 889-896 行**：遍历旧文件，先从内存列表移除，再从磁盘删除
 - **第 899 行**：添加新文件到列表末尾
@@ -1069,21 +1072,26 @@ sequenceDiagram
     loop 每个日志文件
         Recover->>Recover: 解析：measurement + oldFiles + newFiles
 
-        alt 新文件存在
-            Recover->>FS: 重命名 .tmp → 最终名称
+        alt 新文件全部存在
+            Recover->>FS: processFiles：重命名 .init → 最终名称
             Recover->>FS: 删除旧文件
-        else 新文件不存在（压缩中断）
-            Note over Recover: 旧文件还在，无需操作
+            Recover->>Log: 删除日志
+        else 新文件不全存在
+            alt 旧文件全部存在
+                Recover->>FS: 把旧文件改名为 .init
+                Recover->>Log: 保留日志
+            else 旧文件也不全
+                Recover->>Log: 报 invalid compact log file
+            end
         end
-
-        Recover->>Log: 删除日志文件
     end
 ```
 
 **通俗解释**：
 - 压缩日志记录了"哪些旧文件被替换成了哪些新文件"
-- **新文件存在**：说明压缩已完成但替换没做完，继续完成替换
-- **新文件不存在**：说明压缩还没完成，旧文件还在，无需操作
+- **新文件全部存在**：说明压缩已完成但替换没做完，继续完成替换并删除旧文件
+- **新文件不全存在且旧文件全在**：把旧文件改名为 `.init`，保留日志等待下次恢复
+- **两者都不全**：日志无效，报错并保留现场
 - 这个机制确保压缩操作的原子性
 
 ---
@@ -1109,15 +1117,15 @@ sequenceDiagram
     Task->>L3: acquire(filePaths)
     Note over L3: 文件路径不能重叠<br/>防止同一文件被并发压缩
 
-    Task->>L4: IncrFull()
-    Note over L4: 全量压缩最多 CPU/2 个<br/>防止全量压缩占满资源
+    Task->>L4: FullCompact 准入检查
+    Note over L4: 全量压缩准入上限 CPU/2<br/>超限时 FullCompact 直接跳过本轮
 ```
 
 **通俗解释**：
 - **第 1 层 compLimiter**：全局最多 CPU 核数个 goroutine 在做压缩，防止 CPU 打满
 - **第 2 层 taskMutex**：同一个 measurement 同时只能有一个压缩任务，防止重复压缩
 - **第 3 层 acquire**：文件路径不能重叠，防止同一个文件被两个压缩任务同时操作
-- **第 4 层 fullCompactingCount**：全量压缩最多 CPU/2 个，防止全量压缩（很重）占满所有资源
+- **第 4 层 fullCompactingCount**：全量压缩准入上限为 CPU/2；`FullCompact` 在 `maxFullCompactor - fullCompactingCount < 1` 时直接 `return nil`（跳过本轮，不排队、不阻塞），`IncrFull` 仅做原子计数
 
 ### 6.2 TaskScheduler 执行流程
 
@@ -1248,12 +1256,12 @@ Step 4: 第 3 层 acquire
   → Task3: acquire(["disk_001.tssp", "disk_002.tssp"]) ✓
   → Task4: acquire(["net_001.tssp", "net_002.tssp"]) ✓
 
-Step 5: 第 4 层 fullCompactingCount
+Step 5: 第 4 层 fullCompactingCount（准入检查，不阻塞）
   → 如果 Task1-4 都是全量压缩：
-    → Task1: IncrFull() ✓（1/2）
-    → Task2: IncrFull() ✓（2/2）
-    → Task3: IncrFull() 阻塞...（等待 Task1 或 Task2 完成）
-    → Task4: IncrFull() 阻塞...
+    → Task1: FullCompact 检查 2-0>=1，进入并 IncrFull()（1/2）
+    → Task2: FullCompact 检查 2-1>=1，进入并 IncrFull()（2/2）
+    → Task3: FullCompact 检查 2-2<1 → 直接 return nil，本轮跳过
+    → Task4: 同上，本轮跳过（不排队等待）
   → 如果 Task1-4 都是增量压缩：
     → 不受 fullCompactingCount 限制
 ```
@@ -1286,11 +1294,11 @@ sequenceDiagram
         else 自动判断
             Check->>Mem: 估算内存 = avgChunkRows * maxColumns * 8 * 文件数
             alt 内存 >= 128MB
-                Check-->>Caller: true（非流式）
-            else maxChunkRows > 500 * maxRowsPerSegment
-                Check-->>Caller: true（非流式）
-            else
                 Check-->>Caller: false（流式）
+            else maxChunkRows > 500 * maxRowsPerSegment
+                Check-->>Caller: false（流式）
+            else
+                Check-->>Caller: true（非流式）
             end
         end
     end
@@ -1495,7 +1503,7 @@ func (t *tsImmTableImpl) compactToLevel(m *MmsTables, group FilesInfo, full, isN
 - **第 87 行**：`NewChunkIterators` 创建非流式迭代器，每个文件一个 ChunkIterator
 - **第 94 行**：`m.compact` 执行非流式压缩，使用堆合并多个 ChunkIterator
 - **第 97 行**：`NewStreamIterators` 创建流式迭代器
-- **第 100 行**：`InitEvents` 初始化事件系统，用于流式压缩的文件替换
+- **第 103 行**：`InitEvents` 初始化事件系统，用于流式压缩的文件替换
 - **第 111 行**：`compItrs.compact` 执行流式压缩，边合并边编码
 - **第 113 行**：失败时清理临时文件，防止磁盘泄漏
 - **第 131 行**：`ReplaceFiles` 是原子替换操作（写日志 → 重命名 → 删旧 → 加新 → 删日志）
@@ -1679,19 +1687,16 @@ sequenceDiagram
 
     Recover->>Recover: 校验 CRC32
 
-    loop 每个 measurement
-        alt 新文件存在
-            Recover->>FS: 重命名 .tmp → 最终名称
-            Recover->>FS: 删除旧文件
-        else 新文件不存在
-            Note over Recover: 降采样未完成，保留旧文件
-        end
+    loop 每个 measurement（先统一 rename 全部新文件）
+        Recover->>FS: 重命名 .init → 最终名称（renameFiles）
     end
-
-    Recover->>Log: 删除日志文件
+    loop 每个 measurement（再统一删除旧文件）
+        Recover->>FS: 删除旧文件（deleteFiles，不检查新文件是否存在）
+    end
+    Note over Recover: 若新文件缺失，旧文件仍会被删除——这是当前实现的已知风险
 ```
 
-**核心代码**：`engine/downsample_info.go:25-69`
+**核心代码**：`engine/downsample_info.go:25-69`（`unmarshal` 见 71-165）
 
 ```go
 // 第 25 行：DownSampleFilesInfo — 降采样日志结构
@@ -1720,7 +1725,7 @@ func (info DownSampleFilesInfo) marshal(dst []byte) []byte {
     return dst
 }
 
-// 第 71 行：反序列化（校验 CRC32）
+// 第 71 行：反序列化（CRC 由调用方 readDownSampleLogFile 校验）
 func (info *DownSampleFilesInfo) unmarshal(src []byte) ([]byte, error) {
     info.taskID = numberenc.UnmarshalUint64(src)
     src = src[8:]
@@ -1731,8 +1736,8 @@ func (info *DownSampleFilesInfo) unmarshal(src []byte) ([]byte, error) {
 ```
 
 **逐行解释**：
-- **第 58 行**：CRC32 校验和确保日志文件没有损坏
-- **第 66-69 行**：反序列化时先校验 CRC32，不匹配就报错，防止损坏的日志导致数据丢失
+- **第 66 行**：`marshal` 在序列化末尾追加 CRC32 校验和，用于检测日志文件损坏
+- **第 71-165 行**：`unmarshal` 只做反序列化，不校验 CRC；CRC 由 `readDownSampleLogFile` 在调用 `unmarshal` 之前校验（`engine/shard.go:1496-1501`），不匹配就报错并删除损坏日志
 
 ---
 
@@ -1762,12 +1767,13 @@ sequenceDiagram
         end
 
         alt 阶段 2: 物理删除
-            SG->>SG: DeletedAt + 24h < now？
+            SG->>SG: DeletedAt + 24h <= now？
             Note over SG: 等待 24 小时<br/>给 LogKeeper 缓冲时间
 
-            SG->>OBS: DeleteObsPath(shardPath)
-            SG->>OBS: DeleteObsPath(indexPath)
-            SG->>Meta: PruneGroupsCommand(sgId)
+            SG->>OBS: DeleteObsPath(shardPath, obsOpts)
+            SG->>OBS: DeleteObsPath(shardPath, nil)
+            SG->>Meta: PruneGroupsCommand(true, shardId)
+            SG->>Meta: DeleteIndexGroup + PruneGroupsCommand(false, indexId)  // 索引不走 DeleteObsPath
             Note over Meta: 从元数据中移除
         end
     end
@@ -1794,7 +1800,7 @@ sequenceDiagram
 
 阶段 2：物理删除（等待 24 小时）
   → 2024-01-11 10:00:00（标记删除后 24 小时）
-  → ShardGroup 1: DeletedAt(1月10日) + 24h = 1月11日 < 1月11日
+  → ShardGroup 1: DeletedAt(1月10日) + 24h = 1月11日，不晚于当前时间（>= 24h 即删）
     → 物理删除：删除 OBS 上的数据文件和索引文件
     → 从元数据中移除
 
@@ -1840,8 +1846,8 @@ func (c *Client) PruneGroupsCommand(shardGroup bool, id uint64) error {
 ```
 
 **逐行解释**：
-- **第 2047 行**：`DelayDeleteShardGroup` 只设置 `DeletedAt` 时间戳，不删除数据
-- **第 2053 行**：通过 Raft 共识传播，确保所有 meta 节点一致
+- **第 2048 行**：`DelayDeleteShardGroup` 只设置 `DeletedAt` 时间戳，不删除数据
+- **第 2057 行**：通过 `retryExec` 把命令发给 meta 服务，确保所有 meta 节点一致（一致性由 meta 层的命令复制保证）
 - **第 2062 行**：`PruneGroupsCommand` 物理删除，从元数据中移除 ShardGroup
 
 ### 9.2 删除超时保护
@@ -1952,14 +1958,13 @@ func (m *MmsTables) EnableCompAndMerge() {
     → 跳过 shard 1
 
   00:30 - Downsample 完成
-    → 当前实现未在 StartDownSample 结束时调用 EnableCompAndMerge()
-    → CompactionEnable()：允许压缩
-    → MergeEnable()：允许合并
+    → StartDownSample 成功/失败路径都未调用 EnableCompAndMerge()
+    → 压缩与合并仍保持禁用，直到外部 bgr 开关重新启用（partition.setEnableShardsBgr）
 
   00:40 - Compactor 再次触发
     → merger()：检查 shard 1
-    → MergeEnabled() = true（降采样已完成）
-    → 正常执行合并
+    → MergeEnabled() = false（仍禁用）
+    → 跳过 shard 1
 ```
 
 **通俗解释**：
@@ -1967,9 +1972,8 @@ func (m *MmsTables) EnableCompAndMerge() {
 1. **降采样时**：会议室被占用，其他人不能使用
    - 禁止压缩（CompactionDisable）
    - 禁止合并（MergeDisable）
-2. **降采样完成后**：会议室空闲，其他人可以使用
-   - 允许压缩（CompactionEnable）
-   - 允许合并（MergeEnable）
+2. **降采样完成后**：会议室不会自动开放，需要外部开关显式恢复
+   - 调用 `EnableCompAndMerge()` 才允许压缩/合并（`StartDownSample` 不会自动调用）
 
 这样确保降采样和压缩不会同时操作同一个 shard，避免数据损坏！
 
@@ -1992,7 +1996,7 @@ sequenceDiagram
     Down->>Shard: ReplaceDownSampleFiles()
     Down->>Shard: 更新 DownSampleLevel
 
-    Note over Shard: 降采样完成后<br/>压缩和合并恢复
+    Note over Shard: 降采样结束后仍保持禁用<br/>需外部开关显式恢复
 
     alt shard 已降采样
         Comp->>Comp: Compact() 跳过
@@ -2121,12 +2125,12 @@ sequenceDiagram
     participant Limiter as compLimiter
     participant FullLimiter as fullCompactingCount
 
-    Cold->>FullLimiter: IncrFull(1)
-    FullLimiter->>FullLimiter: 检查：count < CPU/2？
+    Cold->>FullLimiter: FullCompact 准入检查
+    FullLimiter->>FullLimiter: maxFullCompactor - fullCompactingCount >= 1？
 
     alt 全量压缩已满
-        FullLimiter-->>Cold: 阻塞等待
-        Note over Hot: 热 shard 的普通压缩<br/>也被 compLimiter 阻塞
+        FullLimiter-->>Cold: 直接跳过本轮（return nil）
+        Note over Hot: 全量压缩任务不进入调度队列<br/>不占用 compLimiter 槽位
     else 全量压缩未满
         Cold->>Limiter: 申请 limiter 槽位
         Limiter->>Limiter: 检查：活跃数 < CPU？
@@ -2136,25 +2140,25 @@ sequenceDiagram
 
 **隐患**：
 - 全量压缩很重（合并所有文件到最高 level），可能长时间占用 limiter 槽位
-- 虽然有 `fullCompactingCount` 限制为 CPU/2，但仍然可能影响热 shard 的压缩
+- `fullCompactingCount` 只做准入判断（超限直接跳过），不会阻塞；但全量压缩任务仍与普通压缩共享 compLimiter，未超限时依然会占用槽位
 - 建议：全量压缩使用独立的 limiter，与普通压缩隔离
 
 ---
 
 ## 13. 端到端实战：一次 Level Compaction 的完整生命周期
 
-> 假设 shard 有 6 个 TSSP 文件分布在 L0-L2，追踪一次 L0→L1 压缩的完整过程。
+> 假设 shard 有 12 个 TSSP 文件分布在 L0-L2，追踪一次 L0→L1 压缩的完整过程。
 
 ### 13.1 初始状态
 
 ```
 Shard 文件分布：
-L0: [file1.tssp (10MB), file2.tssp (8MB)]    ← 刚从 MemTable flush 出来
+L0: [file1.tssp (10MB), file2.tssp (8MB), file8.tssp … file13.tssp（各 1MB）]  ← 刚从 MemTable flush 出来，共 8 个
 L1: [file3.tssp (50MB), file4.tssp (45MB)]   ← 之前的压缩结果
 L2: [file5.tssp (200MB), file6.tssp (180MB)] ← 更早的压缩结果
 
-文件数量：L0=2, L1=2, L2=2
-触发条件：L0 文件数 ≥ 2（默认阈值）
+文件数量：L0=8, L1=2, L2=2
+触发条件：L0 文件数 ≥ 8（默认阈值）
 ```
 
 ### 13.2 压缩时序图
@@ -2190,21 +2194,21 @@ sequenceDiagram
     Note over Compact: ===== 构建 CompactTask =====
     Compact->>Task: 创建 CompactTask
     Task->>Task: CompactGroupBuilder.Init()
-    Task->>Task: CompactGroupBuilder.AddFile(file1, file2)
+    Task->>Task: CompactGroupBuilder.AddFile(file1, file2, file8 … file13)
     Task->>Task: CompactGroupBuilder.SwitchGroup()
-    Note over Task: 输入文件：file1.tssp, file2.tssp<br/>目标 Level：L1<br/>输出文件：file7.tssp (新文件)
+    Note over Task: 输入文件：L0 的 8 个文件（file1、file2、file8…file13）<br/>目标 Level：L1<br/>输出文件：file7.tssp (新文件)
 
     Note over Task: ===== 执行压缩 =====
-    Task->>Acquire: acquire(file1, file2)
+    Task->>Acquire: acquire(8 个文件路径)
     Note over Acquire: 标记文件为 inCompact 状态<br/>防止被其他压缩任务选中
 
     Task->>Execute: NonStreamingCompaction()
-    Note over Execute: 读取 file1 + file2 的所有 block<br/>合并排序 → 写入 file7.tssp
+    Note over Execute: 读取 8 个 L0 文件的所有 block<br/>合并排序 → 写入 file7.tssp
 
-    Task->>Replace: ReplaceFiles(old=[file1,file2], new=[file7])
-    Note over Replace: 原子替换：从文件列表中移除 file1,file2<br/>添加 file7.tssp
+    Task->>Replace: ReplaceFiles(old=[8 个 L0 文件], new=[file7])
+    Note over Replace: 原子替换：从文件列表中移除 8 个旧文件<br/>添加 file7.tssp
 
-    Task->>Done: CompactDone(file1, file2)
+    Task->>Done: CompactDone(8 个文件路径)
     Note over Done: 清除 inCompact 标记<br/>释放文件引用
 
     Note over Compact: ===== 更新文件列表 =====
@@ -2259,14 +2263,21 @@ func (c *Compactor) merger() {
         if !sh.immTables.MergeEnabled() {
             continue  // 该 shard 的 merge 已禁用（比如正在降采样）
         }
-        // 检查是否需要全量合并
-        conf := config.GetStoreConfig()
-        full := false
-        if conf.UnorderedOnly || conf.Merge.MergeSelfOnly {
-            d := fasttime.UnixTimestamp() - sh.LastWriteTime()
-            full = d >= atomic.LoadUint64(&fullCompColdDuration)  // 冷 shard 标志
+        id := sh.GetID()
+        select {
+        case <-sh.closed.Signal():
+            log.Info("closed", zap.Uint64("shardId", id))
+            return  // shard 已关闭，退出
+        default:
+            // 检查是否需要全量合并
+            conf := config.GetStoreConfig()
+            full := false
+            if conf.UnorderedOnly || conf.Merge.MergeSelfOnly {
+                d := fasttime.UnixTimestamp() - sh.LastWriteTime()
+                full = d >= atomic.LoadUint64(&fullCompColdDuration)  // 冷 shard 标志
+            }
+            _ = sh.immTables.MergeOutOfOrder(id, full, false)  // 执行合并
         }
-        _ = sh.immTables.MergeOutOfOrder(sh.GetID(), full, false)  // 执行合并
     }
 }
 ```
@@ -2289,39 +2300,73 @@ func (t *tsImmTableImpl) compactToLevel(m *MmsTables, group FilesInfo, full, isN
     compactStatItem.Level = group.toLevel - 1
     compactStat.AddActive(1)  // 活跃压缩任务数 +1
     defer func() {
-        compactStat.AddActive(-1)                         // 活跃压缩任务数 -1
-        compactStat.PushCompaction(compactStatItem)        // 上报统计
+        compactStat.AddActive(-1)
+        compactStat.PushCompaction(compactStatItem)
     }()
 
+    var cLog *zap.Logger
+    var logEnd func()
+    if isNonStream {
+        cLog, logEnd = logger.NewOperation(log, "Compaction", group.name)
+    } else {
+        cLog, logEnd = logger.NewOperation(log, "StreamCompaction", group.name)
+    }
+    defer logEnd()
+    lcLog := Log.NewLogger(errno.ModuleCompact).SetZapLogger(cLog)
+    ...
+    var oldFilesSize int
     var newFiles []TSSPFile
     var compactErr error
+    var events *Events
+    var success = false
 
-    // 根据压缩模式选择不同的执行路径
     if isNonStream {
-        // 非流式：ChunkIterators 堆合并
         compItrs := m.NewChunkIterators(group)
-        compItrs.WithLog(cLog)
+        if compItrs == nil {
+            group.compIts.Close()
+            return nil
+        }
+        compItrs.WithLog(lcLog)
         oldFilesSize = compItrs.estimateSize
-        newFiles, compactErr = m.compact(compItrs, group.oldFiles, group.toLevel, true, cLog)
+        newFiles, compactErr = m.compact(compItrs, group.oldFiles, group.toLevel, true, lcLog)
         compItrs.Close()
     } else {
-        // 流式：StreamIterators 堆合并
         compItrs := m.NewStreamIterators(group)
+        if compItrs == nil {
+            group.compIts.Close()
+            return nil
+        }
         events = compItrs.InitEvents(group.toLevel)
-        compItrs.WithLog(cLog)
+        defer func() {
+            events.Finish(success, m.getEventContext())
+        }()
+        compItrs.WithLog(lcLog)
         oldFilesSize = compItrs.estimateSize
         newFiles, compactErr = compItrs.compact(group.oldFiles, group.toLevel, true)
+        if compactErr != nil {
+            compItrs.RemoveTmpFiles()
+        }
         compItrs.Close()
     }
 
     if compactErr != nil {
+        lcLog.Error("compact fail", zap.Error(compactErr))
         return compactErr
     }
+    ...
+    if events != nil {
+        err := events.TriggerReplaceFile(filepath.Dir(m.path), *m.lock)
+        if err != nil {
+            return err
+        }
+    }
 
-    // 原子替换文件
     if err := m.ReplaceFiles(group.name, group.oldFiles, newFiles, true); err != nil {
         return err
     }
+    ...
+    success = true
+    ...
     return nil
 }
 ```
@@ -2358,7 +2403,7 @@ func NonStreamingCompaction(fi FilesInfo) bool {
 }
 ```
 
-**压缩前后对比**：
+**压缩前后对比**（以 file1、file2 的 series 数据为例，其余 6 个 L0 文件同理）：
 ```
 压缩前：
 L0: [file1.tssp (10MB), file2.tssp (8MB)]
@@ -2368,7 +2413,7 @@ L0: [file1.tssp (10MB), file2.tssp (8MB)]
               series C: [t1=300]
 
 压缩后：
-L1: [file7.tssp (15MB)]
+L1: [file7.tssp (24MB)]
   file7 包含：series A: [t1=10, t2=20, t3=30, t4=40, t5=50]  ← 合并了
               series B: [t1=100, t2=200]
               series C: [t1=300]
@@ -2449,7 +2494,7 @@ func (m *MmsTables) ReplaceFiles(name string, oldFiles, newFiles []TSSPFile, isO
 **逐行解释**：
 - `defer recover()`：捕获 panic，防止压缩任务崩溃导致整个 Compactor 停止
 - `writeCompactedFileInfo`：写压缩日志，这是崩溃恢复的关键 — 如果进程在步骤 2-6 之间崩溃，重启时可以根据日志恢复
-- `RenameTmpFiles`：把 `.tmp` 后缀重命名为 `.tssp`，确保数据不丢失
+- `RenameTmpFiles`：去掉 `.init` 后缀（`.tssp.init` → `.tssp`），确保数据不丢失
 - `fs.lock.Lock()`：measurement 级别的锁，防止并发修改同一 measurement 的文件列表
 - `fs.deleteFile(f)` + `m.deleteFiles(f)`：先从内存列表移除，再从磁盘删除
 - `sort.Sort(fs)`：按序列号排序，确保文件顺序正确
@@ -2460,7 +2505,7 @@ func (m *MmsTables) ReplaceFiles(name string, oldFiles, newFiles []TSSPFile, isO
 ```
 压缩后文件分布：
 L0: [] (清空)
-L1: [file3.tssp (50MB), file4.tssp (45MB), file7.tssp (15MB)]
+L1: [file3.tssp (50MB), file4.tssp (45MB), file7.tssp (24MB)]
 L2: [file5.tssp (200MB), file6.tssp (180MB)]
 
 文件数量：L0=0, L1=3, L2=2
@@ -2480,8 +2525,8 @@ Level Compaction 就像"图书馆整理书架"：
 - **L1**：整理过的书，按类别放好（中等文件，有序）
 - **L2**：更早整理的书，按年份放好（大文件，有序）
 - **整理过程**：
-  1. 检查 L0 书架：新书太多（≥2 本），需要整理
-  2. 把 L0 的书和 L1 的书合并
+  1. 检查 L0 书架：新书太多（≥8 本），需要整理
+  2. 把 L0 的 8 个文件合并（同一 level 内成组，不读取 L1 文件）
   3. 按类别重新排列
   4. 放回 L1 书架
   5. 清空 L0 书架
@@ -2504,13 +2549,13 @@ flowchart TB
         D["② DATA BLOCKS (变长)<br/>所有 series 的编码数据"]
         CM["③ CHUNK META BLOCKS (变长)<br/>每个 series 的元信息"]
         MI["④ META INDEX BLOCKS (变长)<br/>稀疏索引，每个 40 bytes"]
-        BFT["⑤ BLOOM FILTER INDEX (40 bytes)<br/>布隆过滤器索引"]
-        BF["⑥ BLOOM FILTER BLOCKS (变长)<br/>布隆过滤器数据"]
-        TI["⑦ TABLE INDEX (变长)<br/>Trailer，文件尾部索引"]
-        TF["⑧ TRAILER FOOTER (8 bytes)<br/>Trailer 偏移量 (int64)"]
+        BF["⑤ BLOOM FILTER (变长)<br/>布隆过滤器数据（单个 blob，无独立索引区）"]
+        IT["⑥ ID-TIME DATA (变长)<br/>(seriesID, maxTime) 对"]
+        TI["⑦ TRAILER (变长)<br/>各区域 offset/size + 统计信息"]
+        TF["⑧ TRAILER FOOTER (8 bytes)<br/>Trailer 偏移量（zig-zag 编码 int64）"]
     end
 
-    H --> D --> CM --> MI --> BFT --> BF --> TI --> TF
+    H --> D --> CM --> MI --> BF --> IT --> TI --> TF
 ```
 
 ### 14.1 TSSP 文件物理布局
@@ -2522,7 +2567,7 @@ TSSP 文件物理布局（从文件头到文件尾）：
 ┌──────────────────────────────────────────────────────────────────┐
 │ ① HEADER (16 bytes)                                              │
 │    [8 bytes] magic = "53ac2021" (固定标识符)                       │
-│    [8 bytes] version = 2 (uint64, 小端序)                         │
+│    [8 bytes] version = 2 (uint64, 大端序)                         │
 ├──────────────────────────────────────────────────────────────────┤
 │ ② DATA BLOCKS (变长)                                             │
 │    所有 series 的所有列的所有 segment 的编码数据                     │
@@ -2547,7 +2592,7 @@ TSSP 文件物理布局（从文件头到文件尾）：
 │    文件元数据：各区域的 offset/size + 统计信息                        │
 ├──────────────────────────────────────────────────────────────────┤
 │ ⑧ FOOTER (8 bytes)                                               │
-│    [8 bytes] Trailer 的 offset (int64, 小端序)                     │
+│    [8 bytes] Trailer 的 offset (int64, 大端序 + zig-zag)                     │
 │    读取时先读这 8 字节，跳转到 Trailer，再解析整个文件                   │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -2555,23 +2600,25 @@ TSSP 文件物理布局（从文件头到文件尾）：
 **通俗解释**：
 - 文件分为 8 个区域，从头到尾依次是：HEADER → DATA → CHUNK META → META INDEX → BLOOM FILTER → ID-TIME → TRAILER → FOOTER
 - **读取顺序**：先读 FOOTER（最后 8 字节）→ 得到 Trailer offset → 读 Trailer → 得到各区域 offset/size → 按需读取任意区域
-- **写入顺序**：先写 DATA → 再写 CHUNK META → 最后写 META INDEX + BLOOM + TRAILER + FOOTER
+- **写入顺序**：先写 DATA → 再写 CHUNK META → 最后写 META INDEX + BLOOM + ID-TIME + TRAILER + FOOTER
 
 ### 14.2 HEADER — 文件头（16 字节）
 
 **代码位置**：`engine/immutable/table.go:24-28`
 
 ```go
-const tableMagic = "53ac2021"                                       // 字符串常量，len=8
-const version    = uint64(2)                                        // 8 字节版本号
-var fileHeaderSize = len(tableMagic) + int(unsafe.Sizeof(version))  // = 16
+const (
+    tableMagic     = "53ac2021"                                       // 字符串常量，len=8
+    version        = uint64(2)                                        // 8 字节版本号
+    fileHeaderSize = len(tableMagic) + int(unsafe.Sizeof(version))    // = 16
+)
 ```
 
 **字节布局**：
 ```
 偏移    内容                          含义
 0x00    35 33 61 63 32 30 32 31      "53ac2021" (magic)
-0x08    02 00 00 00 00 00 00 00      version = 2 (小端序)
+0x08    00 00 00 00 00 00 00 02      version = 2 (大端序)
 ```
 
 **通俗解释**：
@@ -2614,37 +2661,52 @@ DATA BLOCKS 内部布局：
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-**代码位置**：`engine/immutable/stream_compact.go:1135-1210`（编码函数）
+**代码位置**：`engine/immutable/stream_compact.go:1135-1210`（编码函数），`engine/immutable/column_builder.go:428`（列头）
 
 ```go
-// 时间列编码
-func encodeTimeColumn(rec *record.Record, col *record.ColVal, ...) {
-    // 写入列头
-    EncodeColumnHeader(buf, col.Len, col.NilCount, colValType)
-    // 编码时间戳
-    encoding.EncodeTimestampBlock(col.IntegerValues(), buf)
+// engine/immutable/column_builder.go:428
+func EncodeColumnHeader(col *record.ColVal, dst []byte, typ uint8) []byte {
+    ...
 }
 
-// 普通列编码
-func encodeColumn(rec *record.Record, colIdx int, ...) {
-    // 写入列头
-    EncodeColumnHeader(buf, col.Len, col.NilCount, colValType)
-    // 根据类型选择编码器
-    switch colValType {
-    case influx.Float:
-        encoding.EncodeFloatBlock(col.FloatValues(), buf)
-    case influx.Integer:
-        encoding.EncodeIntegerBlock(col.IntegerValues(), buf)
-    case influx.String:
-        encoding.EncodeStringBlock(col.ByteValues(), buf)
-    case influx.Boolean:
-        encoding.EncodeBooleanBlock(col.BooleanValues(), buf)
+// engine/immutable/stream_compact.go:1135-1162
+func (b *ColumnBuilder) encodeTimeColumn(cols []record.ColVal, offset int64) error {
+    for _, col := range cols {
+        times := col.IntegerValues()
+        ...
+        b.data = EncodeColumnHeader(&col, b.data, encoding.BlockInteger)
+        b.data, err = encoding.EncodeTimestampBlock(col.Val, b.data, b.coder)
+        ...
     }
+    return nil
+}
+
+// engine/immutable/stream_compact.go:1164-1210
+func (b *ColumnBuilder) encodeColumn(segCols []record.ColVal, tmCols []record.ColVal, offset int64, ref record.Field) error {
+    for i := range segCols {
+        segCol := &segCols[i]
+        ...
+        b.data = EncodeColumnHeader(segCol, b.data, uint8(ref.Type))
+        switch ref.Type {
+        case influx.Field_Type_String:
+            b.data, err = encoding.EncodeStringBlock(segCol.Val, segCol.Offset, b.data, b.coder)
+        case influx.Field_Type_Boolean:
+            b.data, err = encoding.EncodeBooleanBlock(segCol.Val, b.data, b.coder)
+        case influx.Field_Type_Float:
+            b.data, err = encoding.EncodeFloatBlock(segCol.Val, b.data, b.coder)
+        case influx.Field_Type_Int:
+            b.data, err = encoding.EncodeIntegerBlock(segCol.Val, b.data, b.coder)
+        default:
+            panic(ref)
+        }
+        ...
+    }
+    return err
 }
 ```
 
 **逐行解释**：
-- `EncodeColumnHeader`：写入列头，包含行数、nil 数、值类型
+- `EncodeColumnHeader`：写入类型标志、null bitmap 长度/内容与 null 计数（无 null 时退化为类型+行数）
 - `EncodeTimestampBlock`：时间戳编码（可能使用 delta-of-delta 压缩）
 - `EncodeFloatBlock`：浮点数编码（可能使用 XOR 压缩）
 - 时间列始终是 `colMeta` 数组的最后一列（`TimeMeta()` 方法）
@@ -2787,7 +2849,7 @@ MetaIndex[19]: id=951, offset=..., count=50 → 指向 ChunkMeta 950-999
 
 ### 14.7 Trailer — 文件元数据
 
-**代码位置**：`engine/immutable/trailer.go:58-65`，`engine/immutable/table_stat.go:35-51`
+**代码位置**：`engine/immutable/trailer.go:24-32`，`engine/immutable/table_stat.go:25-33`（`Marshal` 见 `trailer.go:58-66`）
 
 ```go
 type Trailer struct {
@@ -2838,12 +2900,14 @@ type ExtraData struct {
 ┌──────────┬───────────┬──────────────────────────────────┐
 │ 字段     │ 长度      │ 含义                             │
 ├──────────┼───────────┼──────────────────────────────────┤
-│ seq      │ 8 hex     │ 序列号（决定文件排序）              │
+│ seq      │ 8-16 hex  │ 序列号（决定文件排序）              │
 │ level    │ 4 hex     │ 压缩级别（0=初始，1=L1，...）      │
 │ merge    │ 4 hex     │ 合并级别（每次合并递增）            │
 │ extent   │ 4 hex     │ 文件扩展号（文件分裂时递增）        │
 └──────────┴───────────┴──────────────────────────────────┘
 ```
+
+注：`TSSPFileName.String()` 使用 `%08x-%04x-%04x%04x` 格式化，seq 最少 8 位，超过 32 位时会变长（解析正则允许 8-16 位）。
 
 **有序文件 vs 无序文件**：
 ```
@@ -2911,13 +2975,13 @@ sequenceDiagram
         F2->>Disk: readData(seg0.offset, seg0.size)
         Disk-->>F2: 原始字节
         F2->>Acc: decodeSegment → 追加到累加器
-        Note over Acc: 累加器：2000 行
-        alt 累加器行数 ≥ maxRowsPerSegment (1000)
+        alt 不满足 continueMerge（非本文件最后一段，或已是最后一个 iterator，或累加器已满）
             Acc->>Out: writeSegment() → 写入输出文件
-            Note over Acc: 累加器清空，继续累加
+        else 满足 continueMerge
+            Note over Acc: 继续与下一个文件的同名 segment 拼接
         end
     end
-    Acc->>Out: writeSegment() → 写入剩余数据
+    Acc->>Out: writeLastSegment() → 写入剩余数据
 
     Note over Heap,F2: 处理 Column 1 (temperature) … 同样的流程
 
@@ -2944,24 +3008,24 @@ sequenceDiagram
 
 ```go
 func (c *StreamIterators) genChunkSchema() {
+    c.fields = c.fields[:0]
     // 从堆中弹出最小的 iterator
     itr := heap.Pop(c).(*StreamIterator)
+    c.resetSchemaMap()
     c.mergeSchema(itr.curtChunkMeta)  // 合并列定义
     id := itr.curtChunkMeta.sid       // 记录当前 series ID
+    itr.col.Init()
+    c.chunkSegments = len(itr.curtChunkMeta.timeRange)
     c.chunkItrs = append(c.chunkItrs[:0], itr)  // 加入当前组
 
     // 继续弹出所有相同 sid 的 iterator
     for c.Len() > 0 {
-        itr = heap.Pop(c).(*StreamIterator)
-        if id == itr.curtChunkMeta.sid {
-            c.mergeSchema(itr.curtChunkMeta)  // 同一 series → 合并 schema
-            c.chunkItrs = append(c.chunkItrs, itr)
-        } else {
-            heap.Push(c, itr)  // 不同 series → 放回堆
-            break
-        }
+        ...
     }
+    ...
     sort.Sort(c.fields)  // 列名排序，确保输出文件的列顺序一致
+    c.fields = append(c.fields, record.Field{Name: record.TimeField, Type: influx.Field_Type_Int})
+    ...
 }
 ```
 
@@ -2970,7 +3034,7 @@ func (c *StreamIterators) genChunkSchema() {
 - `id := itr.curtChunkMeta.sid`：记录当前正在处理的 series ID
 - 循环弹出所有相同 sid 的 iterator → 这些 iterator 来自不同文件，但都是同一个 series
 - `c.mergeSchema()`：合并所有文件的列定义（不同文件可能有不同的列，schema evolution）
-- `sort.Sort(c.fields)`：列名排序，保证输出文件的列顺序一致
+- `sort.Sort(c.fields)`：列名排序，保证输出文件的列顺序一致；排序后会追加 time 字段（`record.TimeField`），它始终位于 schema 末尾
 
 **关键洞察**：
 - 堆的排序规则是 `(sid, minTime)`，所以相同 sid 的 iterator 会连续弹出
@@ -2982,51 +3046,95 @@ func (c *StreamIterators) genChunkSchema() {
 **代码位置**：`engine/immutable/stream_compact.go:753-871`
 
 ```go
-func (c *StreamIterators) compactColumn(dstIdx int, ref record.Field, ...) {
-    // 从上一次文件分裂遗留的数据开始
-    if c.lastSegRows > 0 {
-        c.col.AppendColVal(c.lastSeg.ColVals[dstIdx], 0, c.lastSegRows)
+func (c *StreamIterators) compactColumn(dstIdx int, ref record.Field, needCalPreAgg bool, fieldIndex []int) (iteratorStart, segmentIndex int, splitFile bool, err error) {
+    c.maxTime = 0
+
+    // merge column ref
+    _ = c.colBuilder.initEncoder(ref)
+    splitFile = false
+    id := c.chunkItrs[c.iteratorStart].curtChunkMeta.sid
+    segmentN := 0
+    lastSegRows := c.lastSeg.RowNums()
+    if lastSegRows > 0 {
+        idx := c.lastSeg.FieldIndexsFast(ref.Name)
+        col := c.lastSeg.Column(idx)
+        c.col.AppendColVal(col, ref.Type, 0, col.Len)
+        ...
+        col.Init()
     }
 
-    // 遍历每个 iterator（每个文件）
+    var rowCount = 0
+    var maxRows = GetMaxRowsPerSegment4TsStore()
+
     for itrIndex := c.iteratorStart; itrIndex < len(c.chunkItrs); itrIndex++ {
         itr := c.chunkItrs[itrIndex]
+        if c.isClosed() {
+            err = ErrCompStopped
+            return
+        }
+
         srcMeta := itr.curtChunkMeta
-        tm := srcMeta.TimeMeta()  // 时间列的 ColumnMeta
+        tm := srcMeta.TimeMeta()
+        var srcColMeta *ColumnMeta
 
-        // 遍历该 iterator 的每个 segment
+        c.colBuilder.cm = &c.dstMeta
+        c.colBuilder.colMeta = &c.dstMeta.colMeta[dstIdx]
+
+        idx := fieldIndex[itrIndex]
+        if idx >= 0 {
+            srcColMeta = &srcMeta.colMeta[idx]
+        } else {
+            rowCount = srcMeta.Rows(c.ctx.preAggBuilders.timeBuilder)
+        }
+
+        // merge full segments(full segment: rows in segment EQ 1000)
         for segIndex := c.segmentIndex; segIndex < len(tm.entries); segIndex++ {
-            // ① 从磁盘读取该 segment 的列数据
-            colSeg := srcMeta.colMeta[srcColIdx].entries[segIndex]
-            segData := itr.readData(colSeg.offset, colSeg.size)
-
-            // ② 解码到临时缓冲区
-            c.decodeSegment(segData, tmData, ref)
-
-            // ③ 如果是时间列，验证时间顺序
-            if ref.Name == record.TimeField {
-                c.validateTimes(c.tmpCol.IntegerValues())
+            ...
+            if idx >= 0 {
+                colSeg := &srcColMeta.entries[segIndex]
+                if !needCalPreAgg {
+                    segData, er := itr.readData(colSeg.offset, colSeg.size)
+                    ...
+                    if err = c.decodeSegment(segData, nil, ref); err != nil {
+                        return
+                    }
+                } else {
+                    colData, er := itr.readData(colSeg.offset, colSeg.size)
+                    ...
+                    tmSeg := &tm.entries[segIndex]
+                    tmData, er := itr.readTimeData(tmSeg.offset, tmSeg.size)
+                    ...
+                    if err = c.decodeSegment(colData, tmData, ref); err != nil {
+                        return
+                    }
+                }
+            } else {
+                ...
             }
 
-            // ④ 追加到累加器
-            c.col.AppendColVal(c.tmpCol, 0, c.tmpCol.Len)
-
-            // ⑤ 如果累加器满了，写入输出文件
-            if !c.continueMerge(c.col.Len, maxRowsPerSegment) {
-                c.writeSegment(sid, ref, needCalPreAgg)
-                c.col.Reset()  // 清空累加器
+            if c.continueMerge(segIndex, itrIndex, tm) {
+                break
             }
+
+            if err = c.writeSegment(srcMeta.sid, ref, needCalPreAgg); err != nil {
+                return
+            }
+            segmentN++
+            ...
         }
     }
+
+    err = c.writeLastSegment(segmentN, ref, id)
+    return
 }
 ```
 
 **逐行解释**：
-- `itr.readData(colSeg.offset, colSeg.size)`：**从磁盘读取一个 segment 的数据**。这是流式的关键——每次只读 ≤1000 行
-- `c.decodeSegment()`：解码到临时缓冲区 `c.tmpCol`
-- `c.validateTimes()`：如果是时间列，检查是否有序（详见 16 节）
-- `c.col.AppendColVal()`：追加到累加器
-- `c.writeSegment()`：累加器满了（≥1000 行），写入输出文件，清空累加器
+- `itr.readData(colSeg.offset, colSeg.size)`：**从磁盘读取一个 segment 的数据**。这是流式的关键——每次只读一个 segment（通常 ≤1000 行）
+- `c.decodeSegment()`：解码到临时缓冲区 `c.tmpCol`（时间列在 `decodeSegment` 内部调用 `validateTimes`）
+- `c.col.AppendColVal()`：`decodeSegment` 内部把解码结果追加到累加器 `c.col`
+- `c.continueMerge(segIndex, itrIndex, tm)`：判断是否继续与下一个文件拼接（当前文件最后一段、还有后续 iterator、且累加器未满）
+- `c.writeSegment()`：不满足 continueMerge 时写出一个 segment；列处理结束时由 `writeLastSegment` 写出剩余数据
 
 **为什么是"流式"？**
 
@@ -3072,36 +3180,61 @@ func (c *StreamIterators) validateTimes(times []int64) error {
 
 ```go
 func (c *StreamIterators) Flush() error {
-    // ① 写入最后一个 MetaIndex 块
-    c.SwitchChunkMeta()
-
-    // ② 生成 Bloom Filter
-    c.genBloomFilter()
-
-    // ③ 计算各区域的 offset/size
-    c.trailer.dataOffset = int64(fileHeaderSize)  // = 16
-    c.trailer.dataSize = c.writer.DataSize() - int64(fileHeaderSize)
-
-    // ④ 把 ChunkMeta 追加到 DATA 区后面
-    c.CopyChunkMetaToData()
-
-    // ⑤ 写入 MetaIndex 条目（每个 40 bytes）
-    for _, mi := range c.metaIndexItems {
-        c.writer.WriteData(mi.Marshal())
+    if c.writer.DataSize() <= 16 {
+        return errEmptyFile
     }
 
-    // ⑥ 写入 Bloom Filter
-    c.writer.WriteData(c.bloomFilter)
+    if c.mIndex.count > 0 {
+        if err := c.SwitchChunkMeta(); err != nil {
+            return err
+        }
+    }
 
-    // ⑦ 写入 IdTime 数据
-    c.writer.WriteData(c.idTimeData)
+    c.genBloomFilter()
+    c.trailer.dataOffset = int64(len(tableMagic) + int(unsafe.Sizeof(version)))
+    c.trailer.dataSize = c.writer.DataSize() - c.trailer.dataOffset
+    metaOff := c.writer.DataSize()
+    c.trailer.indexSize = c.writer.ChunkMetaSize()
 
-    // ⑧ 写入 Trailer
-    c.writer.WriteData(c.trailer.Marshal())
+    if err := c.writer.AppendChunkMetaToData(); err != nil {
+        ...
+    }
 
-    // ⑨ 写入 Footer（最后 8 bytes）
-    footer := numberenc.MarshalInt64(c.trailerOffset)
-    c.writer.WriteData(footer)
+    miOff := c.writer.DataSize()
+    for i := range c.metaIndexItems {
+        m := &c.metaIndexItems[i]
+        m.offset += metaOff
+        c.encChunkIndexMeta = m.marshal(c.encChunkIndexMeta[:0])
+        _, err := c.writer.WriteData(c.encChunkIndexMeta)
+        ...
+    }
+
+    c.trailer.metaIndexSize = c.writer.DataSize() - miOff
+    c.trailer.metaIndexItemNum = int64(len(c.metaIndexItems))
+    c.trailer.bloomSize = int64(len(c.bloomFilter))
+
+    if _, err := c.writer.WriteData(c.bloomFilter); err != nil {
+        ...
+    }
+
+    c.encIdTime = c.pair.Marshal(true, c.encIdTime[:0], c.colBuilder.coder)
+    c.trailer.idTimeSize = int64(len(c.encIdTime))
+    if _, err := c.writer.WriteData(c.encIdTime); err != nil {
+        ...
+    }
+    ...
+    c.trailerData = c.trailer.Marshal(c.trailerData[:0])
+    trailerOffset := c.writer.DataSize()
+    if _, err := c.writer.WriteData(c.trailerData); err != nil {
+        ...
+    }
+
+    var footer [8]byte
+    fb := numberenc.MarshalInt64Append(footer[:0], trailerOffset)
+    if _, err := c.writer.WriteData(fb); err != nil {
+        ...
+    }
+    ...
 }
 ```
 
@@ -3155,11 +3288,11 @@ data/db/0/measurements/cpu/
 ```go
 func SplitRecordByTime(rec *record.Record, pool []record.Record, time int64) (*record.Record, *record.Record) {
     times := rec.Times()
-    // 快速路径 1: 所有数据都比 flushTime 新 → 全部进有序文件
+    // 快速路径 1: 所有数据都 <= flushTime → 全部进无序文件
     if time >= times[len(times)-1] {
         return nil, rec
     }
-    // 快速路径 2: 所有数据都比 flushTime 旧 → 全部进无序文件
+    // 快速路径 2: 所有数据都 > flushTime → 全部进有序文件
     if time < times[0] {
         return rec, nil
     }
@@ -3169,29 +3302,50 @@ func SplitRecordByTime(rec *record.Record, pool []record.Record, time int64) (*r
         return times[i] > time  // 找到第一个 > flushTime 的位置
     })
 
+    if len(pool) < 2 {
+        pool = make([]record.Record, 2)
+    }
+
     // 拆分为两个 Record
     orderRec := &pool[0]    // 有序部分 (time > flushTime)
+    orderRec.Reset()
+    orderRec.ReserveColVal(len(rec.Schema))
+
     unOrderRec := &pool[1]  // 无序部分 (time <= flushTime)
+    unOrderRec.Reset()
+    unOrderRec.ReserveColVal(len(rec.Schema))
+
+    orderIdx, unOrderIdx := 0, 0
 
     for i := range rec.Schema {
         field := rec.Schema[i]
         col := &rec.ColVals[i]
 
+        orderCol, unOrderCol := &orderRec.ColVals[orderIdx], &unOrderRec.ColVals[unOrderIdx]
+
         // 无序部分: [0, n) — 时间 <= flushTime
+        unOrderCol.Init()
         unOrderCol.AppendColVal(col, field.Type, 0, n)
+        ...
         // 有序部分: [n, len) — 时间 > flushTime
+        orderCol.Init()
         orderCol.AppendColVal(col, field.Type, n, col.Len)
+        ...
     }
+
+    orderRec.ColVals = orderRec.ColVals[:orderIdx]
+    unOrderRec.ColVals = unOrderRec.ColVals[:unOrderIdx]
+
     return orderRec, unOrderRec
 }
 ```
 
 **逐行解释**：
 - **第 244 行**：`time` 是 `flushTime`，即该 series 在磁盘上已持久化的最大时间戳
-- **第 245-246 行**：快速路径 — 如果所有数据的时间都 > `flushTime`，说明全是新数据，全部进有序文件，返回 `nil, rec`
-- **第 247-248 行**：快速路径 — 如果所有数据的时间都 <= `flushTime`，说明全是乱序数据，全部进无序文件，返回 `rec, nil`
-- **第 251-252 行**：`sort.Search` 二分查找，找到第一个 `times[i] > flushTime` 的索引 `n`
-- **第 269-275 行**：遍历每一列，将 `[0, n)` 部分追加到无序 Record，`[n, len)` 部分追加到有序 Record
+- **第 244-245 行**：快速路径 — `flushTime >= max(times)`，所有数据都 <= `flushTime`，全是乱序数据，全部进无序文件，返回 `(nil, rec)`
+- **第 246-247 行**：快速路径 — `flushTime < min(times)`，所有数据都 > `flushTime`，全是新数据，全部进有序文件，返回 `(rec, nil)`
+- **第 250-252 行**：`sort.Search` 二分查找，找到第一个 `times[i] > flushTime` 的索引 `n`
+- **第 268-290 行**：遍历每一列，将 `[0, n)` 部分追加到无序 Record，`[n, len)` 部分追加到有序 Record（同时剔除全 nil 列）
 
 **Flush 时的完整流程**：
 
@@ -3204,17 +3358,19 @@ sequenceDiagram
     participant Unorder as unOrderMsBuilder
     participant Disk as 磁盘
 
-    Flush->>Seq: GetFlushTime(sid)
-    Seq-->>Flush: flushTime = 该 series 已持久化的最大时间
+    Flush->>Seq: GetMmsIdTime(measurement)
+    Seq-->>Flush: *MmsIdTime
+    Flush->>Seq: mmsIdTime.Get(sid)
+    Seq-->>Flush: flushTime = 该 series 已持久化的最大时间（lastFlushTime）
 
     Flush->>Split: SplitRecordByTime(rec, pool, flushTime)
 
-    alt 所有时间 > flushTime
-        Split-->>Flush: (nil, rec) 全部有序
-        Flush->>Order: WriteRecord(rec, isOrder=true)
-    else 所有时间 <= flushTime
-        Split-->>Flush: (rec, nil) 全部无序
+    alt 所有时间 <= flushTime
+        Split-->>Flush: (nil, rec) 全部无序
         Flush->>Unorder: WriteRecord(rec, isOrder=false)
+    else 所有时间 > flushTime
+        Split-->>Flush: (rec, nil) 全部有序
+        Flush->>Order: WriteRecord(rec, isOrder=true)
     else 部分有序部分无序
         Split-->>Flush: (orderRec, unOrderRec)
         Flush->>Order: WriteRecord(orderRec, isOrder=true)
@@ -3227,7 +3383,7 @@ sequenceDiagram
 
 **Sequencer 的作用**：
 
-Sequencer 是一个内存中的 `map[seriesID]maxTimestamp` 结构，记录每个 series 已持久化的最大时间戳。每次 Flush 成功后，Sequencer 会更新对应 series 的最大时间。这样下次 Flush 时，就能准确判断哪些数据是"乱序"的。
+Sequencer 通过 `GetMmsIdTime(measurement)` 返回 `MmsIdTime`，后者用「高 32 位 → 低 32 位 → `*idInfo`」的二级 map 记录每个 series 的 `lastFlushTime` 与行数。每次 Flush 成功后，Sequencer 会更新对应 series 的最大时间。这样下次 Flush 时，就能准确判断哪些数据是"乱序"的。
 
 ```
 示例：Series A 的 Sequencer 记录 maxTime=300
@@ -3280,6 +3436,8 @@ sequenceDiagram
         M->>Build: buildMergeContext(mst, full, force)
         alt force=true
             Build->>Norm: buildNormalMergeContext() → selfMode=false
+        else full=true
+            Build->>Lvl: buildFullMergeContext()
         else 配置 MergeSelfOnly 或 UnorderedOnly
             Build->>Lvl: buildUnorderedOnlyMergeContext()
         else 普通模式
@@ -3332,7 +3490,7 @@ func (m *MmsTables) getMstToMerge(limit int, full bool, force bool) []string {
 - **第 189 行**：`limit` 通常等于 CPU 核数，防止一次合并太多 measurement
 - **第 197 行**：三重检查 — 无文件跳过、正在关闭跳过、正在合并跳过
 - **第 201-203 行**：`full`（冷 shard）或 `force`（强制）模式下，直接选中
-- **第 206 行**：普通模式下，文件数 >= 4（`DefaultLevelMergeFileNum`）才选中；或者距上次合并时间超过 `MinInterval`（默认 10 秒）
+- **第 206 行**：普通模式下，文件数 >= 4（`DefaultLevelMergeFileNum`）才选中；或者距上次合并时间超过 `MinInterval`（默认 300 秒；`Nearly` 为 true 表示仍在间隔内）
 
 **第二层规划：BuildMergeContext**
 
@@ -3376,6 +3534,8 @@ func BuildMergeContext(mst string, files *TSSPFiles, full bool, lmt *lastMergeTi
 }
 ```
 
+注意：`MaxMergeSelfLevel` 默认 0，此时上面的 `for` 循环一次都不执行，普通模式必然走 `buildNormalMergeContext`；自合并需要显式配置。
+
 **决策树**：
 
 ```
@@ -3416,8 +3576,7 @@ func buildLevelMergeContext(mst string, files *TSSPFiles, level uint16, callback
         fileMergedLevel := f.FileNameMerge()
         if fileMergedLevel != level {
             if ctx.UnorderedLen() > 0 {
-                callback(ctx)  // 提交当前上下文
-                ctx = NewMergeContext(mst, level, true)  // 新建上下文
+                ctx = NewMergeContext(mst, level, true)  // 丢弃已累积的上下文（不提交）
             }
             continue
         }
@@ -3443,18 +3602,20 @@ func buildLevelMergeContext(mst string, files *TSSPFiles, level uint16, callback
   F6: merge=1, size=2MB
 
 buildLevelMergeContext(level=0):
-  - F1, F2, F3, F4 都是 merge=0 → 同组
+  - F1..F4 都是 merge=0 → 同组
   - fileNum=8 (LevelMergeFileNum[0])
-  - 4 个文件 < 8 → 不够一组，暂不提交
+  - 4 个文件 < 8 → 不触发 callback
+  - 遇到 F5(merge=1) → 丢弃已累积的 [F1..F4]（不提交）
 
 buildLevelMergeContext(level=1):
   - F5, F6 都是 merge=1 → 同组
   - fileNum=8 (LevelMergeFileNum[1])
-  - 2 个文件 < 8 → 不够一组，暂不提交
+  - 2 个文件 < 8 → 不触发 callback
+  - 遇到 F6(merge=2) → 丢弃已累积的 [F5,F6]（不提交）
 
 最终结果：
-  level=0 的上下文: [F1, F2, F3, F4] → selfMode=true, level=0
-  level=1 的上下文: [F5, F6] → selfMode=true, level=1
+  没有产生任何自合并上下文
+  随后由 BuildMergeContext 的兜底分支调用 buildNormalMergeContext（selfMode=false）
 ```
 
 **第四层兜底：buildNormalMergeContext — 合并到有序**
@@ -3510,21 +3671,20 @@ func buildNormalMergeContext(mst string, files *TSSPFiles) *MergeContext {
 
   buildLevelMergeContext(level=0):
     - F1(merge=0), F2(merge=0), F3(merge=0) → 同组
-    - 3 个文件 < 8 (LevelMergeFileNum[0]) → 不提交
-    - F4(merge=1) != 0 → 提交 ctx=[F1,F2,F3]
-    → 产生: MergeContext{level=0, selfMode=true, files=[F1,F2,F3]}
+    - 3 个文件 < 8 (LevelMergeFileNum[0]) → 不触发 callback
+    - F4(merge=1) != 0 → 丢弃 ctx=[F1,F2,F3]（不提交）
+    → 产生: 0 个上下文
 
   buildLevelMergeContext(level=1):
     - F4(merge=1), F5(merge=1) → 同组
-    - 2 个文件 < 8 (LevelMergeFileNum[1]) → 不提交
-    - F6(merge=2) != 1 → 提交 ctx=[F4,F5]
-    → 产生: MergeContext{level=1, selfMode=true, files=[F4,F5]}
+    - 2 个文件 < 8 (LevelMergeFileNum[1]) → 不触发 callback
+    - F6(merge=2) != 1 → 丢弃 ctx=[F4,F5]（不提交）
+    → 产生: 0 个上下文
 
-  步骤 2 结果: 2 个自合并上下文，无需兜底
+  步骤 2 结果: 0 个自合并上下文 → 走兜底 buildNormalMergeContext（selfMode=false）
 
 最终执行：
-  1. execMergeContext(ctx1) → 合并 F1+F2+F3 → 输出 merge=1 的新文件
-  2. execMergeContext(ctx2) → 合并 F4+F5 → 输出 merge=2 的新文件
+  execMergeContext(兜底 ctx) → 把无序文件合并到匹配的有序文件（可能因 MaxUnorderedFileNumber/Size 被截断）
 ```
 
 ### 16.3 乱序合并的两种模式
@@ -3822,7 +3982,7 @@ sequenceDiagram
 
         Note over MP: ===== Handle: 逐列合并 =====
         loop 每列
-            MP->>CI: ReadColumn(sid, colName) → 有序列数据
+            MP->>CI: ColumnIterator.Run(p) → 回调有序列数据
             MP->>UR: ChangeColumn(sid, field) + Read(sid, maxTime) → 无序列数据
             MP->>MP: MergeHelper(有序列, 无序列, mergedTimes)
             MP->>Out: 写入合并后的列数据
@@ -3884,11 +4044,11 @@ func (m *MmsTables) matchOrderFiles(ctx *MergeContext) {
   F1: [50,  150]  → 重叠 [100,150] → 匹配
   F2: [200, 300]  → 重叠 [200,300] → 匹配（因为 F1 已匹配，连续添加）
   F3: [400, 600]  → 重叠 [400,500] → 匹配（连续添加）
-  F4: [700, 800]  → 不重叠，且 min > max → 停止
+  F4: [700, 800]  → 不重叠，但 min > max 且 order.Len()>0 → 仍被加入（代码不 break）
 
-结果: ctx.order = [F1, F2, F3]
+结果: ctx.order = [F1, F2, F3, F4]
 
-为什么 F2 和 F3 也会被添加？
+为什么 F2、F3、F4 也会被添加？
   因为 ctx.order.Len() > 0 条件：一旦有文件被匹配，后续所有文件都会被添加
   这保证了有序文件的连续性 — 合并后的文件不会出现"空洞"
 ```
@@ -3923,7 +4083,7 @@ sequenceDiagram
 
         Note over MP: ===== Handle: 逐列合并 =====
         loop 每列
-            MP->>CI: ReadColumn(sid, colName) → 有序列数据
+            MP->>CI: ColumnIterator.Run(p) → 回调有序列数据
             MP->>UR: ChangeColumn(sid, field) + Read(sid, maxTime) → 无序列数据
             MP->>MP: MergeHelper(有序列, 无序列, mergedTimes)
             Note over MP: 双指针归并：<br/>有序列指针 i, 无序列指针 j<br/>按 mergedTimes 的顺序<br/>依次取值
@@ -4084,20 +4244,45 @@ MergeHelper 结果:
 
 ### 16.8 UnorderedReader — 无序文件读取器
 
-**代码位置**：`engine/immutable/unordered_reader.go:234-249`
+**代码位置**：`engine/immutable/unordered_reader.go:30-47`（UnorderedColumnReader）、`234-249`（UnorderedReader）
 
 ```go
-type UnorderedReader struct {
-    readers []*UnorderedColumnReader  // 每个无序文件一个 reader
-    mst     string
-    shardId uint64
+// engine/immutable/unordered_reader.go:30-47
+type UnorderedColumnReader struct {
+    fi      *FileIterator
+    sr      *SegmentReader
+    columns *UnorderedColumns
+
+    seq uint64
+    sid uint64
+
+    // times of out-of-order data
+    times []int64
+
+    colIdx  int
+    ref     *record.Field
+    colMeta *ColumnMeta
+    swap    *record.ColVal
+    remain  []*record.ColVal
+    colPool *MergeColPool
 }
 
-type UnorderedColumnReader struct {
-    fi      *FileIterator    // 文件迭代器
-    ctx     *ReadContext     // 读取上下文
-    curSid  uint64           // 当前 series ID
-    times   []int64          // 当前 series 的时间列
+// engine/immutable/unordered_reader.go:234-249
+type UnorderedReader struct {
+    log     *logger.Logger
+    ctx     *UnorderedReaderContext
+    readers []*UnorderedColumnReader
+
+    sid     uint64
+    ref     *record.Field
+    schemas map[string]record.Field
+
+    ofs   int
+    times []int64
+    swap  []int64
+
+    timeCol record.ColVal
+    nilCol  record.ColVal
 }
 ```
 
@@ -4105,35 +4290,49 @@ type UnorderedColumnReader struct {
 
 ```go
 // InitTimes: 读取某个 series 的所有时间戳
-func (ur *UnorderedReader) InitTimes(sid uint64, maxTime int64) {
-    allTimes := make([]int64, 0)
-    for _, reader := range ur.readers {
-        reader.ChangeSeries(sid)  // 定位到该 series
-        times := reader.ReadTimes(maxTime)  // 读取时间列
-        allTimes = MergeTimes(allTimes, times, nil)  // 归并排序去重
+func (r *UnorderedReader) InitTimes(sid uint64, maxTime int64) {
+    r.times = r.times[:0]
+    if sid != r.sid {
+        return
     }
-    ur.mergedTimes = allTimes
+    for _, reader := range r.readers {
+        times := reader.ReadTime(sid, maxTime)
+        r.swap = MergeTimes(r.times, times, r.swap[:0])
+        r.times, r.swap = r.swap, r.times
+    }
 }
 
-// Read: 读取某个 series 的某列数据
-func (ur *UnorderedReader) ChangeColumn(sid uint64, ref *record.Field) {
-    // 先选择要读取的列；列名不作为 Read 参数传入
+// ChangeColumn: 先按列名切换到要读取的列
+func (r *UnorderedReader) ChangeColumn(sid uint64, ref *record.Field) {
+    r.ofs = 0
+    r.ref = ref
+    for _, reader := range r.readers {
+        reader.ChangeColumn(sid, ref)
+    }
 }
 
-func (ur *UnorderedReader) Read(sid uint64, maxTime int64) (*record.ColVal, []int64, error) {
-    result := record.NewColVal(...)
-    for _, reader := range ur.readers {
-        col := reader.ReadColumn(sid, maxTime, colName)
-        result.AppendColVal(col, 0, col.Len)
+// Read: 读取某个 series 的当前列，并交给 ctx.merge 合并
+func (r *UnorderedReader) Read(sid uint64, maxTime int64) (*record.ColVal, []int64, error) {
+    nilTimes := r.ReadTimes(maxTime)
+    if len(nilTimes) == 0 {
+        return nil, nil, nil
     }
-    return result
+    nilCol := r.AllocNilCol(len(nilTimes), r.ref)
+    for _, reader := range r.readers {
+        col, times, err := reader.Read(sid, maxTime)
+        if err != nil {
+            return nil, nil, err
+        }
+        r.ctx.add(times, col)
+    }
+    return r.ctx.merge(nilCol, nilTimes, r.ref.Type)
 }
 ```
 
 **逐行解释**：
-- `InitTimes()`：从所有无序文件中读取某个 series 的时间列，归并排序去重
-- `Read()`：从所有无序文件中读取某个 series 的某列数据，追加到结果中
-- `ChangeSeries(sid)`：将 FileIterator 定位到指定的 series
+- `InitTimes()`：对每个 reader 调用 `ReadTime(sid, maxTime)`，再用 `MergeTimes` 复用 swap 切片归并排序去重
+- `Read()`：从所有无序文件读取当前列的 `(col, times)`，交给 `r.ctx.merge(nilCol, nilTimes, r.ref.Type)` 合并
+- `ChangeSeries(sid)`：将每个 `UnorderedColumnReader` 定位到指定 series
 
 ### 16.9 乱序合并的完整数据流
 
@@ -4152,7 +4351,7 @@ Step 2: MergeHelper (value 列)
   有序 value:      [10,  -,   20,  -,   30,  -,   50,  60]  (- 表示该时间没有值)
   无序 value:      [-,   15,  -,   25,  -,   40,  -,   -]
 
-  合并规则：优先取有序文件的值，无序文件的值补充空位
+  合并规则：同一时间戳优先取无序（新）值；无序为 nil 时才取有序值
   合并结果 value:  [10,  15,  20,  25,  30,  40,  50,  60]
 
 Step 3: 写入输出文件

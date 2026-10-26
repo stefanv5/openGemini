@@ -1,5 +1,7 @@
 # Module 18: Retention 数据保留策略深度审计报告（庖丁解牛版）
 
+> 代码基线：`origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）。本文所有 `file:line` 均以该提交为准（快照 `snapshots/spec-md-chinese`）。
+
 > Retention 是数据生命周期的最后一环。它负责将过期数据物理删除，释放存储空间。openGemini 支持两种粒度的保留策略：**Shard 级**（整个 shard 过期删除）和 **Measurement 级**（单个 measurement 过期删除）。
 
 ---
@@ -32,13 +34,13 @@ sequenceDiagram
 
 ## 2. 整体架构
 
-### 2.1 两个服务
+### 2.1 三个 Service
 
 ```mermaid
 graph TB
     subgraph "Retention 服务"
         A["services/retention/service.go<br/>Shard/Index 级保留"]
-        B["services/retention/mst/service.go<br/>Measurement 级保留"]
+        B["services/retention/mst/service.go<br/>Measurement 级保留（shard 内 / index 内两个 Service）"]
     end
 
     subgraph "Engine 层"
@@ -59,9 +61,11 @@ graph TB
     A --> D
     B --> F
     E --> G
-    E --> H
+    D --> H
     F --> I --> J
 ```
+
+另外 `HandleLocalStorage` 还有第三段清理：`Engine.ExpiredCacheIndexes()` → `Engine.ClearIndexCache(...)`（`services/retention/service.go:293-303`）。
 
 ### 2.2 服务周期
 
@@ -143,13 +147,13 @@ sequenceDiagram
     Note over Scan: 遍历所有 DBPT<br/>检查 shard.IsExpired()
 
     loop 每个过期的 shard
-        Handle->>Meta: DeleteShardGroup(shardID)
+        Handle->>Meta: DeleteShardGroup(db, rp, id, MarkDelete)
         Note over Meta: 在 meta 中标记删除
 
         Handle->>Delete: DeleteShardOrIndex(shardID)
         Note over Delete: 异步删除（120s 超时）
 
-        Handle->>Meta: PruneGroupsCommand()
+        Handle->>Meta: PruneGroupsCommand(true, shardID)
         Note over Meta: 清理 meta 中的过期记录
     end
 ```
@@ -160,61 +164,79 @@ sequenceDiagram
 
 ```go
 func (e *EngineImpl) DeleteShard(db string, ptId uint32, shardID uint64) error {
-    // 1. 获取分区引用
+    e.log.Info("start delete shard...", zap.String("db", db), zap.Uint64("shardID", shardID))
+    start := time.Now()
+    atomic.AddInt64(&stat.EngineStat.DelShardCount, 1)
+    defer func(tm time.Time) {
+        d := time.Since(tm)
+        atomic.AddInt64(&stat.EngineStat.DelShardDuration, d.Nanoseconds())
+        stat.UpdateEngineStatS()
+        e.log.Info("delete shard done", zap.String("db", db), zap.Uint64("shardID", shardID),
+            zap.Duration("time used", d))
+    }(start)
+
     e.mu.RLock()
     if err := e.checkAndAddRefPTNoLock(db, ptId); err != nil {
         e.mu.RUnlock()
+        atomic.AddInt64(&stat.EngineStat.DelShardErr, 1)
         return err
     }
     dbPtInfo := e.DBPartitions[db][ptId]
     e.mu.RUnlock()
+
     defer e.unrefDBPT(db, ptId)
 
     dbPtInfo.mu.Lock()
-    // 2. 检查分区是否正在迁移（防止迁移中的分区被删除）
     if !dbPtInfo.bgrEnabled {
         dbPtInfo.mu.Unlock()
         return errno.NewError(errno.PtIsAlreadyMigrating)
     }
-    // 3. 检查 shard 是否存在
     sh, ok := dbPtInfo.shards[shardID]
     if !ok {
         dbPtInfo.mu.Unlock()
         return errno.NewError(errno.ShardNotFound, shardID)
     }
-    // 4. 防止重复删除
+
     if _, ok := dbPtInfo.pendingShardDeletes[shardID]; ok {
         dbPtInfo.mu.Unlock()
         return fmt.Errorf("shard %d already in deleting", shardID)
     }
-    // 5. 从 shard map 中移除，加入 pending 删除集合
+    // remove from pt map
     delete(dbPtInfo.shards, shardID)
     dbPtInfo.pendingShardDeletes[shardID] = struct{}{}
     dbPtInfo.mu.Unlock()
 
-    // 6. defer 清理 pendingShardDeletes
     defer func(pt *DBPTInfo) {
         pt.mu.Lock()
         delete(pt.pendingShardDeletes, shardID)
         pt.mu.Unlock()
     }(dbPtInfo)
 
-    // 7. 关闭 shard（释放文件句柄、WAL 等）
+    // start close shard and release resource
     if err := sh.Close(); err != nil {
+        atomic.AddInt64(&stat.EngineStat.DelShardErr, 1)
         return err
     }
 
-    // 8. 删除 OBS 远程数据（如果配置了对象存储）
     lock := fileops.FileLockOption(*dbPtInfo.lockPath)
+    // remove shard's wal&data on-disk, index data will not delete right now, if obs-option is not empty, then should remove remote shard dir
     obsOption := sh.GetObsOption()
     if obsOption != nil {
         if err := fileops.RemoveAll(fileops.GetRemoteDataPath(obsOption, sh.GetDataPath()), lock); err != nil {
+            atomic.AddInt64(&stat.EngineStat.DelShardErr, 1)
             return err
         }
     }
-    // 9. 删除本地数据目录和 WAL
-    fileops.RemoveAll(sh.GetDataPath(), lock)
-    fileops.RemoveAll(sh.GetWalPath(), lock)
+    if err := fileops.RemoveAll(sh.GetDataPath(), lock); err != nil {
+        atomic.AddInt64(&stat.EngineStat.DelShardErr, 1)
+        return err
+    }
+    if err := fileops.RemoveAll(sh.GetWalPath(), lock); err != nil {
+        atomic.AddInt64(&stat.EngineStat.DelShardErr, 1)
+        return err
+    }
+
+    return nil
 }
 ```
 
@@ -236,7 +258,7 @@ sequenceDiagram
     alt 删除完成
         Pending-->>T2: 不在 pending 中 → 继续
     else 删除超时
-        Pending-->>T2: 在 pending 中 → 跳过
+        Pending-->>T2: 在 pending 中 → 返回 pending 错误（调用方记日志/置 retryNeeded）
     end
 ```
 
@@ -265,6 +287,7 @@ sequenceDiagram
         Tick->>Delete: DeleteShardOrIndex(db, pt, indexID, IndexDelete)
         Delete->>Index: Engine.DeleteIndex(db, pt, indexID)
         Index-->>Delete: 删除 index 目录 / 释放资源
+        Tick->>Meta: PruneGroupsCommand(false, indexID)
     end
 ```
 
@@ -287,7 +310,7 @@ RP=7d，index group 100 的 EndTime=2024-01-01
 
 ### 5.1 独立服务
 
-**代码位置**：`services/retention/mst/service.go`
+**代码位置**：`services/retention/mst/service.go`（`deleteMstInShardHandle` 49-60、`deleteMstInShards` 76-91；index 侧 `deleteMstInIndexHandle` 100-111、`deleteMstInIndexes` 127-161）
 
 ```mermaid
 sequenceDiagram
@@ -316,30 +339,55 @@ sequenceDiagram
 
 ```go
 func (m *MmsTables) DropMeasurement(_ context.Context, name string) error {
-    // 1. 停止所有文件的读取
-    m.Order[mst].StopFiles()
-    m.OutOfOrder[mst].StopFiles()
-    m.CSFiles[mst].StopFiles()
+    var orderWg, inorderWg, csWg *sync.WaitGroup
+    mstPath := filepath.Join(m.path, name)
+    log.Info("drop measurement start...", zap.String("name", name), zap.String("path", mstPath))
+    m.mu.RLock()
+    order, ok := m.Order[name]
+    orderWg = stopFiles(ok, order)
 
-    // 2. 删除文件
-    for _, f := range m.Order[mst].files {
-        if f.Inuse() {
-            f.Rename(f.Path() + ".tmp")  // 重命名为 .tmp
-            nodeTableStoreGC.Add(f)       // 加入延迟删除队列
-        } else {
-            f.Remove()                     // 立即删除
-        }
+    unOrder, ok := m.OutOfOrder[name]
+    inorderWg = stopFiles(ok, unOrder)
+
+    csFiles, ok := m.CSFiles[name]
+    csWg = stopFiles(ok, csFiles)
+
+    m.mu.RUnlock()
+
+    if orderWg != nil {
+        orderWg.Wait()
+    }
+    if inorderWg != nil {
+        inorderWg.Wait()
+    }
+    if csWg != nil {
+        csWg.Wait()
     }
 
-    // 3. 清理内存
-    delete(m.Order, mst)
-    delete(m.OutOfOrder, mst)
-    delete(m.CSFiles, mst)
+    err := m.deleteFilesForDropMeasurement(order, unOrder, csFiles, name, mstPath)
+    if err != nil {
+        return err
+    }
 
-    // 4. 删除目录
-    fileops.RemoveAll(mstDir)
+    m.mu.Lock()
+    delete(m.Order, name)
+    delete(m.OutOfOrder, name)
+    delete(m.CSFiles, name)
+
+    m.sequencer.DelMmsIdTime(name)
+    m.mu.Unlock()
+
+    mmsDir := filepath.Join(m.path, name)
+    lockFile := fileops.FileLockOption(*m.lock)
+    _ = fileops.RemoveAll(mmsDir, lockFile)
+    _ = fileops.RemoveAll(fileops.GetRemoteDataPath(m.GetObsOption(), mmsDir), lockFile)
+    log.Info("drop measurement done", zap.String("name", name), zap.String("path", mstPath))
+
+    return nil
 }
 ```
+
+文件层面的“重命名为 `.tmp` + 加入 TableStoreGC”不在这个函数里：`deleteFilesForDropMeasurement` 会调用 `MmsTables.deleteFiles`，后者对 `Inuse()` 的文件执行 `f.Rename(fname + tmpFileSuffix)` 并 `nodeTableStoreGC.Add(f)`，对空闲文件直接 `f.Remove()`（`engine/immutable/compact.go:495-515`）。
 
 ### 5.3 TableStoreGC — 延迟删除
 
@@ -347,27 +395,42 @@ func (m *MmsTables) DropMeasurement(_ context.Context, name string) error {
 
 ```go
 type TableStoreGC struct {
-    removeFiles map[string]TSSPFile  // 待删除的文件
-    mu          sync.Mutex
+    mu          sync.RWMutex
+    removeFiles map[string]TSSPFile
 }
 
-func (gc *TableStoreGC) GC() {
-    ticker := time.NewTicker(200 * time.Millisecond)
-    for range ticker.C {
-        gc.mu.Lock()
-        for name, f := range gc.removeFiles {
+// ...（NewTableStoreGC、Add 从略）
+
+func (sgc *TableStoreGC) GC() {
+    timer := time.NewTicker(time.Millisecond * 200)
+    for range timer.C {
+        sgc.mu.Lock()
+        if len(sgc.removeFiles) == 0 {
+            sgc.mu.Unlock()
+            continue
+        }
+
+        for fn, f := range sgc.removeFiles {
             if !f.Inuse() {
-                f.Remove()              // 引用计数为 0，删除
-                delete(gc.removeFiles, name)
+                err := f.Remove()
+                if err != nil {
+                    log.Error("gc remove file fail", zap.String("file", fn), zap.Error(err))
+                } else {
+                    log.Info("remove file", zap.String("file", fn))
+                    delete(sgc.removeFiles, fn)
+                }
             }
         }
-        gc.mu.Unlock()
+        sgc.mu.Unlock()
     }
+    timer.Stop()
 }
 ```
 
 **通俗解释**：
-TableStoreGC 就像"垃圾回收站"。有些文件正在被查询（Inuse=true），不能立即删除。就把它们重命名为 `.tmp`，放进"垃圾回收站"。每 200ms 检查一次，如果没人用了（Inuse=false），就真正删除。
+TableStoreGC 就像“垃圾回收站”。有些文件正在被查询（Inuse=true），不能立即删除。就把它们重命名为 `.tmp`，放进“垃圾回收站”。每 200ms 检查一次，如果没人用了（Inuse=false），就真正删除。
+
+**补充（Lease 复用窗口）**：该基线在 `engine/immutable/evict.go:53-81` 新增了 `UnrefFilesWithLease` / `UnrefFilesReader`：读取引用归零、进入 Lease 的文件会被收集成 `map[TSSPFile]bool` 返回，调用方据此跳过 `Unref()`；`tssp_reader.go` 通过 `leaseDuration`（默认 30s，`engine/immutable/tssp_reader.go:42`）维护这个窗口。因此延迟删除实际有两套机制：Lease 复用窗口与 TableStoreGC 延迟删除。
 
 ---
 
@@ -388,12 +451,12 @@ sequenceDiagram
     IndexSvc->>Engine: ExpiredIndexesForMst(db, rp, ttlInfo)
     Engine-->>IndexSvc: 过期 measurement index 信息
     loop 每个过期 measurement
-        IndexSvc->>Engine: DeleteMstInIndex(db, pt, indexID, mstName)
-        Engine->>IndexBuilder: DeleteMsts(mstName)
+        IndexSvc->>Engine: DeleteMstInIndex(db, pt, indexID, msts, onlyUseDiskThreshold)
+        Engine->>IndexBuilder: DeleteMsts(msts, onlyUseDiskThreshold)
     end
 ```
 
-**代码讲解**：`services/retention/mst/service.go` 中 `NewDeleteMstInShardService/HandleLocalStorageInShard` 负责 shard 内 measurement 数据删除；`NewDeleteMstInIndexService/HandleLocalStorageInIndex` 负责 index 内 measurement 条目删除。这里不是 index group retention，不会通过 `DeleteIndexGroup` 删除整个 index group；measurement 级 index 路径调用 `Engine.DeleteMstInIndex`，最终进入 `IndexBuilder.DeleteMsts`。数据文件路径通过 `Engine.DeleteMstInShard` 进入 `shard.DropMeasurement` 和 `MmsTables.DropMeasurement`。
+**代码讲解**：`services/retention/mst/service.go` 中 `NewDeleteMstInShardService/HandleLocalStorageInShard` 负责 shard 内 measurement 数据删除；`NewDeleteMstInIndexService/HandleLocalStorageInIndex` 负责 index 内 measurement 条目删除。这里不是 index group retention，不会通过 `DeleteIndexGroup` 删除整个 index group；measurement 级 index 路径调用 `Engine.DeleteMstInIndex`，最终进入 `IndexBuilder.DeleteMsts`（签名：`DeleteMstInIndex(db, ptId, indexID, msts []string, onlyUseDiskThreshold uint64)`、`DeleteMsts(msts []string, onlyUseDiskThreshold uint64)`；同一 index 下的多个 mst 会在 `deleteMstInIndexes` 中先按 pt/indexID 聚合）。数据文件路径通过 `Engine.DeleteMstInShard` 进入 `shard.DropMeasurement` 和 `MmsTables.DropMeasurement`。
 
 **具体例子**：
 
@@ -436,7 +499,12 @@ sequenceDiagram
     loop deletedSgInfos
         Retention->>OBS: 删除远程数据
         Retention->>Local: 删除本地数据
-        Retention->>Meta: PruneGroupsCommand()
+        Retention->>Meta: PruneGroupsCommand(true, shardID)
+    end
+
+    loop expiredIndexes（GetExpiredIndexes）
+        Retention->>Meta: DeleteIndexGroup(db, rp, indexGroupID)
+        Retention->>Meta: PruneGroupsCommand(false, indexID)
     end
 ```
 
@@ -466,7 +534,7 @@ config.IsLogKeeper() = false:
 | `endTime + duration < now` | 简单明确的过期公式 | 无歧义判断 |
 | `duration = 0` 永久保留 | 灵活的保留策略 | 支持永久数据 |
 | Pending State | 防止并发删除 | 避免重复操作 |
-| 异步删除（120s 超时） | 不阻塞主循环 | 服务持续运行 |
+| 异步删除（120s 超时） | 子 goroutine 执行删除，调用方最多同步等待 120s | 超时后转入 pending，下一轮跳过 |
 | Measurement 级 TTL | 细粒度保留控制 | 不同 measurement 不同保留期 |
 | Index Retention | 清理过期 index group | 避免索引目录膨胀 |
 | Measurement Index 删除 | TTL 删除数据同时清理索引 | 防止孤儿索引 |

@@ -1,5 +1,7 @@
 # Module 22: Arrow Flight 协议深度审计报告（庖丁解牛版）
 
+> 基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）；代码快照：`_spec_verify_20260616/snapshots/spec-md-chinese`。
+
 > Arrow Flight 是 Apache Arrow 的高性能数据传输协议，基于 gRPC。openGemini 实现了 Arrow Flight 的 DoPut（写入）和 DoGet（读取）两个核心操作。
 
 ---
@@ -22,7 +24,7 @@ sequenceDiagram
         Note over Server: 跳过 Flight token 验证
     end
     Server->>Write: RetryWriteRecord(db, rp, mst, record)
-    Write-->>Client: PutResult ack
+    Server-->>Client: PutResult ack
 
     Note over Client,Query: DoGet（读取）
     Client->>Server: DoGet(ticket={"q":"SELECT * FROM cpu","db":"mydb"})
@@ -80,10 +82,10 @@ sequenceDiagram
 
     Client->>DoPut: gRPC stream (Arrow Records)
     DoPut->>Reader: 创建 RecordReader
+    DoPut->>DoPut: 解析 descriptor → db/rp/mst（每个 stream 一次）
 
     loop 每个 Record
         Reader->>DoPut: arrow.Record
-        DoPut->>DoPut: 解析 descriptor → db/rp/mst
         DoPut->>Writer: RetryWriteRecord(db, rp, mst, record)
         DoPut-->>Client: PutResult{ack}
     end
@@ -116,13 +118,13 @@ sequenceDiagram
     participant Engine as 查询引擎
 
     Client->>DoGet: DoGet(ticket)
-    DoGet->>DoGet: 解析 JSON ticket
-    DoGet->>Handler: HandleQuery(ticket, user, server)
+    DoGet->>Handler: HandleQuery(ticket.GetTicket(), user, server)
+    Handler->>Handler: 解析 JSON ticket
     Handler->>Engine: 执行查询
     Engine-->>Client: Arrow Record 流
 ```
 
-DoGet 会把解析后的 ticket 连同 user、server 传给 `HandleQuery(ticket, user, server)`。ticket 当前支持的关键字段包括：`q`、`db`、`rp`、`node_id`、`params`、`chunked`、`chunkSize`、`innerChunkSize`、`is_query_series_limit`。当前 `handler_arrowflight.go` 的 `request` 结构体把这些控制字段都定义为 `string`，所以 ticket 中的数字、布尔值和 `params` 对象都要写成字符串；`params` 是 JSON 字符串，后续再二次解析。
+DoGet 会把 ticket 的原始字节 `ticket.GetTicket()` 连同 user、server 传给 `HandleQuery`；JSON 解析在 `HandleQuery` 内完成（`json.Unmarshal(ticket, &req)`，见 `lib/util/lifted/influx/httpd/handler_arrowflight.go:69`）。ticket 当前支持的关键字段包括：`q`、`db`、`rp`、`node_id`、`params`、`chunked`、`chunkSize`、`innerChunkSize`、`is_query_series_limit`。当前 `handler_arrowflight.go` 的 `request` 结构体把这些控制字段都定义为 `string`，所以 ticket 中的数字、布尔值和 `params` 对象都要写成字符串；`params` 是 JSON 字符串，后续再二次解析。
 
 ---
 
@@ -137,7 +139,7 @@ sequenceDiagram
     Client->>Auth: {"username":"admin","password":"pass"}
     Auth->>Auth: 验证密码 (MetaClient.Authenticate)
     Auth->>Auth: 生成 token (SHA-256(JSON{username,timestamp,salty}))
-    Auth->>Store: 存储 token (24 小时过期)
+    Auth->>Store: 存储 token（内存 map，无 TTL）
     Auth-->>Client: 返回 token
 
     Note over Client: 后续请求携带 token
@@ -158,7 +160,7 @@ sequenceDiagram
   max-body-size = 25000000           # gRPC MaxRecvMsgSize，<=0 时使用默认值
 ```
 
-**代码位置**：`lib/util/lifted/influx/httpd/config/config.go` 定义默认值；`app/ts-sql/sql/server.go` 只有在 `c.HTTP.FlightEnabled` 为 true 时初始化 `arrowflight.NewService(c.HTTP)`。
+**代码位置**：`lib/util/lifted/influx/httpd/config/config.go` 定义默认值；`app/ts-sql/sql/server.go` 只有在 `c.HTTP.FlightEnabled` 为 true 时进入 `initArrowFlightService`，且角色必须是 `AppSingle/AppData/AppSql`，才会初始化 `arrowflight.NewService(c.HTTP)`（`app/ts-sql/sql/server.go:180,279-285`）。`RecordWriter` 只在 `AppSingle/AppData` 角色创建，`SetHandler` 只在 `AppSql/AppSingle` 角色调用。
 
 ---
 
@@ -166,7 +168,7 @@ sequenceDiagram
 
 | 设计 | 目的 | 效果 |
 |------|------|------|
-| Arrow IPC 格式 | 高效列式序列化 | 零拷贝传输 |
+| Arrow IPC 格式 | 高效列式序列化 | 列式传输，减少转换开销 |
 | gRPC 传输 | 双向流 | 低延迟 |
-| SHA-256 token 认证 | 安全性 | token 由 username、timestamp、随机 salty 生成，24 小时自动过期 |
+| SHA-256 token 认证 | 安全性 | token 由 username、timestamp、随机 salty 生成；校验时超过 24h 拒绝并删除（惰性过期） |
 | db/rp/mst 路由 | 灵活写入 | descriptor 中指定目标 |

@@ -1,5 +1,7 @@
 # Module 10: Stream Processing 深度审计报告（庖丁解牛版 v3）
 
+> 代码基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）。文中所有 `file:line` 均以该提交为准。
+
 > 时序图优先，逐步拆解。每个流程都有 Mermaid 时序图 + 核心代码逐行解释。
 
 ---
@@ -62,7 +64,7 @@ GROUP BY time(1m), host
 ```mermaid
 graph TB
     subgraph "协调层 (ts-sql / coordinator)"
-        A1[PointsWriter] -->|写入数据触发| B1[Stream.calculate]
+        A1[PointsWriter] -->|"写入数据触发（仅 Case4 跨分布）"| B1[Stream.calculate]
         B1 --> B2[calculateWindow]
         B2 --> B3[mapRowsToShard]
         B3 -->|聚合结果| A1
@@ -88,9 +90,10 @@ graph TB
 ```
 
 **通俗解释**：
-- **协调层**（`coordinator/stream.go`）：在行模式写入时触发，负责窗口计算、分组聚合和目标 shard 映射，聚合结果回到 `PointsWriter` 写入链路。
+- **协调层**（`coordinator/stream.go`）：在行模式写入且源表/目标表分布不一致（`routeAndCalculateStreamRows` 的 Case4）时触发，负责窗口计算、分组聚合和目标 shard 映射，聚合结果回到 `PointsWriter` 写入链路；Case1-3（同分布）只给源行打 `StreamId` 并映射目标 shard，由存储层单级聚合。
 - **存储层异步 Stream 服务**（`app/ts-store/stream/`）：运行独立 Stream Engine，周期同步任务，按任务类型分发到 TagTask 或 TimeTask，执行窗口聚合、WAL 回放和周期性 flush。
 - 两条链路不是同一个入口：协调层 `Stream.calculate()` 直接在写入协调流程中生成目标行；存储层 `WriteRows()` 走快速过滤/任务分发，`WriteRec()` 和 `WriteReplayRows()` 才会把 `CacheRecord` / `ReplayRow` 放入 Engine 级 `s.cache`。
+- 跨分布场景下，协调层产出的聚合行会被标记 `StreamOnly=true`：存储层不会把它直接落盘（`engine/shard.go` 跳过 `StreamOnly` 行），而是由任务并入当前窗口再次聚合，最终在 flush 时写出——这是两级聚合的合并点。
 
 **协调侧链路：`coordinator/stream.go` 写入协调聚合**
 
@@ -189,7 +192,7 @@ type Stream struct {
 ```
 
 **逐行解释**：
-- **第 124 行**：`cache` 是一个带缓冲的 channel，所有需要处理的数据（CacheRow、CacheRecord、ReplayRow）都进入此 channel
+- **第 124 行**：`cache` 是一个带缓冲的 channel，接收 `WriteRec()` 产生的 `CacheRecord` 与 `WriteReplayRows()`/`StreamHandler()` 产生的 `ReplayRow`；行写入路径（`WriteRows()`）不经过此 channel，直接分发到 task
 - **第 131 行**：`tasks` 使用 `sync.Map` 而非普通 map，因为多个 goroutine 会并发读写（filter goroutine 读取，updateTask 写入）
 - **第 132 行**：`taskNum` 用于快速判断是否有活跃任务，避免遍历 sync.Map
 
@@ -598,7 +601,7 @@ func (s *Stream) mapRowsToShard(
 - **第 276 行**：遍历 `dataCache`，key 是 groupKey，value 是 `map[int64][]*float64`（时间 -> 聚合值数组）
 - **第 278-280 行**：解析 groupKey 得到各个维度的值
 - **第 299-311 行**：将聚合值写入 Row 的 Fields
-- **第 318 行**：`r.StreamOnly = true` 标记此数据来自流任务，防止循环触发
+- **第 338 行**：`r.StreamOnly = true` 标记该行是流任务产出的（可能是部分聚合的）行：存储层跳过落盘（`engine/shard.go`），由任务再聚合后于 flush 写出；`count` 也据此判断取字段值还是计 1
 
 ---
 
@@ -616,7 +619,7 @@ graph TB
 
         H[cache chan] --> I[filter goroutine x N]
         I --> J{数据类型}
-        J -->|CacheRow| K[rowsRangeTask]
+        J -->|"CacheRow（仅测试可达）"| K[rowsRangeTask]
         J -->|CacheRecord| L[recordRangeTask]
         J -->|ReplayRow| M[WAL 回放]
 
@@ -680,7 +683,7 @@ func NewStream(store Storage, Logger Logger, cli MetaClient, conf stream.Config,
 
 **逐行解释**：
 - **第 71 行**：`SetWriteStreamPointsEnabled` 是一个全局开关，控制是否处理流任务
-- **第 72 行**：`cache` channel 的大小由 `conf.FilterCache` 决定（默认 4 * CPU 数）
+- **第 72 行**：`cache` channel 的大小由 `conf.FilterCache` 决定（默认 `4 * (CPU 数 / 2)`，见 `services/stream/conf.go`）
 - **第 77 行**：`ants.NewPool` 创建协程池，大小由 `conf.FilterConcurrency` 决定
 - **第 96-108 行**：启动 N 个 filter goroutine，每个都从 `cache` channel 读取并处理数据
 
@@ -781,6 +784,7 @@ func (s *Stream) filter() {
                 }
 
             case *CacheRecord:                        // Record 写入
+                s.stats.AddStreamFilter(1)
                 ref, indexes := s.recordRangeTask(r)
                 if !ref {
                     continue
@@ -836,7 +840,7 @@ func (s *Stream) filter() {
 - **第 601 行**：`rowsRangeTask` 返回每个任务匹配的行范围（start, end 对）
 - **第 608-612 行**：为每个匹配的任务段增加引用计数
 - **第 615-626 行**：将匹配的行切片分发到对应任务
-- **第 628-639 行**：`CacheRecord` 使用 `WaitGroup` 等待所有任务处理完成
+- **第 627-640 行**：`CacheRecord` 分支用 `RetainNum`/`Release` 计数，`WriteRec()` 中的 `Wait()` 阻塞到全部任务处理完成
 - **第 641-667 行**：`ReplayRow` 的处理，最后一批数据发送 `LastReplayRow` 标记
 
 ### 5.2 WriteRows 快速路径
@@ -904,9 +908,9 @@ func (s *Stream) WriteRows(writeCtx *WriteStreamRowsCtx) (bool, error) {
 **逐行解释**：
 - **第 769 行**：`allocCacheRow` 从对象池分配 `CacheRow`，避免频繁内存分配
 - **第 773 行**：`rowsRangeTask` 是关键的匹配函数，返回每个任务匹配的行范围
-- **第 782-785 行**：`r.ww.Ref()` 增加 `WritePointsWork` 的引用，确保写入路径不会过早释放
+- **第 777-782 行**：`r.ww.Ref()` 增加 `WritePointsWork` 的引用，确保写入路径不会过早释放
 - **第 815 行**：`FilterRowsByCond` 是关键入口，决定数据是直接写入还是进入聚合窗口
-- **第 822 行**：返回 `inUse` 告诉调用方是否需要聚合（用于决定是否等待 flush）
+- **第 822 行**：返回 `inUse` 告诉调用方该批次是否被流任务异步持有（`transport/server_insert.go` 据此决定是否立即归还 `DecoderWork`）
 
 **关键区别**：`WriteRows()` 是行模式快速路径，它在函数内部完成 `rowsRangeTask()` 和 `FilterRowsByCond()`，再通过 `task.Put(cache)` 把匹配数据交给具体任务；它不会执行 `s.cache <- CacheRow`。Engine 级 `s.cache` 主要接收 `WriteRec()` 产生的 `CacheRecord` 和 `WriteReplayRows()` 产生的 `ReplayRow`。
 
@@ -968,6 +972,7 @@ type TagTask struct {
     replayShardIds  map[uint32][]*uint64    // 回放 shard 映射
     replayOver      bool                    // 回放是否结束
     replayCount     int32                   // 回放计数器
+    mu              sync.Mutex              // 保护回放变量与 shard 映射
 
     ptLoadStatus map[uint32]*flushStatus    // ptID -> 最后 flush 时间
     *BaseTask
@@ -995,16 +1000,37 @@ func (s *TagTask) parallelCalculate() {
                     switch v := cache.(type) {
                     case *TaskCache:
                         err := s.calculateRow(v)         // 行模式计算
-                        s.innerRes <- err
+                        if err != nil {
+                            s.Logger.Error("calculate error", zap.String("window", s.name), zap.Error(err))
+                        }
+                        select {
+                        case s.innerRes <- err:
+                        default:
+                            s.Logger.Error(fmt.Sprintf("stream innerRes is full, size %v", len(s.innerRes)))
+                        }
                     case *CacheRecord:
                         err := s.calculateRec(v)         // Record 模式计算
-                        s.innerRes <- err
+                        if err != nil {
+                            s.Logger.Error("calculate error", zap.String("window", s.name), zap.Error(err))
+                        }
+                        select {
+                        case s.innerRes <- err:
+                        default:
+                            s.Logger.Error(fmt.Sprintf("stream innerRes is full, size %v", len(s.innerRes)))
+                        }
                     case *ReplayRow:
                         atomic.AddInt32(&s.replayCount, 1)
                         s.resetReplayVar()               // 重置回放变量
                         err := s.replayWalRow(v)         // WAL 回放计算
                         atomic.AddInt32(&s.replayCount, -1)
-                        s.innerRes <- err
+                        if err != nil {
+                            s.Logger.Error("calculate error", zap.String("window", s.name), zap.Error(err))
+                        }
+                        select {
+                        case s.innerRes <- err:
+                        default:
+                            s.Logger.Error(fmt.Sprintf("stream innerRes is full, size %v", len(s.innerRes)))
+                        }
                     case *LastReplayRow:                 // 回放结束标记
                         for {
                             if atomic.LoadInt32(&s.replayCount) == 0 {
@@ -1030,8 +1056,8 @@ func (s *TagTask) parallelCalculate() {
 **逐行解释**：
 - **第 318 行**：启动 `concurrency` 个 goroutine，从 `innerCache` channel 读取数据
 - **第 324 行**：`calculateRow` 是行模式的原子聚合
-- **第 333 行**：`replayWalRow` 处理 WAL 回放数据
-- **第 344-356 行**：`LastReplayRow` 触发回放结束，等待所有回放计数归零
+- **第 346 行**：`replayWalRow` 处理 WAL 回放数据（`case *ReplayRow` 分支起于第 343 行）
+- **第 357-366 行**：`LastReplayRow` 触发回放结束，等待所有回放计数归零
 
 ### 6.2 核心聚合：calculateRow
 
@@ -1143,6 +1169,7 @@ func (s *TagTask) calculateRow(cache *TaskCache) error {
 sequenceDiagram
     participant T as Ticker
     participant CF as cycleFlush
+    participant CM as consumeDataAndUpdateMeta
     participant F as flush
     participant GR as generateRows
     participant BR as buildRow
@@ -1162,8 +1189,8 @@ sequenceDiagram
         WR->>WR: FastMarshalMultiRows()
         WR->>S: store.WriteRows()
         WR->>S: snapshot(ptID) - 持久化 flush 时间
-        F->>CF: 通过 updateWindow channel 通知
-        CF->>CF: 更新窗口元数据
+        F->>CM: 通过 updateWindow channel 通知
+        CM->>CM: 更新窗口元数据
     end
 ```
 
@@ -1475,19 +1502,20 @@ func (s *TimeTask) calculateRow(cache *TaskCache) {
 ```mermaid
 graph LR
     A[数据到达] --> B{window == 0?}
-    B -->|是| C[filterRowsByExpr]
+    B -->|是| C["FilterRowsByCond 同步过滤"]
     C --> D{匹配条件?}
-    D -->|是| E[直接写入目标表]
+    D -->|是| E["追加到 cache.streamRows，随本批写入目标表"]
     D -->|否| F[丢弃]
     B -->|否| G[进入聚合窗口]
 ```
 
 **通俗解释**：
-- 当 `window == 0` 时，TimeTask 进入 filter-only 模式
-- 不做聚合，只做条件过滤，满足条件的行直接写入目标表
+- 当 `window == 0` 时，TimeTask 的 `run()` 直接返回，不启动 `consumeData`/`cycleFlush`，任务侧没有任何 goroutine；过滤在写入路径同步完成
+- 真正的 filter-only 处理在 `TimeTask.FilterRowsByCond`（`time_task.go:879-924`）：条件不匹配直接丢弃；`needAgg == false` 时把匹配行追加到 `cache.streamRows`，由 `WriteStreamPoints`（`transport/server.go:176-183`）合并回本批写入
+- 下方 `calculateFilterOnly` 保留了同样的过滤逻辑，但当前基线中只有单测会调用它
 - 适用于简单的数据转发场景（如 `SELECT * FROM cpu WHERE temperature > 50`）
 
-**核心代码**：`app/ts-store/stream/time_task.go:274-341`
+**核心代码**：`app/ts-store/stream/time_task.go:274-341`（生产路径不可达，仅单测调用）
 
 ```go
 // 第 274 行：calculateFilterOnly — filter-only 模式
@@ -1627,6 +1655,7 @@ func filterRowsByExpr(rows []influx.Row, expr influxql.Expr) []int {
 sequenceDiagram
     participant D as detectReplay
     participant WM as StreamWalManager
+    participant ST as Stream
     participant T as TagTask
     participant RV as replayValues
 
@@ -1634,12 +1663,13 @@ sequenceDiagram
     D->>D: 检查所有任务是否初始化完成
     D->>WM: Replay(ctx, ptID, isLastPT)
     WM->>WM: 读取 WAL 文件
-    WM->>T: StreamHandler(rows, isLastRows, fileNames)
-    T->>T: 构建 ReplayRow
-    T->>T: cache <- ReplayRow
+    WM->>ST: StreamHandler(rows, isLastRows, fileNames)
+    ST->>ST: 构建 ReplayRow
+    ST->>ST: cache <- ReplayRow
+    ST->>T: filter 分发 task.Put(ReplayRow)
     T->>T: replayWalRow() - 使用 replayValues
     T->>T: ConcurrencyFunc 原子聚合
-    WM->>T: LastReplayRow (最后一批)
+    ST->>T: LastReplayRow (最后一批)
     T->>T: replayOver = true
     T->>T: flushReplayData()
     T->>T: cleanReplayData()
@@ -1729,7 +1759,7 @@ func (s *TagTask) replayWalRow(cache *ReplayRow) error {
     flushTime, ok1 := s.ptLoadStatus[cache.ptID]         // 获取该 ptID 的 flush 时间
     _, ok2 := s.replayShardIds[cache.ptID]
     if !ok1 || !ok2 {
-        return fmt.Errorf("replay ptId not found")
+        return fmt.Errorf("replay ptId not found,ptID: %d,ptLoadStatus: %v，replayShardIds: %v", cache.ptID, s.ptLoadStatus, s.replayShardIds)
     }
     values := s.genReplayValues(cache.ptID)               // 获取回放专用的聚合数组
 
@@ -1949,8 +1979,9 @@ func (s *TagTask) snapshot(ptID uint32) {
 
 **逐行解释**：
 - **第 988 行**：`curFlushTime` 是当前 flush 的结束时间（窗口右边界）
-- **第 995-996 行**：写入 JSON 格式的 snapshot 文件
-- **第 995 行**：文件权限 0600（只有 owner 可读写）
+- **第 995-996 行**：`path.Join` 拼接 snapshot 文件路径
+- **第 996-998 行**：`os.WriteFile` 写入 JSON 格式的 snapshot 文件
+- **第 996 行**：`os.WriteFile` 的文件权限 0600（只有 owner 可读写）
 
 **具体例子**：
 假设一个 Stream 任务 ID = 123，数据库 = "mydb"，ptID = 1，rp = "autogen"：
@@ -2014,9 +2045,9 @@ func AddFloat64(a *float64, b float64) float64 {
 ### 10.2 Ring Buffer 窗口溢出
 
 **问题描述**：
-- `windowNum` 是环形缓冲区的大小，默认 = `maxWindowNum = 5`
-- 如果 `maxDelay` 很大，`windowNum = maxDelay/window + 2` 可能超过 5
-- 超过时会返回错误：`"maxDelay too big, exceed the maxWindowNum"`
+- 环形缓冲区大小固定为 `windowNum = maxWindowNum = 5`（`BaseTask.windowNum` 取常量，与 `maxDelay` 无关）
+- `RegisterTask` 用局部变量 `windowNum = maxDelay/window + 2` 做校验，超过 5 时注册失败
+- 报错信息：`"maxDelay too big, exceed the maxWindowNum"`
 
 **核心代码**：`app/ts-store/stream/stream.go:494-499`
 
@@ -2047,7 +2078,7 @@ if info.Interval > 0 {
 **核心代码**：`app/ts-store/stream/stream.go:393-404`
 
 ```go
-// 第 393 行：依次回放所有 ptID
+// 第 395 行：依次回放所有 ptID
 for ptID := range initTime {
     var err error
     isLastPT := replayCount == len(initTime)-1
@@ -2183,7 +2214,7 @@ DELAY 30s
 1. 从 ts-meta 获取所有 StreamInfo
 2. 对比本地 tasks，发现新任务
 3. 创建 TagTask（因为有 GROUP BY host）
-4. 启动 4 个 goroutine：cycleFlush、parallelCalculate、cleanWindow、consumeDataAndUpdateMeta
+4. 启动 4 个 goroutine（`parallelCalculate` 内部再按 `concurrency` 起 M 个，常驻 M+3）：cycleFlush、parallelCalculate、cleanWindow、consumeDataAndUpdateMeta
 
 **第三步：数据到达**
 
@@ -2256,13 +2287,18 @@ TagTask 的 `consumeDataAndUpdateMeta()` 接收数据：
 ## 附录：关键函数调用链
 
 ```
-写入路径:
-  PointsWriter.WritePoints()
-    -> Stream.calculate()                    [协调层]
+写入路径（协调层，仅 Case4 跨分布）:
+  PointsWriter.RetryWritePointRows()
+    -> PointsWriter.writePointRows()
+      -> PointsWriter.routeAndCalculateStreamRows()
+        -> Stream.calculate()                    [协调层]
       -> Stream.calculateWindow()
         -> Stream.GenerateGroupKey()
         -> FieldCall.SingleThreadFunc()
       -> Stream.mapRowsToShard()
+
+写入路径（存储层，所有行写入）:
+  ts-store WriteStreamPoints()
     -> StreamEngine.WriteRows()              [存储层]
       -> Stream.allocCacheRow()
       -> Stream.rowsRangeTask()
@@ -2307,16 +2343,18 @@ WAL 回放:
 
 ## 附录：配置参数
 
+> 说明：下表为 `services/stream/conf.go` 中 `NewConfig()` 的内置默认值。当前 `app/ts-store/run/server.go` 传给 `stream.NewStream` 的是 `stream2.NewConfig()` 而非配置文件的 `config.Stream`，因此除 `write-enabled` 外，这些参数在运行期无法通过 `[stream]` 配置段调整；`check-interval` 未被任何代码读取（`Run()` 中写死 10s）。
+
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `check-interval` | 10s | 任务刷新间隔 |
+| `check-interval` | 10s | 任务刷新间隔（未生效：`Run()` 中写死 10s） |
 | `windowConcurrency` | CPU/2 | 窗口计算并发度 |
 | `filterConcurrency` | CPU/2 | Filter goroutine 数量 |
 | `filterCache` | 4 * CPU/2 | Cache channel 缓冲大小 |
 | `write-enabled` | true | 是否启用流处理写入 |
 | `maxWindowNum` | 5 | 环形缓冲区最大窗口数 |
 | `maxReplayWindowNum` | 100 | 回放最大窗口数 |
-| `FlushParallelMinRowNum` | 10000 | 并行 flush 最小行数 |
+| `FlushParallelMinRowNum` | 10000 | 并行 flush 最小行数（预留常量，代码中无引用） |
 
 ---
 
@@ -2544,7 +2582,7 @@ func (s *TagTask) calculateRec(cache *CacheRecord) error {
 - **第 542 行**：`generateRecGroupKeyIndex` 预计算 groupKey 对应的列索引，避免每行重复查找
 - **第 547-554 行**：预计算聚合字段的列索引 `callIds`
 - **第 593-599 行**：直接从 Record 的列中读取值，CPU 缓存友好
-- **第 605 行**：`SetAndSwapPointerFloat64` 原子设置指针，确保并发安全
+- **第 611 行**：`SetAndSwapPointerFloat64` 原子设置指针，确保并发安全
 
 **具体例子**：
 假设一个 Record 有 1000 行数据，GROUP BY host，聚合 max(temperature)：
@@ -2644,12 +2682,12 @@ graph TB
         A[sync.Pool] -->|"Get()"| B{池中有对象?}
         B -->|是| C[返回已有对象]
         B -->|否| D[创建新对象]
-        D --> E[RowsPool.Get() - 获取 rows 切片]
+        D --> E["RowsPool.Get() - 获取 rows 切片"]
         E --> F[返回 CacheRow]
 
-        G[Put(r)] --> H[RowsPool.Put(&r.rows)]
+        G["Put(r)"] --> H["RowsPool.Put(&r.rows)"]
         H --> I[清空 rows 和 ww]
-        I --> J[sync.Pool.Put(r)]
+        I --> J["sync.Pool.Put(r)"]
     end
 ```
 
@@ -2695,7 +2733,7 @@ func (p *CacheRowPool) Put(r *CacheRow) {
 **逐行解释**：
 - **第 39-45 行**：`Get` 先尝试从 `sync.Pool` 获取，如果没有则创建新对象
 - **第 49-54 行**：`Put` 先归还 rows 切片到 RowsPool，清空引用，再归还到 sync.Pool
-- **第 43 行**：`rowsPool.Get()` 返回一个空的 `[]influx.Row` 切片，避免频繁分配
+- **第 42 行**：`rowsPool.Get()` 返回一个空的 `[]influx.Row` 切片，避免频繁分配
 
 ### 13.2 TaskCachePool
 
@@ -2707,6 +2745,8 @@ type TaskCachePool struct {
     pool  sync.Pool
     count int64           // 当前池外的对象数
 }
+
+// ...（省略 NewTaskCachePool，第 129-132 行）
 
 // 第 134 行：Get — 从池中获取 TaskCache
 func (p *TaskCachePool) Get() *TaskCache {
@@ -2762,7 +2802,7 @@ func NewTaskDataPool() *TaskDataPool {
     return p
 }
 
-// 第 105 行：Get — 从池中获取数据（阻塞）
+// 第 105 行：Get — 从缓冲读取数据（阻塞；生产代码未调用，仅单测使用）
 func (p *TaskDataPool) Get() ChanData {
     cache := <-p.cache            // 从 channel 读取（阻塞）
     p.IncreaseChan()              // 增加可用容量
@@ -2774,7 +2814,7 @@ func (p *TaskDataPool) IncreaseChan() {
     atomic.AddInt64(&p.length, -1)
 }
 
-// 第 115 行：Put — 归还数据到池中
+// 第 115 行：Put — 投递数据到任务缓冲
 func (p *TaskDataPool) Put(cache ChanData) {
     p.cache <- cache              // 写入 channel（阻塞）
     atomic.AddInt64(&p.length, 1)
@@ -2788,9 +2828,9 @@ func (p *TaskDataPool) Len() int64 {
 
 **逐行解释**：
 - **第 91 行**：缓冲大小 = `CPU 数 * 8`，范围 [4, 256]
-- **第 106-107 行**：`Get` 从 channel 读取，如果没有数据会阻塞
+- **第 106-107 行**：`Get` 从 channel 读取，如果没有数据会阻塞（生产代码直接 `<-s.cache`，未使用 `Get`）
 - **第 116-117 行**：`Put` 写入 channel，如果缓冲满会阻塞
-- 这种设计实现了背压机制：当处理速度跟不上时，写入端会自动阻塞
+- 这种设计实现了背压机制：当处理速度跟不上时，写入端（`Put`）会自动阻塞
 
 ---
 
@@ -2901,8 +2941,8 @@ func (r *CacheRow) IsStreamRow(name string, v Task, row influx.Row, key uint64) 
 - **第 194 行**：两个条件都满足才返回 true：
   1. 表名匹配源表或目标表
   2. 行的 StreamId 包含该任务的 ID
-- `util.Include(row.StreamId, key)` 检查该行是否由该 Stream 任务产生
-- 这个检查防止了流任务的输出数据再次触发同一个流任务（避免无限循环）
+- `util.Include(row.StreamId, key)` 检查该行是否属于该 Stream 任务：Case1-3（同分布）由协调层给源行打上 streamID（`coordinator/points_writer.go:550`），Case4（跨分布）由 `mapRowsToShard` 给聚合行打上 `si.ID`（`coordinator/stream.go:346`），两类行互斥
+- 因此聚合行会再次进入同一任务并并入当前窗口（这正是两级聚合的合并点）；真正避免重复膨胀的是窗口时间戳检查（`et - 1`）与存储层跳过 `StreamOnly` 行
 
 **核心代码**：`app/ts-store/stream/stream.go:220-222`
 
@@ -3128,7 +3168,7 @@ func (s *TagTask) unCompressDictKey(key string) (string, error) {
         s.Logger.Error(fmt.Sprintf("invalid corpus key %v", key))
         return "", err
     }
-    return s.stringDict.LoadValue(intV)           // 从字典中查找原始字符串
+    return s.stringDict.LoadValue(intV), nil           // 从字典中查找原始字符串
 }
 ```
 
@@ -3234,11 +3274,13 @@ func (s *Stream) updateTask() {
         for i, v := range info.Calls {
             inFieldType, ok := srcSchema.GetTyp(v.Field)
             if !ok {
+                s.Logger.Error(fmt.Sprintf("streamName: %s, srcMst: %s, inField: %s, get input field type failed", info.Name, srcMst.Name, v.Field))
                 canRegisterTask = false
                 break
             }
             outFieldType, ok := dstSchema.GetTyp(v.Alias)
             if !ok {
+                s.Logger.Error(fmt.Sprintf("streamName: %s, dstMst: %s, outField: %s, get output field type failed", info.Name, dstMst.Name, v.Alias))
                 canRegisterTask = false
                 break
             }
@@ -3253,6 +3295,7 @@ func (s *Stream) updateTask() {
             } else {
                 calls[i], err = streamLib.NewFieldCall(inFieldType, outFieldType, v.Field, v.Alias, v.Call, len(info.Dims) != 0)
                 if err != nil {
+                    s.Logger.Error(fmt.Sprintf("streamName: %s, dstMst: %s, outField: %s, new stream call failed", info.Name, dstMst.Name, v.Alias), zap.Error(err))
                     canRegisterTask = false
                     break
                 }
@@ -3262,6 +3305,7 @@ func (s *Stream) updateTask() {
         for i := range info.Dims {
             ty, ok := srcSchema.GetTyp(info.Dims[i])
             if !ok || influx.Field_Type_Tag != ty {
+                s.Logger.Error(fmt.Sprintf("streamName: %s, dstMst: %s, dim: %s check fail", info.Name, dstMst.Name, info.Dims[i]))
                 canRegisterTask = false
                 break
             }
@@ -3500,6 +3544,9 @@ func (s *TagTask) buildRow(flushTime int64) func(k, vv any) bool {
             validNum = 0
             if tags.Len() < len(s.groupKeys) {
                 *tags = make([]influx.Tag, len(s.groupKeys))
+                for i := 0; i < tags.Len(); i++ {
+                    (*tags)[i] = influx.Tag{}
+                }
             }
             for i := range s.groupKeys {
                 value := values[i]
@@ -3528,7 +3575,7 @@ func (s *TagTask) buildRow(flushTime int64) func(k, vv any) bool {
 
 **逐行解释**：
 - **第 780 行**：`ReFill()` 重置 Row 对象，保留底层内存
-- **第 793 行**：`atomic2.LoadFloat64(v[s.offset+i])` 原子读取聚合值
+- **第 797 行**：`atomic2.LoadFloat64(v[s.offset+i])` 原子读取聚合值
 - **第 815 行**：`strings.Split(key, config.StreamGroupValueStrSeparator)` 将压缩格式的 groupKey 分割
 - **第 829 行**：`unCompressDictKey(value)` 将整数索引解压缩为原始字符串
 - **第 844 行**：`s.rows[s.validNum].Timestamp = flushTime` 设置时间戳为窗口的 flush 时间
@@ -3895,7 +3942,7 @@ graph TB
   - 1 个 `cleanWindow` goroutine：清理旧窗口
   - 1 个 `consumeDataAndUpdateMeta` goroutine：数据消费 + 窗口更新
 
-- 每个 TimeTask 有 2 个 goroutine：
+- 每个 TimeTask 在 `window > 0` 时有 2 个 goroutine；`window == 0`（filter-only）时 `run()` 直接返回，不启动任何 goroutine，过滤在写入路径同步完成：
   - 1 个 `cycleFlush` goroutine：周期性 flush
   - 1 个 `consumeData` goroutine：数据消费 + 窗口更新
 
@@ -3904,7 +3951,7 @@ graph TB
 ```mermaid
 graph LR
     subgraph "外部 -> Stream Engine"
-        A[WriteRows] -->|"rowsRangeTask + task.Put"| E["TaskDataPool.cache"]
+        A[WriteRows] -->|"rowsRangeTask + FilterRowsByCond，需聚合时 Put"| E["TaskDataPool.cache"]
         C[WriteRec] -->|"Stream.s.cache <- CacheRecord"| B["Stream.s.cache"]
         D[WriteReplayRows / StreamHandler] -->|"Stream.s.cache <- ReplayRow"| B
     end
@@ -3940,7 +3987,7 @@ graph LR
 ### 23.1 设计原则
 
 1. **两层架构**：协调层负责窗口计算和分组，存储层负责真正的流式聚合
-2. **无锁设计**：使用原子操作（CAS）代替互斥锁，提高并发性能
+2. **热点无锁**：聚合槽位使用原子操作（CAS）代替互斥锁；分组映射与回放元数据仍由 `sync.Mutex` 保护
 3. **对象池**：大量使用 sync.Pool 和 channel 池，减少 GC 压力
 4. **环形缓冲区**：使用固定大小的数组实现滑动窗口，避免内存持续增长
 5. **背压机制**：通过带缓冲的 channel 实现自然背压，防止数据积压
@@ -4006,13 +4053,18 @@ graph LR
 ## 附录：关键函数调用链
 
 ```
-写入路径:
-  PointsWriter.WritePoints()
-    -> Stream.calculate()                       [协调层]
+写入路径（协调层，仅 Case4 跨分布）:
+  PointsWriter.RetryWritePointRows()
+    -> PointsWriter.writePointRows()
+      -> PointsWriter.routeAndCalculateStreamRows()
+        -> Stream.calculate()                       [协调层]
       -> Stream.calculateWindow()
         -> Stream.GenerateGroupKey()
         -> FieldCall.SingleThreadFunc()
       -> Stream.mapRowsToShard()
+
+写入路径（存储层，所有行写入）:
+  ts-store WriteStreamPoints()
     -> StreamEngine.WriteRows()                 [存储层]
       -> Stream.allocCacheRow()
       -> Stream.rowsRangeTask()
@@ -4089,14 +4141,16 @@ WAL 回放:
 
 ## 附录：配置参数
 
+> 说明：下表为 `services/stream/conf.go` 中 `NewConfig()` 的内置默认值。当前 `app/ts-store/run/server.go` 传给 `stream.NewStream` 的是 `stream2.NewConfig()` 而非配置文件的 `config.Stream`，因此除 `write-enabled` 外，这些参数在运行期无法通过 `[stream]` 配置段调整；`check-interval` 未被任何代码读取（`Run()` 中写死 10s）。
+
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `check-interval` | 10s | 任务刷新间隔 |
+| `check-interval` | 10s | 任务刷新间隔（未生效：`Run()` 中写死 10s） |
 | `windowConcurrency` | CPU/2 | 窗口计算并发度（TagTask 的 parallelCalculate goroutine 数） |
 | `filterConcurrency` | CPU/2 | Filter goroutine 数量 |
 | `filterCache` | 4 * CPU/2 | Cache channel 缓冲大小 |
 | `write-enabled` | true | 是否启用流处理写入 |
 | `maxWindowNum` | 5 | 环形缓冲区最大窗口数 |
 | `maxReplayWindowNum` | 100 | 回放最大窗口数 |
-| `FlushParallelMinRowNum` | 10000 | 并行 flush 最小行数 |
+| `FlushParallelMinRowNum` | 10000 | 并行 flush 最小行数（预留常量，代码中无引用） |
 | `TaskDataPool.cache` | CPU*8, [4,256] | 任务数据池 channel 缓冲大小 |

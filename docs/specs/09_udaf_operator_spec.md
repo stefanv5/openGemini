@@ -1,6 +1,10 @@
 # Module 9: UDAF / 算子框架深度审计报告（庖丁解牛版 v3）
 
 > 时序图 + 核心代码逐行解释。先画图，再对照代码，一步一步拆解。
+>
+> **基线**：`origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11，main + 19 个提交）。
+>
+> 说明：代码块中的中文注释为解读性注释；代码为源码摘录，省略处以 `...` 标注。
 
 ---
 
@@ -8,7 +12,7 @@
 
 openGemini 的 UDAF（User-Defined Aggregate Function）/ 算子框架是一套**可扩展的聚合函数注册与执行系统**。它的核心目标是：
 
-1. **统一注册入口**：无论是内置聚合函数（count、sum、first、last）还是扩展聚合函数（percentile_approx、histogram_quantile），都通过统一的接口注册和发现。
+1. **多入口注册**：count/sum 注册在 `OpFactory`，first/last 等由 `NewProcessors` 的 switch 兜底，percentile_approx/histogram_quantile 注册在 `AggOperator` 表；函数编译、类型推导与下推能力另由 `query.RegisterAggregateFunction` 承担。
 2. **类型安全分发**：根据输入数据类型（Float、Integer、String、Boolean）自动选择对应的 Iterator 实现。
 3. **流式聚合执行**：通过 StreamAggregateTransform 实现基于时间窗口和标签分组的流式聚合。
 4. **UDAF 扩展能力**：允许通过不同 Iterator 模式处理特殊聚合。`percentile_approx` 走 OGSketch 系列 Iterator，`histogram_quantile` 走 `FloatColFloatHistogramIterator`，`WideIterator` 主要服务 Castor / CastorAD 这类需要整批 Arrow 数据交换的算子。
@@ -54,7 +58,7 @@ openGemini 的算子框架分为三层：
 
 | 层次 | 核心组件 | 职责 |
 |------|----------|------|
-| **注册层** | OpFactory + AggOperator 注册表 | 算子的注册、发现、类型推导 |
+| **注册层** | OpFactory + AggOperator 注册表 + query.RegisterAggregateFunction | 算子的注册、发现、类型推导 |
 | **分发层** | NewProcessors() | 根据函数名分发到对应的 Routine 创建逻辑 |
 | **执行层** | StreamAggregateTransform + CoProcessor + Iterator | 流式聚合执行引擎 |
 
@@ -63,7 +67,7 @@ graph TB
     subgraph 注册层
         OF[OpFactory 单例<br/>engine/op/factory.go]
         AO[AggOperator 注册表<br/>engine/executor/agg_factory.go]
-        REG[agg_operators.go<br/>init() 注册 19 个算子]
+        REG["agg_operators.go<br/>init() 注册 19 个算子"]
     end
 
     subgraph 分发层
@@ -136,6 +140,8 @@ func (op *BaseOp) init(derived Op, name string, id uint64, arity int) {
     op.arity = arity
 }
 
+// ...（省略 Name、ID、Arity、EqualTo）
+
 // Clone、Compile、Type 都是模板方法，委托给 derived（子类）
 func (op *BaseOp) Clone() Op {
     return op.derived.Clone()
@@ -182,7 +188,7 @@ type ProjectOp interface {
 }
 ```
 
-**通俗解释**：`ProjectOp` 用于**逐行计算**的场景。它不需要聚合多行数据，只需要对每一行的值进行转换。例如 `SELECT abs(value) FROM cpu` 中的 `abs` 就是一个 ProjectOp。
+**通俗解释**：`ProjectOp` 用于**逐行计算**的场景。它不需要聚合多行数据，只需要对每一行的值进行转换。例如 `SELECT tolower(host) FROM cpu` 中的 `tolower` 就是一个 ProjectOp（`abs` 是数学/物化函数，不走 ProjectOp）。
 
 ### 2.4 AggregateOp 与 UDAFOp — 聚合算子接口
 
@@ -193,6 +199,8 @@ type ProjectOp interface {
 type RoutineFactory interface {
     Create(...interface{}) (interface{}, error)
 }
+
+// ...（省略 FuncRoutineFactory）
 
 // AggregateOp 定义了聚合算子的工厂方法
 type AggregateOp interface {
@@ -234,7 +242,7 @@ classDiagram
         +EqualTo(Op) bool
         +Clone() Op
         +Dump() string
-        +Type(...DataType) DataType
+        +Type(args ...DataType) (DataType, error)
         +Compile(Call) error
     }
 
@@ -248,7 +256,7 @@ classDiagram
 
     class ProjectOp {
         <<interface>>
-        +Eval(...interface{}) interface{}
+        +Eval(args ...any) (any, error)
     }
 
     class AggregateOp {
@@ -264,7 +272,7 @@ classDiagram
 
     class RoutineFactory {
         <<interface>>
-        +Create(...interface{}) interface{}
+        +Create(args ...any) (any, error)
     }
 
     BaseOp ..|> Op : 实现通用元数据
@@ -283,7 +291,7 @@ classDiagram
 
 ### 3.1 单例工厂 — 全局算子注册中心
 
-**代码位置**：`engine/op/factory.go:24-32`
+**代码位置**：`engine/op/factory.go:24-36`
 
 ```go
 var opFactory *OpFactory
@@ -326,6 +334,8 @@ func (c *OpFactory) FindOp(name string) (Op, bool) {
     return nil, false
 }
 
+// ...（省略 FindProjectOp、GetAggregateOpNames）
+
 // FindAggregateOp 查找并断言为 AggregateOp
 func (c *OpFactory) FindAggregateOp(name string) (AggregateOp, bool) {
     if op, ok := c.FindOp(name); ok {
@@ -336,6 +346,8 @@ func (c *OpFactory) FindAggregateOp(name string) (AggregateOp, bool) {
     }
     return nil, false
 }
+
+// ...（省略 GetAggregateOpNames）
 
 // FindUDAFOp 查找并断言为 UDAFOp
 func (c *OpFactory) FindUDAFOp(name string) (UDAFOp, bool) {
@@ -364,6 +376,8 @@ func (c *OpFactory) FindUDAFOp(name string) (UDAFOp, bool) {
 // TypeMapper 实现了 influxql.TypeMapper 接口，用于查询编译时的类型推导
 type TypeMapper struct{}
 
+// ...（省略 MapType、MapTypeBatch）
+
 func (m TypeMapper) CallType(name string, args []influxql.DataType) (influxql.DataType, error) {
     if op, ok := GetOpFactory().FindOp(name); ok {
         return op.Type(args...)  // 委托给算子自身的 Type 方法
@@ -372,10 +386,14 @@ func (m TypeMapper) CallType(name string, args []influxql.DataType) (influxql.Da
     }
 }
 
+// ...（省略 MapType、MapTypeBatch）
+
 // Valuer 实现了 influxql.CallValuer 接口，用于常量折叠（constant folding）
 type Valuer struct{}
 
 var _ influxql.CallValuer = Valuer{}  // 编译时接口检查
+
+// ...（省略 Value、SetValuer）
 
 func (v Valuer) Call(name string, args []interface{}) (interface{}, bool) {
     if op, ok := GetOpFactory().FindProjectOp(name); ok {
@@ -392,8 +410,8 @@ func (v Valuer) Call(name string, args []interface{}) (interface{}, bool) {
 
 **通俗解释**：
 
-- `TypeMapper`：在 SQL 解析阶段，系统需要知道 `percentile_approx(value, 99)` 的返回类型是什么。`TypeMapper` 会查找对应的 `Op`，调用其 `Type()` 方法来推导返回类型。
-- `Valuer`：在查询编译阶段，如果某些表达式可以在编译时求值（如 `SELECT abs(-5)`），`Valuer` 会通过 `ProjectOp.Eval()` 提前计算结果，这就是**常量折叠优化**。
+- `TypeMapper`：在 SQL 解析阶段，系统需要知道聚合函数调用的返回类型。`TypeMapper` 只覆盖注册在 `OpFactory` 的算子（如 `count`、`sum`、`tolower`、`toupper`）；`percentile_approx` 等未注册算子会返回 `influxql.Unknown`，随后由 `engine/executor/schema.go` 的 `DefaultTypeMapper`（`influxql.MultiTypeMapper`）继续委派给 `query.FunctionTypeMapper`，最终调用 `query.RegisterAggregateFunction` 注册的 `CallTypeFunc` 完成推导。
+- `Valuer`：在查询编译阶段，如果某些表达式可以在编译时求值（如 `SELECT tolower('ABC')`），`Valuer` 会通过 `ProjectOp.Eval()` 提前计算结果，这就是**常量折叠优化**。`abs(-5)` 由数学/物化函数处理，不经过 `Valuer`。
 
 ### 3.4 辅助判断函数
 
@@ -458,6 +476,8 @@ func GetAggOperator(name string) AggOperator {
     return factoryInstance[name]
 }
 
+// ...（省略 type AggFactory map[string]AggOperator）
+
 // RegistryAggOp 注册一个新的 AggOperator
 func RegistryAggOp(name string, aggOp AggOperator) {
     _, ok := factoryInstance[name]
@@ -470,7 +490,7 @@ func RegistryAggOp(name string, aggOp AggOperator) {
 
 **通俗解释**：这是 openGemini 的**第二套算子注册体系**。与 `OpFactory` 不同，`AggOperator` 注册表专门用于聚合算子，它不走 `Op` 接口体系，而是直接通过 `AggOperator` 接口的 `CreateRoutine` 方法创建执行 Routine。
 
-**为什么有两套注册体系？** 这是历史演进的结果。代码注释 `// TODO migrate all operators` 表明，未来计划将所有算子迁移到统一的 `OpFactory` 体系。目前两套体系并存：
+**为什么有两套注册体系？** 这是历史演进的结果。代码注释 `// TODO migrate all operators` 表明，未来计划将所有算子迁移到统一的 `OpFactory` 体系。目前这两套体系并存（另有 query 层注册表，见 §10.5）：
 - `OpFactory`：通过 `init()` 函数注册，走 `AggregateOp.Factory().Create()` 路径
 - `AggOperator` 注册表：通过 `RegistryAggOp()` 注册，走 `AggOperator.CreateRoutine()` 路径
 
@@ -579,7 +599,11 @@ type BasePromOp struct {
 }
 
 func NewBasePromOp(op string, fn ColReduceFunc[float64], fv ColMergeFunc[float64]) BasePromOp {
-    return BasePromOp{op: op, fn: fn, fv: fv}
+    return BasePromOp{
+        op: op,
+        fn: fn,
+        fv: fv,
+    }
 }
 
 func (c *BasePromOp) CreateRoutine(params *AggCallFuncParams) (Routine, error) {
@@ -790,9 +814,11 @@ func NewProcessors(inRowDataType, outRowDataType hybridqp.RowDataType,
   → 否: 继续
   ↓
 路径 3: switch name 硬编码分发
-  → count/sum/first/last/percentile/...
+  → first/last/percentile/median/...（count/sum 已在路径 1 拦截）
   → 不匹配: 报错 "unsupported aggregation operator"
 ```
+
+> 注：`count`/`sum` 已注册在 `OpFactory`（`engine/executor/init.go:23-24`），正常查询会先命中路径 1；switch 中的同名分支仅作兜底。
 
 ### 5.3 statCallAndAux() — 分析调用模式
 
@@ -873,15 +899,19 @@ func createRoutineFromUDF(inRowDataType, outRowDataType hybridqp.RowDataType,
 | `absent` | 无 | 缺失检测 |
 | `stddev` | 无 | 标准差 |
 | `sample` | 无 | 随机采样 |
-| `difference` | isTimeUniqueCall=true, offset=1 | 差分 |
-| `derivative` | isTimeUniqueCall=true, offset=1 | 导数 |
+| `difference` / `non_negative_difference` | isTimeUniqueCall=true, offset=1 | 差分 |
+| `derivative` / `non_negative_derivative` | isTimeUniqueCall=true, offset=1 | 导数 |
 | `elapsed` | isTransformationCall=true, offset=1 | 时间间隔 |
 | `moving_average` | isTransformationCall=true, offset=N-1 | 移动平均 |
 | `cumulative_sum` | isTransformationCall=true, offset=0 | 累积和 |
 | `integral` | isIntegralCall=true | 积分 |
 | `rate` | 无 | 瞬时增长率 |
 | `irate` | 无 | 瞬时速率 |
-| `ogsketch_*` | isCompositeCall=true (insert/merge) | OGSketch 系列 |
+| `ogsketch_percentile` | 无（FloatTuple 输入） | 从 OGSketch 提取分位数 |
+| `ogsketch_merge` | isCompositeCall=true, clusterNum=N | 合并 OGSketch |
+| `ogsketch_insert` | isCompositeCall=true, clusterNum=N | 插入并输出 OGSketch |
+
+> 注：`count`/`sum` 已注册在 `OpFactory`（`engine/executor/init.go:23-24`），正常查询会先命中路径 1；上述同名 switch 分支仅作兜底。
 
 ---
 
@@ -981,7 +1011,7 @@ graph TD
 
 ### 7.1 结构体定义
 
-**代码位置**：`engine/executor/agg_transform.go:34-64`
+**代码位置**：`engine/executor/agg_transform.go:32-64`
 
 ```go
 const AggBufChunkNum = 2
@@ -1092,7 +1122,9 @@ func (trans *StreamAggregateTransform) run(ctx context.Context, errs *errno.Errs
 **代码位置**：`engine/executor/agg_transform.go:248-304`
 
 ```go
-func (trans *StreamAggregateTransform) reduce(ctx context.Context, errs *errno.Errs) {
+func (trans *StreamAggregateTransform) reduce(
+    ctx context.Context, errs *errno.Errs,
+) {
     var reduceErr error
     defer func() {
         trans.closeNextSignal()
@@ -1130,6 +1162,7 @@ func (trans *StreamAggregateTransform) reduce(ctx context.Context, errs *errno.E
         if trans.bufChunk == nil {
             if trans.newChunk.NumberOfRows() > 0 {
                 trans.sendChunk()
+                return
             }
             return
         }
@@ -1357,7 +1390,7 @@ WHERE time > now() - 1h
 GROUP BY host
 ```
 
-`castor` 必须正好 4 个参数：字段、算法名、配置名、处理类型。第 2/3/4 个参数必须是字符串字面量，`detect` / `predict` 等处理类型会在编译期转换为内部 `_udf_detect` / `_udf_predict`。执行时 `NewWideProcessorImpl()` 根据 `expr.Name == query.CASTOR` 创建 `NewWideIterator(CastorReduce(CopyArrowRecordToChunk), args)`。每个输入 Chunk 会被 `Clone()` 后放入 `chunkCache`，直到 `lastChunk` 才把整批数据交给 Castor Reduce 逻辑。
+`castor` 必须正好 4 个参数：字段、算法名、配置名、处理类型。第 2/3/4 个参数必须是字符串字面量，`detect` / `predict` 等处理类型会在编译期由 `convertToInternalTagVal` 加上前缀 `_`，得到 `_detect` / `_predict` / `_fit` / `_fit_detect`。执行时 `NewWideProcessorImpl()` 根据 `expr.Name == query.CASTOR` 创建 `NewWideIterator(CastorReduce(CopyArrowRecordToChunk), args)`。每个输入 Chunk 会被 `Clone()` 后放入 `chunkCache`，直到 `lastChunk` 才把整批数据交给 Castor Reduce 逻辑。
 
 ### 8.4 ColumnMapping — 列名映射
 
@@ -1481,7 +1514,9 @@ type CoProcessorImpl struct {
 }
 
 func NewCoProcessorImpl(routines ...Routine) *CoProcessorImpl {
-    return &CoProcessorImpl{Routines: routines}
+    return &CoProcessorImpl{
+        Routines: routines,
+    }
 }
 
 func (p *CoProcessorImpl) AppendRoutine(routines ...Routine) {
@@ -1507,6 +1542,8 @@ type WideRoutineImpl struct {
     endPoint *IteratorEndpoint
 }
 
+// ...（省略 NewWideRoutineImpl）
+
 func (r *WideRoutineImpl) WorkOnChunk(in Chunk, out Chunk, params *IteratorParams) {
     r.endPoint.InputPoint.Chunk = in
     r.endPoint.OutputPoint.Chunk = out
@@ -1514,9 +1551,13 @@ func (r *WideRoutineImpl) WorkOnChunk(in Chunk, out Chunk, params *IteratorParam
     r.iterator.Next(r.endPoint, params)
 }
 
+// ...（省略 NewWideCoProcessorImpl）
+
 type WideCoProcessorImpl struct {
     Routine *WideRoutineImpl
 }
+
+// ...（省略 NewWideCoProcessorImpl）
 
 func (p *WideCoProcessorImpl) WorkOnChunk(in Chunk, out Chunk, params *IteratorParams) {
     p.Routine.WorkOnChunk(in, out, params)
@@ -1595,7 +1636,7 @@ if len(inChunk.Columns()) > 1 {
 }
 ```
 
-**问题**：`WideIterator` 只支持单列输入。如果 UDAF 需要处理多列数据（如 `histogram_quantile` 需要同时访问 bucket 边界和计数），必须在 Chunk 外部处理。
+**问题**：`WideIterator` 只支持单列输入。需要整批多字段交换的 UDAF（如 Castor）必须在 Chunk 外部处理。`histogram_quantile` 不受此限制：它只读一个 Float 值列，bucket 上界由 `le` Tag 承载，执行路径是 `FloatColFloatHistogramIterator`，不经过 `WideIterator`。
 
 ### 10.3 AggOperator 注册竞态条件
 
@@ -1640,15 +1681,16 @@ params.ProRes.isUDAFCall = true
 - 将标志设置逻辑集中到 `NewProcessors()` 中
 - 使用显式的返回值而非副作用
 
-### 10.5 两套注册体系并存
+### 10.5 多套注册体系并存
 
-目前 openGemini 有两套算子注册体系：
+目前 openGemini 有三套算子注册体系：
 1. `OpFactory`（`engine/op/factory.go`）
 2. `AggOperator` 注册表（`engine/executor/agg_factory.go`）
+3. `query.RegisterAggregateFunction`（`lib/util/lifted/influx/query/op_factory.go`）：负责编译规则、类型推导与下推能力判断
 
-代码中有注释 `// TODO migrate all operators`，表明这是一个未完成的迁移。两套体系并存导致：
-- 新开发者需要理解两套体系的区别
-- 某些算子可能在两套体系中都有注册（虽然目前没有）
+代码中有注释 `// TODO migrate all operators`，表明这是一个未完成的迁移。多套体系并存导致：
+- 新开发者需要理解多套体系的区别
+- 某些算子可能在多套体系中都有注册（虽然目前没有）
 - 增加了维护成本
 
 ---
@@ -1682,8 +1724,8 @@ AST: &influxql.Select{
         {Expr: &influxql.Call{Name: "time", Args: [&influxql.DurationLiteral{Val: 5m}]}},
     }
 }
-  ↓ (TypeMapper.CallType)
-类型推导: percentile_approx(Float, Number) → Float
+  ↓ (DefaultTypeMapper → query.FunctionTypeMapper → PercentileApproxFunc.CallTypeFunc)
+类型推导: percentile_approx(Float, Number) → Float（CallTypeFunc 返回 args[0]）
   ↓ (LogicalPlan 构建)
 LogicalAggregate → LogicalSeries → Exchange
 ```
@@ -1748,8 +1790,9 @@ RoutineImpl.WorkOnChunk(bufChunk, newChunk, iteratorParam):
   → endPoint.InputPoint = {Chunk: bufChunk, Ordinal: 0}
   → endPoint.OutputPoint = {Chunk: newChunk, Ordinal: 0}
   → OGSketchIterator.Next(endPoint, iteratorParam)
-      → 将 cpu_usage 数据插入 OGSketch
-      → 如果 lastChunk == true: 从 OGSketch 中提取 P99 结果写入 newChunk
+      → 将 cpu_usage 数据插入 OGSketch（UpdateCluster）
+      → 窗口结束时（sameInterval == false 的中间窗）WriteResult 输出 P99 并 Reset
+      → 最后一个窗口留在 sketch 中，由下一个 Chunk 的首窗或流结束时的 processFirstWindow 输出
   ↓
 postProcess(bufChunk):
   → postProcessSingleAggAndSelector(bufChunk) → 更新 Tag 和 TagIndex
@@ -1782,12 +1825,12 @@ graph LR
     subgraph 解析
         Parser[influxql.Parser]
         AST[AST: influxql.Select]
-        TypeMapper[TypeMapper.CallType]
+        TypeMapper["DefaultTypeMapper → FunctionTypeMapper"]
     end
 
     subgraph 规划
         LogicalPlan[LogicalAggregate]
-        PhysPlan[PhysicalAggregate]
+        PhysPlan["Exchange → StreamAggregateTransform"]
     end
 
     subgraph 分发
@@ -1828,12 +1871,12 @@ graph LR
     PostProcess --> Result
 ```
 
-### 11.7 端到端实战：histogram_quantile(0.99, http_request_duration_bucket) 完整生命周期
+### 11.7 端到端实战：histogram_quantile(http_request_duration_bucket, 0.99) 完整生命周期
 
 #### 查询语句
 
 ```sql
-SELECT histogram_quantile(0.99, http_request_duration_bucket)
+SELECT histogram_quantile(http_request_duration_bucket, 0.99)
 FROM http_request_duration_bucket
 WHERE time > now() - 1h
 GROUP BY host, time(5m)
@@ -1847,7 +1890,7 @@ NewProcessors(inRowDataType, outRowDataType, exprOpt, opt, false)
 statCallAndAux()
   → callCount = 1, isSingleCall = true
   ↓
-exprOpt[0].Expr = &influxql.Call{Name: "histogram_quantile", Args: [0.99, bucket_field]}
+exprOpt[0].Expr = &influxql.Call{Name: "histogram_quantile", Args: [bucket_field, 0.99]}
   ↓
 路径 1: op.IsAggregateOp(expr) → false
   ↓
@@ -1855,7 +1898,7 @@ exprOpt[0].Expr = &influxql.Call{Name: "histogram_quantile", Args: [0.99, bucket
   ↓
 HistogramQuantileOp.CreateRoutine(params)
   → params.ProRes.isUDAFCall = true  // 标记为 UDAF（需要全量数据）
-  → 解析参数: percentile = 0.99
+  → 字段取自 Args[0]，百分位取自 Args[1]: percentile = 0.99
   → inOrdinal = bucket_field 的列索引
   → outOrdinal = 输出列索引
   → 创建 FloatColFloatHistogramIterator
@@ -1884,8 +1927,8 @@ RoutineImpl.WorkOnChunk(bufChunk, newChunk, iteratorParam):
   → FloatColFloatHistogramIterator.Next(endPoint, iteratorParam)
       → 收集所有 bucket 数据到内存
       → 如果 lastChunk == true:
-        → FloatHistogramQuantilePromReduce(0.99, buckets)
-        → 在 bucket 边界上线性插值，计算 P99
+        → FloatHistogramQuantilePromReduce(0.99)(buckets)
+        → 在有限桶边界上线性插值；若落在 +Inf 桶则返回上一个桶的上界
         → 将结果写入 newChunk
   ↓
 postProcessWithUDAF(bufChunk):  // 空操作，UDAF 在 WorkOnChunk 中已完成
@@ -1902,12 +1945,10 @@ postProcessWithUDAF(bufChunk):  // 空操作，UDAF 在 WorkOnChunk 中已完成
   le="+Inf" → count=1000
 
 计算 P99 (0.99):
-  1. 目标 count = 1000 * 0.99 = 990
-  2. 找到包含 990 的 bucket: le="5.0" (count=950) → le="+Inf" (count=1000)
-  3. 线性插值: 5.0 + (990-950)/(1000-950) * (∞-5.0)
-     由于上界是 +Inf，使用上一个 bucket 的上界
-     实际计算: 5.0 + (40/50) * (5.0 - 1.0) = 5.0 + 3.2 = 8.2
-  4. 结果: P99 ≈ 8.2 秒
+  1. rank = 1000 * 0.99 = 990
+  2. sort.Search 在前 len-1 个桶中找不到 count >= 990 的桶，bucketIndex 落到最后一个（+Inf）桶
+  3. 命中 if bucketIndex == len(buckets)-1 分支，直接返回 buckets[len-2].upperBound
+  4. 结果: P99 = le="5.0" 的上界 = 5.0 秒（+Inf 桶不参与插值）
 ```
 
 **关键设计点**：
@@ -1927,7 +1968,7 @@ postProcessWithUDAF(bufChunk):  // 空操作，UDAF 在 WorkOnChunk 中已完成
 | `engine/executor/agg_factory.go` | AggOperator 接口、注册表 | 24-53 |
 | `engine/executor/agg_operators.go` | 19 个聚合算子注册 + 实现 | 29-441 |
 | `engine/executor/call_processor.go` | NewProcessors 分发、processorResults、内置算子 | 44-1110 |
-| `engine/executor/agg_transform.go` | StreamAggregateTransform 执行引擎 | 34-657 |
+| `engine/executor/agg_transform.go` | StreamAggregateTransform 执行引擎 | 32-656 |
 | `engine/executor/coprocessor.go` | Iterator/Routine/CoProcessor 接口与实现 | 19-138 |
 | `engine/executor/udaf_iterator.go` | WideIterator 批量-归约模式 | 22-105 |
 
@@ -2035,7 +2076,7 @@ func init() {
 ### 15.1 isSingleCall 优化
 
 当查询只包含一个聚合函数时（如 `SELECT min(value) FROM cpu`），`isSingleCall = true`。这允许：
-- 避免创建辅助列处理器
+- 避免在 Iterator 中使用辅助列缓冲（`auxChunk`）
 - 使用更高效的 Iterator 路径
 - 减少内存分配
 
@@ -2146,36 +2187,63 @@ openGemini 的基础聚合 Iterator 采用**两阶段处理**模式：
 2. **Merge 阶段**：将多个聚合结果合并为最终结果（跨 Chunk 合并）
 
 ```go
-// Reduce 函数类型：将一列数据聚合为一个值
-type ColReduceFunc[T any] func(col Column, values []T) T
+// Merge 函数类型：合并两个聚合点
+type ColMergeFunc[T util.ExceptString] func(prevPoint, currPoint *Point[T])
 
-// Merge 函数类型：将多个聚合结果合并
-type ColMergeFunc[T any] func(values []T) T
+// ...（省略 PointMerge、WindowMerge、RateMiddleReduceFunc）
+
+// Reduce 函数类型：按 [start, end) 区间聚合 Chunk 中的一列
+type ColReduceFunc[T util.ExceptBool] func(c Chunk, values []T, ordinal, start, end int) (index int, value T, isNil bool)
 ```
 
 **以 min 为例**：
 
 ```go
-// MinReduce：在单个 Chunk 内找最小值
-func MinReduce[T float64 | int64](col Column, values []T) T {
-    min := values[0]
-    for _, v := range values[1:] {
-        if v < min {
-            min = v
+// MinReduce：在单个 Chunk 的 [start, end) 区间找最小值
+func MinReduce[T util.NumberOnly](c Chunk, values []T, ordinal, start, end int) (int, T, bool) {
+    column := c.Column(ordinal)
+    times := c.Time()
+    if column.NilCount() == 0 {
+        // fast path
+        minValue, minIndex := values[start], start
+        for i := start; i < end; i++ {
+            v := values[i]
+            if v < minValue || (v == minValue && times[i] < times[minIndex]) {
+                minIndex = i
+                minValue = v
+            }
+        }
+        return minIndex, minValue, false
+    }
+
+    // slow path
+    vs, ve := column.GetRangeValueIndexV2(start, end)
+    if vs == ve {
+        return start, 0, true
+    }
+    minValue, minIndex := values[vs], column.GetTimeIndex(vs)
+    for i := vs; i < ve; i++ {
+        v, index := values[i], column.GetTimeIndex(i)
+        if v < minValue || (v == minValue && times[index] < times[minIndex]) {
+            minIndex = index
+            minValue = v
         }
     }
-    return min
+    return minIndex, minValue, false
 }
 
-// MinMerge：跨 Chunk 合并最小值
-func MinMerge[T float64 | int64](values []T) T {
-    min := values[0]
-    for _, v := range values[1:] {
-        if v < min {
-            min = v
-        }
+// ...（省略 BooleanMinReduce、IntegerMinReduce 等类型变体）
+
+// MinMerge：跨 Chunk 合并最小值，平局取更早的时间戳
+func MinMerge[T util.NumberOnly](prevPoint, currPoint *Point[T]) {
+    if currPoint.isNil {
+        return
     }
-    return min
+    if prevPoint.isNil || (currPoint.value < prevPoint.value) ||
+        (currPoint.value == prevPoint.value && currPoint.time < prevPoint.time) {
+        prevPoint.Assign(currPoint)
+        prevPoint.isNil = false
+    }
 }
 ```
 
@@ -2194,16 +2262,15 @@ case influxql.Float:
 
 ```go
 type FloatIterator struct {
-    reduceFunc    ColReduceFunc[float64]  // Reduce 函数（如 MinReduce）
-    mergeFunc     ColMergeFunc[float64]   // Merge 函数（如 MinMerge）
-    isSingleCall  bool                    // 是否单聚合调用
-    inOrdinal     int                     // 输入列序号
-    outOrdinal    int                     // 输出列序号
-    auxProcessor  []*AuxProcessor         // 辅助列处理器
-    outRowDataType hybridqp.RowDataType   // 输出数据类型
-    values        []float64               // 值缓冲区
-    timeValues    []int64                 // 时间戳缓冲区
-    sameInterval  bool                    // 是否在同一时间窗口
+    isSingleCall bool
+    inOrdinal    int
+    outOrdinal   int
+    prevPoint    *Point[float64]
+    currPoint    *Point[float64]
+    fn           ColReduceFunc[float64]
+    fv           ColMergeFunc[float64]
+    auxChunk     Chunk
+    auxProcessor []*AuxProcessor
 }
 ```
 
@@ -2213,61 +2280,70 @@ type FloatIterator struct {
 sequenceDiagram
     participant Caller as RoutineImpl
     participant FI as FloatIterator
-    participant Col as 输入 Column
-    participant Out as 输出 Column
+    participant Col as 输入 Chunk
+    participant Out as 输出 Chunk
 
     Caller->>FI: Next(endPoint, params)
-    FI->>FI: 检查 sameInterval
-    alt sameInterval == true
-        FI->>Col: 读取当前值
-        FI->>FI: 追加到 values 缓冲区
-    else sameInterval == false（新窗口）
-        FI->>FI: 对 values 执行 mergeFunc
-        FI->>Out: 写入聚合结果
-        FI->>FI: 清空 values 缓冲区
-        FI->>Col: 读取当前值
-        FI->>FI: 追加到 values 缓冲区
+    FI->>FI: 遍历 inChunk.IntervalIndex() 切分时间窗口
+    alt 首窗且 prevPoint 非空
+        FI->>FI: processFirstWindow：用 mergeFunc 合并上一 Chunk 的 prevPoint
+    else 末窗且 p.sameInterval
+        FI->>FI: processLastWindow：暂存到 prevPoint，等待下一个 Chunk
+    else 中间窗
+        FI->>FI: processMiddleWindow：写出当前窗口结果
     end
-    FI->>FI: 检查 lastChunk
-    alt lastChunk == true
-        FI->>FI: 对 values 执行 mergeFunc
-        FI->>Out: 写入最终结果
-    end
+    FI->>Out: 写时间戳（isSingleCall）与聚合值
 ```
 
 ### 16.4 SliceIterator 模式 — 需要全量数据的聚合
 
-某些聚合函数（如 `percentile`、`median`、`mode`、`stddev`）需要看到所有数据才能计算结果。这类函数使用 `SliceIterator`，它将所有数据收集到一个切片中，最后一次性计算。
+某些聚合函数（如 `percentile`、`median`、`mode`、`stddev`）需要看到整个窗口的数据才能计算结果。这类函数使用 `SliceIterator`：它把每个时间窗口的数据累积到 `SliceItem`，在窗口结束时一次性计算；跨 Chunk 未结束的窗口保留在 `buf` 中。
 
 **FloatColFloatSliceIterator 核心逻辑**：
 
 ```go
 type FloatColFloatSliceIterator struct {
-    reduceFunc    ColFloatSliceReduceFunc  // 切片聚合函数
-    isSingleCall  bool
-    inOrdinal     int
-    outOrdinal    int
-    auxProcessor  []*AuxProcessor
-    outRowDataType hybridqp.RowDataType
-    values        []float64               // 收集所有值
-    timeValues    []int64                 // 收集所有时间戳
-    sameInterval  bool
+    isSingleCall bool
+    inOrdinal    int
+    outOrdinal   int
+    buf          *SliceItem[float64]
+    fn           SliceReduce[float64]
+    auxChunk     Chunk
+    auxProcessor []*AuxProcessor
+    windowIndex  []int
 }
 
+// ...（省略 NewFloatColFloatSliceIterator 与 processFirstWindow/processLastWindow/processMiddleWindow）
+
 func (r *FloatColFloatSliceIterator) Next(ie *IteratorEndpoint, p *IteratorParams) {
-    inCol, outCol := ie.InputPoint.Chunk.Column(ie.InputPoint.Ordinal),
-                     ie.OutputPoint.Chunk.Column(ie.OutputPoint.Ordinal)
+    inChunk, outChunk := ie.InputPoint.Chunk, ie.OutputPoint.Chunk
 
-    // 累积数据
-    for i := 0; i < inCol.Length(); i++ {
-        r.values = append(r.values, inCol.FloatValue(i))
-    }
-
-    // 最后一个 Chunk 时执行计算
-    if p.lastChunk {
-        result := r.reduceFunc(r.values)
-        outCol.AppendFloatValue(result)
-        outCol.AppendNotNil()
+    var end int
+    firstIndex, lastIndex := 0, len(inChunk.IntervalIndex())-1
+    inColumn := inChunk.Column(r.inOrdinal)
+    outColumn := outChunk.Column(r.outOrdinal)
+    values := inColumn.FloatValues()
+    for i, start := range inChunk.IntervalIndex() {
+        if i < lastIndex {
+            end = inChunk.IntervalIndex()[i+1]
+        } else {
+            end = inChunk.NumberOfRows()
+        }
+        if !r.isSingleCall {
+            start, end = inColumn.GetRangeValueIndexV2(start, end)
+            if start == end && r.buf.Len() == 0 && (i < lastIndex || (i == lastIndex && !p.sameInterval)) {
+                outColumn.AppendNil()
+                continue
+            }
+        }
+        if i == firstIndex && r.buf.Len() > 0 {
+            r.processFirstWindow(inChunk, outChunk, p.sameInterval,
+                firstIndex != lastIndex, start, end, values)
+        } else if i == lastIndex && p.sameInterval {
+            r.processLastWindow(inChunk, start, end, values)
+        } else {
+            r.processMiddleWindow(inChunk, outChunk, start, end, values)
+        }
     }
 }
 ```
@@ -2276,10 +2352,10 @@ func (r *FloatColFloatSliceIterator) Next(ie *IteratorEndpoint, p *IteratorParam
 
 | 特性 | FloatIterator | FloatColFloatSliceIterator |
 |------|---------------|---------------------------|
-| 处理模式 | 流式 Reduce + Merge | 收集全量 + 一次性计算 |
-| 内存使用 | O(1)（只保留当前窗口值） | O(N)（保留所有值） |
+| 处理模式 | 流式 Reduce + Merge | 按窗口累积 + 窗口结束计算 |
+| 内存使用 | O(1)（只保留聚合点） | O(N)（保留当前窗口的值） |
 | 适用场景 | min, max, sum, count | percentile, median, mode, stddev |
-| 跨 Chunk | 通过 Merge 函数合并 | 直接累积到同一个切片 |
+| 跨 Chunk | 通过 Merge 函数合并 | 未结束窗口累积在 SliceItem 中 |
 
 ### 16.5 TransIterator 模式 — 逐行转换
 
@@ -2292,30 +2368,32 @@ type FloatTransIterator struct {
     isSingleCall bool
     inOrdinal    int
     outOrdinal   int
-    transItem    TransformationItem  // 转换逻辑
+    buf          TransItem
 }
 
-func (r *FloatTransIterator) Next(ie *IteratorEndpoint, p *IteratorParams) {
-    inCol := ie.InputPoint.Chunk.Column(ie.InputPoint.Ordinal)
-    outCol := ie.OutputPoint.Chunk.Column(ie.OutputPoint.Ordinal)
+// ...（省略 NewFloatTransIterator、processFirstWindow、processLastWindow）
 
-    for i := 0; i < inCol.Length(); i++ {
-        value := inCol.FloatValue(i)
-        result, valid := r.transItem.Process(value, i)
-        if valid {
-            outCol.AppendFloatValue(result)
-            outCol.AppendNotNil()
-        }
+func (r *FloatTransIterator) processMiddleWindow(
+    inChunk, outChunk Chunk, start, end, i int,
+) {
+    r.buf.AppendItem(inChunk, r.inOrdinal, start, end, false)
+    if r.buf.Len() > 0 {
+        r.appendCurrItem(inChunk, outChunk, i)
     }
+    r.buf.Reset()
 }
 ```
 
-**TransformationItem 接口**：
+**TransItem 接口**：
 
 ```go
-type TransformationItem interface {
-    Process(value interface{}, index int) (interface{}, bool)
+type TransItem interface {
+    AppendItem(Chunk, int, int, int, bool)
     Reset()
+    Len() int
+    PrevNil() bool
+    ResetPrev()
+    GetBaseTransData() BaseTransData
 }
 ```
 
@@ -2324,24 +2402,25 @@ type TransformationItem interface {
 ```go
 type FloatDifferenceItem struct {
     isNonNegative bool
-    diffFunc      func(prev, curr float64) float64
-    prevValue     float64
-    hasPrev       bool
+    diff          func(prev, curr float64) float64
+    prev          *Point[float64]
+    times         []int64
+    values        []float64
+    nils          []bool
 }
 
-func (d *FloatDifferenceItem) Process(value interface{}, index int) (interface{}, bool) {
-    v := value.(float64)
-    if !d.hasPrev {
-        d.prevValue = v
-        d.hasPrev = true
-        return nil, false  // 第一个值没有差值
+// ...（省略 NewFloatDifferenceItem）
+
+func (f *FloatDifferenceItem) diffComputeFast(prevValue, currValue float64, currTime int64) {
+    if dv := f.diff(prevValue, currValue); !f.isNonNegative || (f.isNonNegative && dv >= 0) {
+        f.times = append(f.times, currTime)
+        f.values = append(f.values, dv)
+        f.nils = append(f.nils, false)
+    } else {
+        f.times = append(f.times, currTime)
+        f.values = append(f.values, 0)
+        f.nils = append(f.nils, true)
     }
-    diff := d.diffFunc(d.prevValue, v)
-    d.prevValue = v
-    if d.isNonNegative && diff < 0 {
-        return nil, false
-    }
-    return diff, true
 }
 ```
 
@@ -2349,24 +2428,34 @@ func (d *FloatDifferenceItem) Process(value interface{}, index int) (interface{}
 
 `top` 和 `bottom` 算子使用**堆**数据结构来高效维护 Top N / Bottom N。
 
-**FloatColFloatHeapIterator 核心逻辑**：
+**FloatColFloatHeapIterator 核心逻辑**（`engine/executor/agg_iterator.gen.go:1178-1190`）：
 
 ```go
 type FloatColFloatHeapIterator struct {
+    n             int
     inOrdinal     int
     outOrdinal    int
+    prevMaxIndex  int
+    buf           *HeapItem[float64]
+    auxChunk      Chunk
     auxProcessor  []*AuxProcessor
-    outRowDataType hybridqp.RowDataType
-    heapItem      *HeapItem[float64]  // 堆实现
+    windowIndex   []int
+    prevBufIndex  []int
+    currBufIndex  []int
+    interBufIndex []int
 }
+```
 
-type HeapItem[T float64 | int64 struct {
-    n           int                           // 堆容量
-    cmpReduce   func(a, b T) bool            // 比较函数（用于 Reduce）
-    cmpTime     func(a, b int64) bool        // 时间比较函数
-    sortFunc    func(values []T, times []int64) // 排序函数
-    values      []T                          // 堆中的值
-    times       []int64                      // 对应的时间戳
+**HeapItem 结构**（`engine/executor/agg_iterator.go:44-51`）：
+
+```go
+type HeapItem[T util.NumberOnly] struct {
+    sortByTime bool
+    maxIndex   int
+    cmpByValue func(a, b *PointItem[T]) bool
+    cmpByTime  func(a, b *PointItem[T]) bool
+    sortFunc   func(item *HeapItem[T])
+    items      []PointItem[T]
 }
 ```
 
@@ -2469,8 +2558,7 @@ func BooleanAuxHelpFunc(input, output Column, rowIdx ...int) {
 func NewAuxCoProcessor(inRowDataType, outRowDataType hybridqp.RowDataType,
     opt hybridqp.ExprOptions) *AuxProcessor {
 
-    inOrdinal := inRowDataType.FieldIndex(opt.Expr.(*influxql.VarRef).Val)
-    outOrdinal := outRowDataType.FieldIndex(opt.Ref.Val)
+    inOrdinal, outOrdinal := inRowDataType.FieldIndex(opt.Expr.(*influxql.VarRef).Val), outRowDataType.FieldIndex(opt.Ref.Val)
     dataType := inRowDataType.Field(inOrdinal).Expr.(*influxql.VarRef).Type
 
     switch dataType {
@@ -2511,7 +2599,7 @@ func NewAuxCoProcessor(inRowDataType, outRowDataType hybridqp.RowDataType,
 ### 18.1 为什么需要 Prometheus 兼容算子？
 
 openGemini 支持 PromQL（Prometheus Query Language）查询。PromQL 的聚合函数与 InfluxQL 有细微差别：
-- PromQL 的 `min` 不忽略 NaN，而 InfluxQL 的 `min` 忽略 NaN
+- `min_prom` 与 `min` 都不传播 NaN；`min_prom` 固定返回区间起点索引，`min` 用时间戳打破平局并返回真实索引
 - PromQL 的 `count` 返回 Float，而 InfluxQL 的 `count` 返回 Integer
 - PromQL 有 `histogram_quantile`、`group`、`scalar` 等特殊函数
 
@@ -2539,32 +2627,24 @@ func (c *MaxPromOp) CreateRoutine(params *AggCallFuncParams) (Routine, error) {
 }
 ```
 
-**MinPromReduce vs MinReduce 的区别**：
+**MinPromReduce vs MinReduce 的区别**：两者都不传播 NaN；差异在 MinReduce 用时间戳打破平局并返回真实 index，MinPromReduce 固定返回 `start`。
 
 ```go
-// MinReduce：忽略 NaN
-func MinReduce[T float64 | int64](col Column, values []T) T {
-    min := values[0]
-    for _, v := range values[1:] {
-        if v < min {
-            min = v
-        }
-    }
-    return min
+// MinReduce：按区间求最小值，平局取更早的时间戳，返回真实 index
+func MinReduce[T util.NumberOnly](c Chunk, values []T, ordinal, start, end int) (int, T, bool) {
+    // ...（快慢路径见 agg_func.go:296-328）
 }
 
-// MinPromReduce：不忽略 NaN，NaN 会传播
-func MinPromReduce(col Column, values []float64) float64 {
-    min := values[0]
-    for _, v := range values[1:] {
-        if math.IsNaN(float64(v)) {
-            return v  // 遇到 NaN 立即返回
-        }
-        if v < min {
-            min = v
+// MinPromReduce：固定返回 start；NaN 不传播，遇到 NaN 时用后继值替换
+func MinPromReduce(c Chunk, values []float64, ordinal, start, end int) (int, float64, bool) {
+    minValue := values[start]
+    for i := start + 1; i < end; i++ {
+        v := values[i]
+        if minValue > v || math.IsNaN(minValue) {
+            minValue = v
         }
     }
-    return min
+    return start, minValue, false
 }
 ```
 
@@ -2613,9 +2693,9 @@ func (c *HistogramQuantileOp) CreateRoutine(params *AggCallFuncParams) (Routine,
 }
 ```
 
-**通俗解释**：`histogram_quantile(0.99, histogram_bucket)` 函数计算直方图的第 99 百分位数。它需要：
-1. 输入是 histogram_bucket 列（包含 bucket 边界和计数）
-2. 使用 `FloatHistogramQuantilePromReduce` 函数进行计算
+**通俗解释**：`histogram_quantile(histogram_bucket, 0.99)` 函数计算直方图的第 99 百分位数。它需要：
+1. 输入是一个 Float 值列（计数），bucket 上界由 `le` Tag 承载（`DecodeTagsWithoutTag("le")`）
+2. 使用 `FloatHistogramQuantilePromReduce(0.99)` 生成 Reduce 函数进行计算
 3. 设置 `isUDAFCall = true`，因为它需要看到所有 bucket 数据
 
 ### 18.4 PromScalarOp — 标量转换
@@ -2691,7 +2771,7 @@ OGSketch（OpenGemini Sketch）是一种**近似分位数计算算法**。它通
 - `clusterNum`：聚类数量，控制精度和内存的权衡（默认 100）
 - `percentile`：要计算的百分位数（0-1）
 
-### 19.2 OGSketchIterator
+### 19.2 OGSketchIterator 与 Routine 构造
 
 **代码位置**：`engine/executor/call_processor.go:570-623`（`NewPercentileApproxRoutineImpl`）
 
@@ -2764,6 +2844,30 @@ func NewPercentileApproxRoutineImpl(inRowDataType, outRowDataType hybridqp.RowDa
 }
 ```
 
+**OGSketchIterator 的结构与输出时机**（`engine/executor/agg_iterator.go:2904-2924`、`2927-2949`）：
+
+```go
+type OGSketchIterator struct {
+    isSingleCall bool
+    inOrdinal    int
+    outOrdinal   int
+    clusterNum   int
+    opt          *query.ProcessorOptions
+    sketch       OGSketchItem
+}
+
+// ...
+func (r *OGSketchIterator) processMiddleWindow(
+    inChunk, outChunk Chunk, start, end int, time int64,
+) {
+    r.sketch.UpdateCluster(inChunk, start, end)
+    r.sketch.WriteResult(outChunk, time)
+    r.sketch.Reset()
+}
+```
+
+`Next()` 按 `inChunk.IntervalIndex()` 分窗：首窗用 `processFirstWindow` 合并上一 Chunk 的残留结果；末窗 `processLastWindow` 只 `UpdateCluster`，等待下一个 Chunk；中间窗立即 `WriteResult` 并 `Reset`。因此带 `GROUP BY time(...)` 时结果按窗口产出，而不是等到 `lastChunk`。
+
 ### 19.3 OGSketch 操作模式
 
 | 操作 | 说明 | 输入类型 | 输出类型 |
@@ -2785,7 +2889,7 @@ SELECT ogsketch_insert(cpu_usage, 99, 100) FROM cpu GROUP BY host
 
 -- 第二阶段：合并所有 OGSketch 并提取结果
 SELECT ogsketch_percentile(ogsketch, 99) FROM (
-    SELECT ogsketch_insert(cpu_usage, 99, 100) FROM cpu GROUP BY host
+    SELECT ogsketch_insert(cpu_usage, 99, 100) AS ogsketch FROM cpu GROUP BY host
 )
 ```
 
@@ -2866,6 +2970,12 @@ Iterator 通过 `IteratorParams.err` 字段传递错误：
 ```go
 // WideIterator 中的错误设置
 func (r *WideIterator) Next(ie *IteratorEndpoint, p *IteratorParams) {
+    if r.isErrHappend {
+        p.err = nil
+        return
+    }
+
+    inChunk := ie.InputPoint.Chunk
     // 单列检查
     if len(inChunk.Columns()) > 1 {
         p.err = errno.NewError(errno.OnlySupportSingleField)
@@ -2874,13 +2984,17 @@ func (r *WideIterator) Next(ie *IteratorEndpoint, p *IteratorParams) {
     }
 
     // 数据类型一致性检查
-    if r.dType != colDtype {
+    colDtype := inChunk.Columns()[0].DataType()
+    if r.dType == influxql.Unknown {
+        r.dType = colDtype
+    } else if r.dType != colDtype {
         p.err = errno.NewError(errno.DtypeNotMatch, r.dType, colDtype)
         r.isErrHappend = true
         return
     }
 
     // 行数限制检查
+    r.rowCnt += inChunk.NumberOfRows()
     if r.rowCnt > UDAFMaxRow {
         p.err = errno.NewError(errno.DataTooMuch, UDAFMaxRow, r.rowCnt)
         r.isErrHappend = true
@@ -2909,7 +3023,9 @@ if trans.iteratorParam.err != nil {
 **代码位置**：`engine/executor/agg_transform.go:248-261`
 
 ```go
-func (trans *StreamAggregateTransform) reduce(ctx context.Context, errs *errno.Errs) {
+func (trans *StreamAggregateTransform) reduce(
+    ctx context.Context, errs *errno.Errs,
+) {
     var reduceErr error
     defer func() {
         trans.closeNextSignal()
@@ -2946,20 +3062,13 @@ func (trans *StreamAggregateTransform) reduce(ctx context.Context, errs *errno.E
 当查询包含多个聚合函数时，`NewProcessors()` 会为每个函数创建一个 Routine，然后将它们添加到同一个 `CoProcessorImpl` 中。
 
 ```go
-// NewProcessors() 中的处理
+// NewProcessors() 中的处理（示意）：循环按调用名分发，而非按函数名逐个判断
 for i := range exprOpt {
     switch expr := exprOpt[i].Expr.(type) {
     case *influxql.Call:
-        // ...
-        // 第一个聚合函数: min
-        if aggOp := GetAggOperator("min"); aggOp != nil {
-            routine, _ = aggOp.CreateRoutine(params)  // Routine 1
-            coProcessor.AppendRoutine(routine)
-            continue
-        }
-        // 第二个聚合函数: max
-        if aggOp := GetAggOperator("max"); aggOp != nil {
-            routine, _ = aggOp.CreateRoutine(params)  // Routine 2
+        name := expr.Name
+        if aggOp := GetAggOperator(name); aggOp != nil {
+            routine, _ = aggOp.CreateRoutine(params)
             coProcessor.AppendRoutine(routine)
             continue
         }
@@ -3096,7 +3205,7 @@ func (trans *StreamAggregateTransform) postProcessMultiTransformation(c Chunk) {
 }
 ```
 
-**通俗解释**：转换型算子（如 `difference`、`derivative`）的后处理比较复杂：
+**通俗解释**：转换型算子（如 `elapsed`、`moving_average`、`cumulative_sum`）的后处理比较复杂：
 1. 需要处理 `offset`（前 N 个点没有输出）
 2. 需要处理 `prevSameInterval`（跨 Chunk 的连续性）
 3. 需要避免重复的 Tag
@@ -3161,7 +3270,7 @@ nextSignal   chan Semaphore   // reduce → run 的控制信号
 ```
 
 **安全性保证**：
-1. `inputChunk` 是无缓冲 channel（或缓冲为 1），保证了数据的顺序性
+1. `inputChunk` 是无缓冲 channel（`make(chan Chunk)`），保证了数据的顺序性
 2. `nextSignal` 是信号通道，保证了背压控制
 3. `closedSignal` 使用 `*bool` 指针，通过 `sync.Once` 保证只关闭一次
 
@@ -3253,11 +3362,11 @@ r.chunkCache = append(r.chunkCache, inChunk.Clone())
 ### 24.3 SliceIterator 的内存开销
 
 ```go
-values []float64  // 收集所有值
+buf *SliceItem[float64]  // 按窗口累积的值
 ```
 
-`SliceIterator` 将所有值收集到一个切片中：
-- 内存使用量 = 数据行数 × 数据类型大小
+`SliceIterator` 通过 `SliceItem` 累积当前窗口的值：
+- 内存使用量 = 当前窗口行数 × 数据类型大小
 - 对于 Float 类型：每行 8 字节
 - 10000 行 ≈ 80KB
 
@@ -3333,7 +3442,7 @@ func TestMinOp_CreateRoutine(t *testing.T) {
 
 ### 26.1 统一注册体系
 
-当前的两套注册体系（`OpFactory` 和 `AggOperator`）计划合并为统一的 `OpFactory` 体系。这将：
+当前的注册体系（`OpFactory`、`AggOperator`，以及 `query.RegisterAggregateFunction`）计划逐步收敛到统一的 `OpFactory` 体系。这将：
 - 简化代码结构
 - 减少维护成本
 - 统一类型推导和编译校验
@@ -3369,7 +3478,7 @@ func TestMinOp_CreateRoutine(t *testing.T) {
 | `DefaultClusterNum` | 100 | OGSketch 默认聚类数 | `call_processor.go:32` |
 | `MaxClusterNum` | 100000 | OGSketch 最大聚类数 | `call_processor.go:33` |
 | `AggBufChunkNum` | 2 | 聚合缓冲 Chunk 数 | `agg_transform.go:32` |
-| `CircularChunkNum` | - | Chunk 对象池大小 | 运行时配置 |
+| `CircularChunkNum` | 4 | Chunk 对象池大小（编译期常量） | `engine/executor/chunk_pool.go:19` |
 
 ---
 
@@ -3387,9 +3496,8 @@ if trans.span != nil {
 ```
 
 可以通过 tracing 系统查看：
-- 总执行时间
-- 每个 Chunk 的处理时间
-- preProcess 和 postProcess 的耗时
+- 总执行时间（`[Agg] TotalWorkCost`）
+- 单个 `compute()`（preProcess + WorkOnChunk + postProcess）的耗时（`reduce_compute` 子 span）
 
 ### 28.2 日志支持
 
@@ -3472,7 +3580,7 @@ func (c *RCAOp) CreateRoutine(params *AggCallFuncParams) (Routine, error) {
 **使用示例**：
 
 ```sql
-SELECT rca(cpu_usage, '{"algorithm":"fault_demarcation","threshold":0.8,"task":{"metadata":{"core_entity_id":"ELB"}}}')
+SELECT rca(cpu_usage, '{"hop_count":3,"bfs_narrow":true,"task":{"metadata":{"core_entity_id":"ELB"}}}')
 FROM cpu
 WHERE time > now() - 1h
 ```
@@ -3483,9 +3591,9 @@ RCA 执行时 `FaultDemarcation` 会读取 `task.metadata.core_entity_id`。如�
 
 ```go
 type AlgoParam struct {
-    Algorithm string  `json:"algorithm"`   // 算法名称
-    Threshold float64 `json:"threshold"`   // 阈值
-    // 其他参数...
+    HopCount  int                    `json:"hop_count"`
+    BFSNarrow bool                   `json:"bfs_narrow"`
+    Task      map[string]interface{} `json:"task"`
 }
 ```
 
@@ -3833,7 +3941,7 @@ reduce() 协程:
        → Routine 3 (percentile_approx): 继续累积
 
      → postProcess(Chunk 2)
-       → 发送结果（因为 host 变了）
+       → 更新 Tag/IntervalIndex；本次发送由 newChunk 达到 ChunkSize 触发（Tag 变化不触发发送）
 
   4. compute(bufChunk = Chunk 3):
      → preProcess(Chunk 3)
@@ -3843,8 +3951,8 @@ reduce() 协程:
      → coProcessor.WorkOnChunk(Chunk 3, newChunk, params)
        → Routine 1 (min): MinReduce(cpu_usage) → 0.4
        → Routine 2 (max): MaxReduce(cpu_usage) → 0.7
-       → Routine 3 (percentile_approx): 执行 OGSketch 计算
-         → 从累积的 memory_usage 数据中提取 P99
+       → Routine 3 (percentile_approx): 窗口结束时 WriteResult
+         → 从当前窗口累积的 memory_usage 数据中提取 P99
 
      → postProcess(Chunk 3)
        → 发送最终结果
@@ -3873,7 +3981,7 @@ reduce() 协程:
 - [x] 函数命名符合 Go 规范（驼峰命名）
 - [x] 接口命名以 `-er` 或 `-or` 结尾（Iterator, Routine, CoProcessor）
 - [x] 错误处理完整（所有错误都有明确的返回值）
-- [x] 注释充分（关键函数都有文档注释）
+- [ ] 注释覆盖不均（算子实现普遍缺少 Go doc 注释）
 
 ### 31.2 设计模式
 
@@ -3889,7 +3997,7 @@ reduce() 协程:
 - [ ] `UDAFMaxRow` 硬编码，无法配置
 - [ ] `closedSignal` 使用 `*bool`，未使用原子操作
 - [ ] `AggOperator` 注册表无并发保护
-- [ ] 两套注册体系并存，增加维护成本
+- [ ] 多套注册体系并存，增加维护成本
 - [ ] 某些算子通过副作用设置标志位（如 `params.ProRes.isUDAFCall = true`）
 
 ### 31.4 测试覆盖
@@ -3919,13 +4027,13 @@ openGemini 的 UDAF/算子框架是一个**设计精良、层次分明**的聚�
 
 **未来改进方向**：
 
-1. 统一两套注册体系
+1. 统一多套注册体系
 2. 支持动态算子注册
 3. 引入向量化执行
 4. 自适应优化策略
 
 ---
 
-> **文档版本**：v3.0
-> **最后更新**：2026-05-29
-> **适用版本**：openGemini 当前主分支
+> **文档版本**：v3.1
+> **最后更新**：2026-10-26
+> **适用版本**：`origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）

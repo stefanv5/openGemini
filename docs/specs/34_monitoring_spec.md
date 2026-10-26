@@ -1,6 +1,8 @@
 # Module 34: Monitoring Service 深度审计报告（庖丁解牛版）
 
-> `app/ts-monitor/` 是 openGemini 的独立监控服务。它不处理用户查询，而是负责收集集群各节点的运行指标、错误日志和元数据信息，并将这些数据推送到 openGemini 自身（自监控）或外部监控系统（如 Prometheus）。
+> 代码基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）；本文行号与代码摘录均以 `_spec_verify_20260616/snapshots/spec-md-chinese` 为准。代码块以源码原文为准，省略处标 `...`；个别中文注释为解读所加。
+
+> `app/ts-monitor/` 是 openGemini 的独立监控服务。它不处理用户查询，而是负责收集集群各节点的运行指标、错误日志和元数据信息，并将这些数据推送到 openGemini 自身（自监控）数据库；同时对外暴露 Prometheus 兼容的 `/metrics` 端点，由 Prometheus 主动抓取。
 
 ---
 
@@ -25,7 +27,7 @@ graph TD
 
     subgraph "外部系统"
         H -->|HTTP /write| I[openGemini 自监控]
-        H -->|HTTP /metrics| J[Prometheus]
+        J[Prometheus] -->|"HTTP GET /metrics"| H
         H -->|HTTP /query| K[openGemini 查询接口]
     end
 
@@ -34,7 +36,7 @@ graph TD
 ```
 
 **通俗解释**：
-- openGemini 的每个节点（ts-meta、ts-sql、ts-store）会定期将运行指标写入本地文件
+- openGemini 的每个节点（ts-meta、ts-sql、ts-store）会定期将运行指标写入本地文件（前提：该节点 `[monitor] store-enabled = true`、`pushers` 含 `file` 且配置了 `store-path`；默认 `store-enabled=false`、`pushers` 为空，即默认不产生任何指标文件，文件监听链路默认空转）
 - ts-monitor 监听这些文件，读取指标数据，然后推送到目标数据库
 - ts-monitor 还收集系统级指标（CPU、内存、磁盘）和集群元数据（数据库数量、measurement 数量、series 基数）
 - 同时提供 Prometheus 兼容的 `/metrics` 端点
@@ -45,7 +47,7 @@ graph TD
 |------|---------|----------------|
 | 资源隔离 | 与主服务竞争 CPU/内存 | 独立进程，GOMAXPROCS=2 |
 | 故障隔离 | 主服务崩溃 = 监控丢失 | 独立进程，可独立重启 |
-| 部署灵活性 | 每个节点都需要 | 单点部署，监控整个集群 |
+| 部署灵活性 | 每个节点都需要 | 每节点部署（采集本机指标文件与本机系统指标）；仅元数据统计是集群级、可选（`query-enable` 默认 false） |
 | 数据聚合 | 分散在各节点 | 集中收集，统一上报 |
 
 ---
@@ -89,14 +91,14 @@ graph TB
         H --> T["ReportMetric() — Tail + 批量写入"]
         I --> U["reportHistoryErrLog() — 压缩日志"]
         J --> V["reportCurrentErrLog() — 实时日志"]
-        N --> T
-        S --> T
+        N --> W
+        S --> W
         T --> W["WriteData() — HTTP POST /write"]
     end
 
     subgraph "Prometheus"
         X["MonitorCollector.Collect()"] --> Y["/metrics 端点"]
-        X --> T
+        T -->|"parseIndex 填充 indexModuleMap"| X
     end
 ```
 
@@ -190,7 +192,7 @@ func (s *Server) Open() error {
 }
 ```
 
-**单例机制**：使用文件锁（`monitor.lock`）确保同一台机器上只有一个 ts-monitor 实例运行。
+**单例机制**：使用文件锁（`monitor.lock`）确保同一台机器上只有一个 ts-monitor 实例运行。注意：`lockFile` 在 Windows 上是空实现（仅 Linux/FreeBSD/Darwin 生效），且锁文件建在二进制所在目录（`filepath.Dir(os.Args[0])`），从不同目录启动的实例互不排斥。
 
 ---
 
@@ -227,19 +229,23 @@ func (c *Collector) ListenFiles() error {
     var currErrLogs []string
     init := true
 
-    ticker := time.NewTicker(listenInterval)  // 5 秒
+    var metrics []string
+
+    ticker := time.NewTicker(listenInterval)
     defer ticker.Stop()
 
-    go c.cleanErrLogHistory()  // 后台清理历史记录
+    if _, err := isExistedPath(c.errLogPath); err != nil {
+        c.logger.Warn("err log path not found", zap.Error(err), zap.String("metric_path", c.metricPath))
+    }
+
+    go c.cleanErrLogHistory()
 
     for {
-        // 监听错误日志
         if err := c.listenErrLogs(hisErrLogs, currErrLogs, init); err != nil {
             return err
         }
         init = false
 
-        // 监听指标文件
         c.listenMetrics(metrics)
 
         select {
@@ -278,10 +284,16 @@ sequenceDiagram
     end
 ```
 
-**核心代码**：`app/ts-monitor/collector/collect.go:176-216`（listenMetrics）
+**核心代码**：`app/ts-monitor/collector/collect.go:176-216`（listenMetrics + scanMetricFiles）
 
 ```go
 func (c *Collector) listenMetrics(metrics []string) {
+    if ok, err := isExistedPath(c.metricPath); err != nil {
+        c.logger.Warn("metric path not found", zap.Error(err), zap.String("metric_path", c.metricPath))
+        return
+    } else if !ok {
+        return
+    }
     metrics = c.scanMetricFiles(metrics)
     if len(metrics) == 0 {
         return
@@ -299,11 +311,11 @@ func (c *Collector) scanMetricFiles(metrics []string) []string {
     defer c.muMetric.Unlock()
 
     for _, filename := range matches {
-        if strings.HasSuffix(filename, ".invalid") {
-            continue  // 跳过无效文件
+        if strings.HasSuffix(filename, suffixInvalid) {
+            continue
         }
-        if strings.HasPrefix(filename, ".") {
-            continue  // 仅当完整路径以 "." 开头才生效，通常不能可靠过滤隐藏文件
+        if strings.HasPrefix(filename, prefixIgnore) {
+            continue
         }
         if _, ok := c.metricCurrent[filename]; !ok {
             c.metricCurrent[filename] = struct{}{}
@@ -336,7 +348,7 @@ flowchart TB
     K --> L["解析 JSON 日志行"]
     L --> M["提取 errno + hostname"]
     M --> N["格式化为行协议"]
-    N --> O["批量上报 (10 秒间隔)"]
+    N --> O["批量上报（首次 10 秒，之后 5 秒）"]
 
     G --> P["解压 .gz 文件"]
     P --> Q["逐行解析"]
@@ -350,22 +362,40 @@ flowchart TB
 **日志行解析**：`app/ts-monitor/collector/report.go:575-613`
 
 ```go
-func (rb *ReportJob) parseErrLine(line []byte, filePrefix string, isCurrent bool, ...) (int, string) {
-    data := make(map[string]interface{})
-    json.Unmarshal(line, &data)
+func (rb *ReportJob) parseErrLine(line []byte, filePrefix string, isCurrent bool, ignoreTimeFunc func(line []byte) bool) (int, string) {
+    if len(line) == 0 {
+        return 0, ""
+    }
+    if ignoreTimeFunc != nil && ignoreTimeFunc(line) {
+        return 0, ""
+    }
 
+    data := make(map[string]interface{})
+    err := json.Unmarshal(line, &data)
+    if err != nil {
+        rb.logger.Error("parse line err", zap.Error(err), zap.ByteString("line", line))
+        return 0, ""
+    }
     tm := data["time"].(string)
     t, _ := time.Parse(time.RFC3339Nano, tm)
     ts := t.UnixNano()
+    rb.saveCurrentErrLog(filePrefix, isCurrent, tm)
 
     errno, _ := strconv.Atoi(data["errno"].(string))
     hostname, _ := data["hostname"].(string)
     tags := fmt.Sprintf("%s,errno=%s,hostname=%s", ErrLogMst, data["errno"], hostname)
 
     var field []string
+    var repeated float64
     for k, v := range data {
         if _, ok := ignoreKeys[k]; ok {
-            continue  // 忽略 errno, hostname, time, level, caller
+            continue
+        } else if k == "repeated" {
+            repeated = v.(float64)
+            continue
+        }
+        if _, ok := v.(string); ok {
+            v = strings.ReplaceAll(v.(string), "\n", "###")
         }
         field = append(field, fmt.Sprintf("%s:%v", k, v))
     }
@@ -379,9 +409,9 @@ func (rb *ReportJob) parseErrLine(line []byte, filePrefix string, isCurrent bool
 {"time":"2024-01-15T10:30:00Z","errno":"5015","hostname":"node1","level":"error","caller":"engine.go:123","msg":"write failed","database":"mydb"}
 ```
 
-**输出示例**：
+**输出示例**（`caller` 在 `ignoreKeys` 中被忽略；字段顺序受 map 遍历随机性影响）：
 ```
-err_log,errno=5015,hostname=node1 msg="caller:engine.go:123;msg:write failed;database:mydb",repeated=0 1705312200000000000
+err_log,errno=5015,hostname=node1 msg="msg:write failed;database:mydb",repeated=0 1705314600000000000
 ```
 
 ---
@@ -394,6 +424,8 @@ err_log,errno=5015,hostname=node1 msg="caller:engine.go:123;msg:write failed;dat
 
 ```go
 type nodeMetrics struct {
+    mu sync.RWMutex
+
     Uptime int64  // 系统运行时长（秒）
 
     CpuNum   int64   // CPU 核数
@@ -431,14 +463,14 @@ type nodeMetrics struct {
 sequenceDiagram
     participant Collect as collect() goroutine
     participant Report as report() goroutine
-    participant Ticker1 as 4 秒定时器
+    participant Ticker1 as Sleep 4 秒循环
     participant Ticker2 as 10 秒定时器
     participant Gopsutil as gopsutil 库
     participant PS as ps 命令
     participant DU as du 命令
     participant Writer as WriteData()
 
-    loop 每 4 秒
+    loop 每 4 秒（time.Sleep）
         Ticker1->>Collect: 触发采集
         Collect->>Gopsutil: host.UptimeWithContext()
         Collect->>Gopsutil: cpu.PercentWithContext()
@@ -449,6 +481,7 @@ sequenceDiagram
         Collect->>PS: ps -ef | grep ts-sql
         Collect->>PS: ps -ef | grep ts-meta
         Collect->>DU: du -al --max-depth=1 .../index
+        Note over Collect: 仅当 conf.Process 含对应组件名才执行 ps；CPU 采样在 100 次循环内重试取首个非空值
     end
 
     loop 每 10 秒
@@ -495,7 +528,7 @@ const (
 ```
 
 **通俗解释**：
-NodeCollector 通过 `ps` 命令检测 openGemini 各组件的运行状态。如果进程存在，状态为 1（running）；如果进程不存在，状态为 2（killed）。
+NodeCollector 通过 `ps` 命令检测 openGemini 各组件的运行状态。如果进程存在，状态为 1（running）；如果进程不存在，状态为 2（killed）。若 `conf.Process` 未配置对应组件名，则根本不会执行该 `ps` 检测，Pid 与 Status 都保持 0。
 
 ---
 
@@ -548,36 +581,54 @@ sequenceDiagram
 
 ```go
 func (q *QueryMetric) query() error {
-    // 1. 获取所有数据库
     queryDB, _ := q.queryExecute("", ShowDatabases)
-    v, _ := parseSeries(queryDB)
+    v, err := parseSeries(queryDB)
+    if err != nil {
+        return err
+    }
     var databases []string
     for _, db := range v.Get("0", "values").GetArray() {
         databases = append(databases, string(db.GetStringBytes("0")))
     }
-    q.queryMetrics.DBCount = int64(len(databases))
 
-    // 2. 遍历每个数据库
+    q.queryMetrics.mu.Lock()
+    q.queryMetrics.DBCount = int64(len(databases))
+    q.queryMetrics.mu.Unlock()
+
     var mstCount int64
     for _, db := range databases {
+        // count mst
         queryMst, _ := q.queryExecute(db, ShowMeasurements)
-        v, _ = parseSeries(queryMst)
+        v, err = parseSeries(queryMst)
+        if err != nil {
+            return err
+        }
         var measurements []string
         for _, mst := range v.Get("0", "values").GetArray() {
-            mstCount++
+            mstCount += 1
             measurements = append(measurements, string(mst.GetStringBytes("0")))
         }
 
-        // 3. 查询每个 measurement 的 series 基数
+        q.queryMetrics.mu.Lock()
+        q.queryMetrics.SeriesMap[db] = make(map[string]int64)
+        q.queryMetrics.mu.Unlock()
+        // count series
         for _, mst := range measurements {
             querySeries, _ := q.queryExecute(db, fmt.Sprintf(ShowSeriesCardinality, mst))
-            v, _ = parseSeries(querySeries)
+            v, err = parseSeries(querySeries)
+            if err != nil {
+                return err
+            }
             for _, vi := range v.GetArray() {
+                q.queryMetrics.mu.Lock()
                 q.queryMetrics.SeriesMap[db][mst] += vi.Get("values", "0").GetInt64("2")
+                q.queryMetrics.mu.Unlock()
             }
         }
     }
+    q.queryMetrics.mu.Lock()
     q.queryMetrics.MstCount = mstCount
+    q.queryMetrics.mu.Unlock()
     return nil
 }
 ```
@@ -645,6 +696,11 @@ type ReportJob struct {
     reportStat    *ReportStat       // 上报失败统计
     replicaN      int               // 副本数
     indexModuleMap map[string][]*metrics.ModuleIndex // 指标缓存（供 Prometheus）
+    // ...
+    Hook          func()
+    errLogLock    sync.RWMutex
+    errLogHistory string
+    mux           *sync.RWMutex
 }
 ```
 
@@ -719,6 +775,8 @@ func (rb *ReportJob) retryEver(path string, headers http.Header, buf string, htt
 
 `retryEver` 的返回值也要注意：超过 `MaxRetryTimes` 后跳出循环并返回 `nil`，调用方不能仅凭返回 error 判断上报是否真正成功。
 
+补充两点：(1) 源码还有 `timeout` channel——`if httpTimeout > 0 { timeout = time.After(httpTimeout) }`，超时直接返回 `errors.New("request timeout")`；`WriteData` 传的是 `0`（永不超时），只有 `CreateDatabase` 传 `HttpTimeout`。(2) `checkConnectionError(err)` 分支是 `time.Sleep(time.Second); continue`，**跳过了 `tries++`**，因此持续性的 connection refused/reset 会无限重试。
+
 ### 7.3 地址切换
 
 ```go
@@ -777,7 +835,7 @@ func (rb *ReportJob) ReportMetric(filename string) error {
 
 **关键设计**：
 - **Tail 模式**：使用 `SnappyTail` 实时读取文件新增内容
-- **批量上报**：缓冲至少 100 行或 5 秒后上报
+- **批量上报**：`postData` 的判据是 `*batch <= MinBatchSize` 才返回，即**累积超过 100 行**立即上报；`ticker.Reset(ReportFrequency)` 在每收到一行时重置，所以 5 秒是「连续 5 秒无新行」的空闲 flush，而不是固定周期
 - **文件读取失败重试**：`tail()`/文件读取失败才按 `maxRetry=2` 计数，超过后将文件标记为 `.invalid`；HTTP 上报失败不走这里的 `.invalid` 逻辑
 
 ---
@@ -834,37 +892,59 @@ func (c *MonitorCollector) Collect(ch chan<- prometheus.Metric) {
 
 ```go
 func (rb *ReportJob) parseIndex(line []byte) {
-    lines := strings.Split(string(line), "\n")
+    var (
+        moduleName  string
+        metricSlice = make([]*metrics.ModuleIndex, 0)
+    )
 
+    lines := strings.Split(string(line), "\n")
+    t := time.Now()
+
+    //Data format of each row: {table name},{labels} {indicator data} {timestamp}
     for _, value := range lines {
         m := metrics.ModuleIndex{
             LabelValues: make(map[string]string),
             MetricsMap:  make(map[string]interface{}),
+            Timestamp:   t,
         }
-
-        // 数据格式: {table name},{labels} {indicator data} {timestamp}
         parts := strings.Split(value, " ")
+        if len(parts) != 3 {
+            rb.logger.Error("invalid metric line:", zap.String("line", value))
+            continue
+        }
         tmp := strings.Split(parts[0], ",")
-
-        moduleName = tmp[0]  // 表名
-
-        // 解析标签
+        if len(tmp) != 2 {
+            rb.logger.Error("invalid metric line:", zap.String("line", value))
+            continue
+        }
+        moduleName = tmp[0]
+        // parse labels
         labels := tmp[1:]
         for _, label := range labels {
             labelKv := strings.Split(label, "=")
             m.LabelValues[labelKv[0]] = labelKv[1]
         }
-
-        // 解析指标
+        // parse index
         indexes := strings.Split(parts[1], ",")
         for _, index := range indexes {
             indexKv := strings.Split(index, "=")
-            value, _ := strconv.ParseFloat(indexKv[1], 64)
-            m.MetricsMap[indexKv[0]] = value
+            if len(indexKv) != 2 {
+                rb.logger.Error("invalid metric index:", zap.String("index", index))
+                continue
+            }
+            value, err := strconv.ParseFloat(indexKv[1], 64)
+            if err != nil {
+                rb.logger.Error("parse index failed", zap.String("file", moduleName), zap.String("index", index), zap.Error(err))
+                m.MetricsMap[indexKv[0]] = indexKv[1]
+            } else {
+                m.MetricsMap[indexKv[0]] = value
+            }
         }
-
-        rb.indexModuleMap[moduleName] = append(rb.indexModuleMap[moduleName], &m)
+        metricSlice = append(metricSlice, &m)
     }
+    rb.mux.Lock()
+    rb.indexModuleMap[moduleName] = metricSlice
+    rb.mux.Unlock()
 }
 ```
 
@@ -873,27 +953,38 @@ func (rb *ReportJob) parseIndex(line []byte) {
 ### 8.3 Prometheus 指标命名
 
 ```
-opengemini_httpd_http_requests_total
-opengemini_performance_query_duration_ns
-opengemini_system_cpu_usage
-opengemini_errno_error_count
+opengemini_httpd_req
+opengemini_performance_WriteUnmarshalNs
+opengemini_errno_value
 ```
 
-**命名规则**：`{namespace}_{moduleName}_{metricName}`
+**命名规则**：`{namespace}_{moduleName}_{metricName}`，其中 `metricName` 就是行协议里的字段名，**大小写原样保留、不做 snake_case 归一化**（`metrics.NewDesc(namespace+"_"+moduleName, metricName, ...)` → `prometheus.BuildFQName("", subsystem, name)`）。
+
+注：`system` 虽在 `metricMsts` 列表中，但其数据由 `NodeCollector` 直接 `WriteData` 写库、不经过 `parseIndex`，因此实际不会出现在 `/metrics` 中。另外 `server.go` 匿名导入 `_ "net/http/pprof"` 并用默认 mux 监听，`/debug/pprof/*` 也随 `http-endpoint` 一并暴露。
 
 ---
 
 ## 9. ReportStat — 上报失败统计
 
-**代码位置**：`app/ts-monitor/collector/report_stat.go:24-55`
+**代码位置**：`app/ts-monitor/collector/report_stat.go:19-54`（`maxRetry` 常量在 19-22、`ReportStat` 在 24-28、`TryAgain` 在 36-47、`Delete` 在 49-54）
 
 ```go
+const (
+    // Maximum number of retries in case of reporting failure
+    maxRetry = 2
+)
+
 type ReportStat struct {
-    failed map[string]int  // filename → 失败次数
+    // key: filename, value: number of failures
+    failed map[string]int
     mu     sync.Mutex
 }
 
-const maxRetry = 2
+func NewReportStat() *ReportStat {
+    return &ReportStat{
+        failed: make(map[string]int),
+    }
+}
 
 func (s *ReportStat) TryAgain(key string) bool {
     s.mu.Lock()
@@ -903,8 +994,16 @@ func (s *ReportStat) TryAgain(key string) bool {
         s.failed[key]++
         return s.failed[key] <= maxRetry
     }
+
     s.failed[key] = 1
     return true
+}
+
+func (s *ReportStat) Delete(key string) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    delete(s.failed, key)
 }
 ```
 

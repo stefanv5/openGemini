@@ -1,6 +1,8 @@
 # Module 17: ShardKey Index 与 Sparse Index 深度审计报告（庖丁解牛版）
 
-> openGemini 的索引系统不止 TSI（Tag Series Index）。还有 **ShardKey Index**（分片键索引）和 **Sparse Index**（稀疏索引）两个重要组件。ShardKey Index 主要服务 range shard 分裂和负载均衡评估；真正的写入路由在 coordinator 的 `DestShard` / `ShardFor` 流程中完成。Sparse Index 用于判断哪些数据块可以跳过。
+> 基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）。本文所有 `file:line` 与代码摘录均以此提交为准。
+
+> openGemini 的索引系统不止 TSI（Tag Series Index）。还有 **ShardKey Index**（分片键索引）和 **Sparse Index**（稀疏索引）两个重要组件。ShardKey Index 主要服务 range shard 分裂和负载均衡评估；真正的写入路由由 coordinator 调用 `meta.ShardGroupInfo` 的 `DestShard`（RANGE 分片）或 `ShardFor`（hash 分片）完成。Sparse Index 用于判断哪些数据块可以跳过。
 
 ---
 
@@ -70,7 +72,7 @@ sequenceDiagram
     end
 
     SKI->>Disk: 写入两种条目
-    Note over Disk: [0] + shardKey → 存在性标记<br/>[1] + shardKey + mstLen + sids → SID 列表
+    Note over Disk: [0] + shardKey → 存在性标记<br/>[1] + varint(shardKeyLen) + shardKey + varint(mstLen) + mstName + sids → SID 列表
 ```
 
 **两种命名空间**：
@@ -78,19 +80,53 @@ sequenceDiagram
 | 前缀 | Key | Value | 用途 |
 |------|-----|-------|------|
 | `[0]` (nsPrefixShardKey) | shardKey | 空 | 判断 shardKey 是否存在 |
-| `[1]` (nsPrefixShardKeyToSid) | shardKey + mstName | SID 列表 | shardKey → series ID 映射 |
+| `[1]` (nsPrefixShardKeyToSid) | `[1][len(shardKey)][shardKey][len(mst)][sids]`（两个变长长度前缀） | 无独立 Value（mergeset 仅存 key，SID 拼在 key 尾部） | shardKey → series ID 映射 |
 
 ### 2.3 分裂点查找
 
-**代码位置**：`engine/index/ski/shardkey_index.go`（`GetSplitPointsWithSeriesCount` 方法）
+**代码位置**：`engine/index/ski/shardkey_index.go:188-223`（`GetSplitPointsWithSeriesCount` 方法）
 
 ```go
 func (idx *ShardKeyIndex) GetSplitPointsWithSeriesCount(poses []int64) ([]string, error) {
-    // 遍历所有 shardKey，按序统计 series 数量
-    // 当累计数量超过阈值时，记录分裂点
-    // 返回分裂点的 shardKey 列表
+	is := idx.getIndexSearch()
+	defer idx.putIndexSearch(is)
+
+	ts := &is.ts
+	kb := &is.kb
+
+	kb.B = append(kb.B[:0], nsPrefixShardKey)
+	ts.Seek(kb.B)
+	i := 0
+	splitPoints := make([]string, 0, len(poses))
+	var sidCount int64
+	var err error
+	valid := false
+	for ts.NextItem() {
+		if !bytes.HasPrefix(ts.Item, kb.B) {
+			break
+		}
+		shardKey := ts.Item[1:]
+		valid, sidCount, err = idx.validSplitKey(sidCount, poses[i], shardKey)
+		if err != nil {
+			return nil, err
+		}
+		if valid {
+			splitPoints = append(splitPoints, string(shardKey))
+			i++
+		}
+		if i >= len(poses) {
+			break
+		}
+	}
+	if i != len(poses) {
+		return nil, fmt.Errorf("can not find enough split keys, find split key len %d, need %d", len(splitPoints), len(poses))
+	}
+	return splitPoints, nil
 }
 ```
+
+判定条件由 `validSplitKey` 实现：按 shardKey 累加 `mp.TSIDsLen()`，当 `sidCount >= pos` 时记该 shardKey 为分裂点。
+**注意**：该方法目前在非测试代码中无调用点（仅 `engine/index/ski/index_test.go:77-81` 覆盖），生产分裂点走 §2.5 的按行数路径。
 
 **具体例子**：
 
@@ -132,19 +168,19 @@ sequenceDiagram
     Note over SKI: 后续 split point / 负载均衡统计使用
 ```
 
-**代码讲解**：写入路由按 shard group、时间范围、hash 和存活 shard 计算，核心在 coordinator 的 `DestShard` / `ShardFor`。`ShardKeyIndex.CreateIndex` 在 TSSTORE MemTable 新建 series 时记录 shardKey 到 SID 的关系，供 `GetSplitPointsWithSeriesCount` / `GetSplitPointsByRowCount` 估算 range shard 分裂点。它不要和列存 sparse index 的查询裁剪链路混为一条路径。
+**代码讲解**：写入路由按 shard group、时间范围、hash 和存活 shard 计算，核心是 coordinator 调用 `meta.ShardGroupInfo` 的 `DestShard`（`ShardKey.Type == RANGE`）或 `ShardFor`（hash 分片，其索引表在 `InitNumOfShards > 0` 时取自 `mi.ShardIdexes[sg.ID]`，不一定是 alive shards）。`ShardKeyIndex.CreateIndex` 在 TSSTORE MemTable 新建 series 时（仅 range 模式）记录 shardKey 到 SID 的关系，供 `GetSplitPointsByRowCount` 估算 range shard 分裂点（`GetSplitPointsWithSeriesCount` 仅测试覆盖）。它不要和列存 sparse index 的查询裁剪链路混为一条路径。
 
 **具体例子**：
 
 ```text
 写入 cpu,host=s1:
-  1. coordinator 根据时间和 hash 调 ShardFor -> shard 3
+  1. coordinator 按 ShardKey.Type 调 DestShard（RANGE）或 ShardFor（hash）-> shard 3
   2. 数据写入 shard 3
   3. MemTable 新建 series 时写 ShardKeyIndex: shardKey(cpu,host=s1) -> SID=1001
   4. 后续 range shard 太大时，ShardKeyIndex 统计累计 series 数，建议 split point
 ```
 
-### 2.4 按行数分裂点查找
+### 2.5 按行数分裂点查找
 
 **代码位置**：`engine/index/ski/shardkey_index.go`（`GetSplitPointsByRowCount` 方法）
 
@@ -152,7 +188,7 @@ sequenceDiagram
 func (idx *ShardKeyIndex) GetSplitPointsByRowCount(poses []int64, f func(name string, sid uint64) (int64, error)) ([]string, error)
 ```
 
-与 `GetSplitPointsWithSeriesCount` 按 series 数量统计不同，`GetSplitPointsByRowCount` 按实际行数统计分裂点。它接受一个回调函数 `f`，用于根据 measurement name 和 SID 计算行数，当累计行数超过阈值时记录分裂点。
+与 `GetSplitPointsWithSeriesCount` 按 series 数量统计不同，`GetSplitPointsByRowCount` 按实际行数统计分裂点。它接受一个回调函数 `f`，用于根据 measurement name 和 SID 计算行数，当累计行数达到或超过阈值（`rowCount >= pos`）时记录分裂点。
 
 ---
 
@@ -201,12 +237,12 @@ sequenceDiagram
     participant Binary as doBinarySearch()
     participant Exclusion as doExclusionSearch()
 
-    Query->>PK: Scan(pkFile, pkRec, keyCondition)
+    Query->>PK: Scan(pkFile, pkRec, pkMark, keyCondition)
 
-    alt 第一列在条件中
+    alt 条件只涉及第一主键列（GetMaxKeyIndex() == 0）
         PK->>Binary: 二分查找
         Note over Binary: O(logN) 定位 fragment 边界<br/>适用于 WHERE pk_col = value
-    else 非第一列
+    else 条件涉及后续主键列（含第 1、2 列同时出现）
         PK->>Exclusion: 层级排除
         Note over Exclusion: 递归细分 fragment 范围<br/>用 MayBeInRange 排除不匹配的子范围
     end
@@ -308,13 +344,14 @@ Bloom Filter Index 就像"每本书的关键词索引"。如果你要找提到"s
 ```mermaid
 graph TB
     subgraph "查询: WHERE host='server1' AND value > 100"
-        Q["查询条件"] --> PK["Primary Key Index"]
-        PK -->|"定位 fragment 范围"| MM["Min/Max Index"]
-        MM -->|"排除 value_max < 100"| BF["Bloom Filter Index"]
-        BF -->|"排除 host 不在 BF 中"| Read["读取剩余 fragment"]
+        Q["查询条件"] --> PK["Primary Key Index<br/>定位 fragment 范围"]
+        PK --> MM["Min/Max Index<br/>排除 value_max < 100"]
+        PK --> BF["Bloom Filter Index<br/>排除 host 不在 BF 中"]
+        MM --> Read["读取剩余 fragment"]
+        BF --> Read
     end
 
-    subgraph "效果"
+    subgraph "效果（示意，非实测）"
         R1["100 个 fragment"] -->|"PK: 50"| R2["50 个 fragment"]
         R2 -->|"MM: 20"| R3["20 个 fragment"]
         R3 -->|"BF: 10"| R4["10 个 fragment"]
@@ -323,6 +360,8 @@ graph TB
     style R1 fill:#ffcdd2
     style R4 fill:#c8e6c9
 ```
+
+> 注：PK 索引先给出 fragment 范围；后续多个 skip index reader 由 `skInfoMap`（Go map）遍历生成，彼此独立地对同一 fragment 集合求交，不保证固定的 MM→BF 次序。
 
 ---
 
@@ -350,5 +389,5 @@ graph TB
 | 分裂点查找 | 按 series 数量或行数统计 | 负载均衡依据 |
 | Primary Key Index | 二分查找 / 层级排除 | O(logN) fragment 定位 |
 | Min/Max Index | Reader 侧支持 fragment 级 min/max 裁剪；writer 当前为空实现 | 不能承诺固定裁剪比例，需先有实际 min/max 索引文件 |
-| Bloom Filter Index | fragment 级布隆过滤器 | 等值查询裁剪 80%+ fragment |
-| 三级协作 | PK → MM → BF 逐层过滤 | 最终只读取 10% 的 fragment |
+| Bloom Filter Index | fragment 级布隆过滤器 | 裁剪率取决于数据分布与 BF 参数，无可承诺比例 |
+| 三级协作 | PK 先缩小范围，MM/BF 等 skip index 各自独立求交 | 裁剪量随数据分布变化（§3.6 数字为示意） |

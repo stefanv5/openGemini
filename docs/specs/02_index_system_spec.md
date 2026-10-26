@@ -1,5 +1,7 @@
 # Module 2: Index System 深度审计报告（庖丁解牛版 v3）
 
+> 代码基线：origin/docs/spec-md-chinese @ 9717d662（2026-04-11）。
+
 > 时序图优先，逐步拆解。每个流程都有 Mermaid 时序图 + 核心代码逐行解释。
 
 ---
@@ -75,19 +77,36 @@ IndexBuilder:
 
 ```go
 func (iBuilder *IndexBuilder) CreateIndexIfNotExists(mmRows *dictpool.Dict, needSecondaryIndex bool) error {
-    // 伪代码：真实函数还包含锁、UUID、index row 组装和二级索引分支。
-    for mmIdx := range mmRows.D {
-        rows := mmRows.D[mmIdx].Value.(*[]influx.Row)
-        for rowIdx := range *rows {
-            if (*rows)[rowIdx].SeriesId != 0 {
-                continue
-            }
-            row := buildIndexRow(mmRows.D[mmIdx].Key, &(*rows)[rowIdx])
-            iBuilder.primaryIndex.WriteRow(row)
-            // needSecondaryIndex 为 true 时，再按 measurement 索引配置写 secondary index。
-        }
-    }
-    return nil
+	...
+	primaryIndex := iBuilder.GetPrimaryIndex()
+	var wg sync.WaitGroup
+	// 1st, create primary index.
+	iRows := getIndexRows()
+	for mmIdx := range mmRows.D {
+		rows, ok := mmRows.D[mmIdx].Value.(*[]influx.Row)
+		if !ok {
+			putIndexRows(iRows)
+			return errno.NewError(errno.CreateIndexFailPointRowType)
+		}
+
+		for rowIdx := range *rows {
+			row := &(*rows)[rowIdx]
+			if row.SeriesId != 0 {
+				continue
+			}
+			...
+			iRow := &(*iRows)[len(*iRows)-1]
+			iRow.Row = row
+			iRow.Wg = &wg
+
+			wg.Add(1)
+			idx := primaryIndex.(*MergeSetIndex)
+			idx.WriteRow(iRow)
+		}
+	}
+	// Wait all rows in the batch finished.
+	wg.Wait()
+	...
 }
 ```
 
@@ -95,11 +114,11 @@ func (iBuilder *IndexBuilder) CreateIndexIfNotExists(mmRows *dictpool.Dict, need
 
 | 行 | 代码 | 作用 |
 |---|------|------|
-| 1 | `kbPool.Get()` | 从缓冲池获取 byte buffer，避免频繁内存分配 |
-| 2 | `buildIndexRow(...)` | 为新 series 生成/填充 TSID 并组装 primary index 写入项 |
-| 3 | `(*rows)[rowIdx].SeriesId != 0` | 已有 TSID，跳过（已索引） |
-| 4 | `primaryIndex.WriteRow(row)` | 投递到 `MergeSetIndex` 的并行写队列 |
-| 5 | `mmRows.D[mmIdx].Value.(*[]influx.Row)` | 从 dictpool 获取 measurement 对应的行数据（基于实际代码修正） |
+| 1 | `iBuilder.GetPrimaryIndex()` | 取得 primary index，实际类型为 `*MergeSetIndex` |
+| 2 | `row.SeriesId != 0` | 已有 TSID，跳过（已索引） |
+| 3 | `iRow.Row = row` / `iRow.Wg = &wg` | 组装 indexRow，并挂上等待计数 |
+| 4 | `idx.WriteRow(iRow)` | 投递到 `MergeSetIndex` 的并行写队列 |
+| 5 | `wg.Wait()` | 等待本批所有行处理完成后再创建二级索引 |
 
 ---
 
@@ -127,7 +146,7 @@ type MergeSetIndex struct {
 	logger           *logger.Logger
 	path             string
 	lock             *string
-	queues           []chan *indexRow       // 并行写入队列，数量 = 2 × CPU 核数
+	queues           []chan *indexRow       // 并行写入队列，数量默认 = CeilToPower2(2 × CPU 核数)，可由 index.concurrency 覆盖
 	labelStoreQueues []chan *TagCol
 
 	bf    []*bloom.BloomFilter             // 分片布隆过滤器，与 queues 一一对应
@@ -152,7 +171,7 @@ type MergeSetIndex struct {
 - `tb *mergeset.Table`：底层 LSM-tree 存储引擎，所有索引条目都存在这里
 - `queues []chan *indexRow`：并行写入队列，每个队列一个 goroutine 消费，避免全局锁竞争
 - `bf []*bloom.BloomFilter`：分片布隆过滤器，用于快速判断 series 是否存在（避免不必要的磁盘查找）
-- `cache *IndexCache`：内存缓存，SeriesKey → TSID 的映射，命中率 ~95%
+- `cache *IndexCache`：内存缓存，SeriesKey → TSID 的映射（命中率为经验值 ~95%，未确认）
 - `deletedTSIDs atomic.Value`：标记删除的 TSID 集合，查询时过滤掉已删除的 series
 - `indexBuilder *IndexBuilder`：负责生成 64-bit UUID 作为 TSID
 
@@ -167,7 +186,7 @@ MergeSetIndex 就像一个"超级通讯录"。想象你有一个巨大的电话�
 假设 4 核 CPU，写入 4 个 series：
 ```
 MergeSetIndex 配置：
-  queues: 8 个 channel（2 × 4 核）
+  queues: 8 个 channel（4 核时 CeilToPower2(2 × 4) = 8）
   bf: 8 个 BloomFilter（与 queues 一一对应）
   cache: HashMap，容量 10000
 
@@ -259,7 +278,7 @@ MergeSet Table 生命周期：
 
 Flush 阶段（rawItems 满了）：
   rawItems → flush → 新建 Part-1（磁盘）
-  Part-1 包含: index.bin + items.bin + lens.bin + metadata.bin
+  Part-1 包含: metaindex.bin + index.bin + items.bin + lens.bin + metadata.json
 
 继续写入：
   AddItems([条目6, 条目7]) → 存入 rawItems（内存）
@@ -288,7 +307,7 @@ sequenceDiagram
     Note over Index: index.bin - 索引块（稠密索引）
     Note over Items: items.bin - 实际数据条目
     Note over Lens: lens.bin - 条目长度
-    Note over Part: metadata.bin - Part 元数据/头信息
+    Note over Part: metadata.json - Part 头信息（partHeader 读写）
 ```
 
 **核心代码** `lib/util/lifted/vm/mergeset/part.go:65-80`：
@@ -306,7 +325,6 @@ type part struct {
 	indexFile fs.MustReadAtCloser  // index.bin - 索引块文件
 	itemsFile fs.MustReadAtCloser  // items.bin - 数据条目文件
 	lensFile  fs.MustReadAtCloser  // lens.bin - 条目长度文件
-	metadataFile fs.MustReadAtCloser // metadata.bin - Part 元数据文件
 
 	idxbCache *indexBlockCache     // 索引块缓存
 	ibCache   *inmemoryBlockCache  // 数据块缓存
@@ -318,7 +336,7 @@ type part struct {
 - `indexFile`：存储索引块（稠密索引），每个 block 内部有序
 - `itemsFile`：存储实际的索引条目数据
 - `lensFile`：存储每个条目的长度，用于定位条目边界
-- `metadataFile`：存储 Part 头信息和辅助元数据，打开 Part 时用于校验和恢复结构
+- `metadata.json`：Part 头信息由 `partHeader` 通过独立的 metadata.json 读写，不在 `part` 结构体内
 - `idxbCache`/`ibCache`：内存缓存，避免重复读取磁盘
 
 **通俗解释**：
@@ -369,7 +387,7 @@ Step 3: 查 items（数据条目）
 
 **通俗解释 — 图书馆的索引卡**：
 
-想象图书馆有几类索引卡，帮你从不同角度找到一本书。对一个含 N 个 tag 的 series，MergeSet 实际写入 `3 + N` 条 primary 条目：
+想象图书馆有几类索引卡，帮你从不同角度找到一本书。对普通路径（非 TagArray）中含 N 个 tag 的 series，MergeSet 实际写入 `3 + N` 条 primary 条目（TagArray 路径见 9.1，按唯一 tag 值对数计算）：
 1. **正向查找卡**（[0x00]前缀）：书名 → 书架号。"《CPU日记》→ 书架1001"。写入时用：给定 seriesKey，快速拿到 TSID。
 2. **反向查找卡**（[0x01]前缀）：书架号 → 书名。"书架1001 → 《CPU日记》"。查询时用：拿到 TSID 后，还原出完整的 seriesKey 用于结果展示。
 3. **标签查找卡**（[0x02]前缀）：标签 → 书架号。"作者=张三 → 书架1001, 1002"。条件查询用：`WHERE host='server1'` 时，通过标签找到所有匹配的 TSID。
@@ -377,39 +395,36 @@ Step 3: 查 items（数据条目）
 
 所有卡片按字节序排列在同一张大表（MergeSet Table）中，查找时用二分法定位。
 
-**核心代码** `engine/index/tsi/mergeset_index.go:841-888` — `decode` 函数创建 primary MergeSet 条目：
+**核心代码** `engine/index/tsi/mergeset_index.go:841-893` — `decode` 函数创建 primary MergeSet 条目：
 
 ```go
-func (idx *MergeSetIndex) decode(ii *mergeindex.IndexItems, seriesKey []byte,
-    name []byte, tags []influx.Tag, tagArray [][]influx.Tag, enableTagArray bool) uint64 {
-    tsid := idx.indexBuilder.GenerateUUID()  // 生成唯一 TSID
+func (idx *MergeSetIndex) decode(ii *mergeindex.IndexItems, seriesKey []byte, name []byte, tags []influx.Tag, tagArray [][]influx.Tag, enableTagArray bool) uint64 {
+	tsid := idx.indexBuilder.GenerateUUID()
+	// Create Series key -> TSID index
+	ii.B = append(ii.B, nsPrefixKeyToTSID)
+	ii.B = append(ii.B, seriesKey...)
+	ii.B = append(ii.B, kvSeparatorChar)
+	ii.B = encoding.MarshalUint64(ii.B, tsid)
+	ii.Next()
 
-    // 条目类型 1: SeriesKey → TSID（正向查找）
-    ii.B = append(ii.B, nsPrefixKeyToTSID)   // 前缀 [0x00]
-    ii.B = append(ii.B, seriesKey...)         // SeriesKey 字节
-    ii.B = append(ii.B, kvSeparatorChar)      // 分隔符
-    ii.B = encoding.MarshalUint64(ii.B, tsid) // TSID (8字节)
-    ii.Next()                                 // 完成一条索引条目
+	// Create TSID -> Series key index
+	ii.B = append(ii.B, nsPrefixTSIDToKey)
+	ii.B = encoding.MarshalUint64(ii.B, tsid)
+	ii.B = append(ii.B, seriesKey...)
+	ii.Next()
 
-    // 条目类型 2: TSID → SeriesKey（反向查找）
-    ii.B = append(ii.B, nsPrefixTSIDToKey)    // 前缀 [0x01]
-    ii.B = encoding.MarshalUint64(ii.B, tsid) // TSID (8字节)
-    ii.B = append(ii.B, seriesKey...)         // SeriesKey 字节
-    ii.Next()
+	// Create Tag -> TSID index
+	compositeKey := kbPool.Get()
+	...
+	compositeKey.B = marshalCompositeTagKey(compositeKey.B[:0], name, nil)
+	ii.B = append(ii.B, nsPrefixTagToTSIDs)
+	ii.B = marshalTagValue(ii.B, compositeKey.B)
+	ii.B = marshalTagValue(ii.B, nil)
+	ii.B = encoding.MarshalUint64(ii.B, tsid)
+	ii.Next()
 
-    // 条目类型 3: Tag → TSID（条件查询，每个 tag 一条）
-    for i := range tags {
-        ii.B = idx.marshalTagToTSIDs(compositeKey.B, ii.B, name, tags[i], tsid)
-        ii.Next()
-    }
-
-    // 条目类型 4: Measurement → TSID（无 tag 条件查询）
-    compositeKey.B = marshalCompositeTagKey(compositeKey.B[:0], name, nil)
-    ii.B = append(ii.B, nsPrefixTagToTSIDs)   // 前缀 [0x02]
-    ii.B = marshalTagValue(ii.B, compositeKey.B) // measurement 名
-    ii.B = marshalTagValue(ii.B, nil)          // 空 tag（表示无条件）
-    ii.B = encoding.MarshalUint64(ii.B, tsid)  // TSID
-    ii.Next()
+	kbPool.Put(compositeKey)
+	return tsid
 }
 ```
 
@@ -421,9 +436,10 @@ TSID -> seriesKey       1 条
 每个 tag -> TSID        tag 数量 N 条
 measurement 空 tag      1 条
 
-总条数 = 3 + tag 数
+总条数 = 3 + tag 数（普通路径）
 例如 cpu,host=s1,region=us:
   3 + 2 = 5 条
+TagArray 路径：3 + 唯一 (tagKey,tagValue) 对数（见 9.1）
 ```
 
 **逐行解释**：
@@ -502,25 +518,22 @@ MergeSet Table 中存储的索引条目（按 Key 排序）：
 │ 用途：WHERE host='server1' 这类条件查询                                          │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │ Tag 索引: host=server1                                                          │
-│ Key: [0x02] + "cpu" + [0x01] + "host" + [0x01] + "server1"                     │
+│ Key: [0x02] + [0xFE] + [0x03] + "cpu" + "host" + [0x01] + "server1" + [0x01]    │
 │ Value: 1001                                                                     │
 │                                                                                 │
-│ Key: [0x02] + "cpu" + [0x01] + "host" + [0x01] + "server1"                     │
-│ Value: 1002  ← 同一个 tag 组合可能对应多个 TSID！                                │
-│                                                                                 │
 │ Tag 索引: host=server2                                                          │
-│ Key: [0x02] + "cpu" + [0x01] + "host" + [0x01] + "server2"                     │
+│ Key: [0x02] + [0xFE] + [0x03] + "cpu" + "host" + [0x01] + "server2" + [0x01]    │
 │ Value: 1002                                                                     │
 │                                                                                 │
 │ Tag 索引: region=us                                                             │
-│ Key: [0x02] + "cpu" + [0x01] + "region" + [0x01] + "us"                        │
+│ Key: [0x02] + [0xFE] + [0x03] + "cpu" + "region" + [0x01] + "us" + [0x01]       │
 │ Value: 1001                                                                     │
 │                                                                                 │
-│ Key: [0x02] + "cpu" + [0x01] + "region" + [0x01] + "us"                        │
-│ Value: 1002                                                                     │
+│ Key: [0x02] + [0xFE] + [0x03] + "cpu" + "region" + [0x01] + "us" + [0x01]       │
+│ Value: 1002  ← 同一个 tag 值可以对应多个 TSID                                   │
 │                                                                                 │
 │ Tag 索引: host=server1 (mem)                                                    │
-│ Key: [0x02] + "mem" + [0x01] + "host" + [0x01] + "server1"                     │
+│ Key: [0x02] + [0xFE] + [0x03] + "mem" + "host" + [0x01] + "server1" + [0x01]    │
 │ Value: 1003                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────┘
 
@@ -528,13 +541,13 @@ MergeSet Table 中存储的索引条目（按 Key 排序）：
 │ 条目类型 4: Measurement → TSID（measurement 级索引）                              │
 │ 用途：无 tag 条件的查询（如 SELECT * FROM cpu）                                   │
 ├─────────────────────────────────────────────────────────────────────────────────┤
-│ Key: [0x02] + "cpu" + [0xFE] + [0x00]                                          │
+│ Key: [0x02] + [0xFE] + [0x03] + "cpu" + [0x01] + [0x01]                         │
 │ Value: 1001                                                                     │
 │                                                                                 │
-│ Key: [0x02] + "cpu" + [0xFE] + [0x00]                                          │
+│ Key: [0x02] + [0xFE] + [0x03] + "cpu" + [0x01] + [0x01]                         │
 │ Value: 1002                                                                     │
 │                                                                                 │
-│ Key: [0x02] + "mem" + [0xFE] + [0x00]                                          │
+│ Key: [0x02] + [0xFE] + [0x03] + "mem" + [0x01] + [0x01]                         │
 │ Value: 1003                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -580,10 +593,10 @@ Step 3: 写入数据文件
     Value = 99.5
 
 Step 4: 查询时通过索引找到 TSID，再通过 TSID 读取数据
-  WHERE host='server1' → TSID=[1001, 1002, 1003]
+  WHERE host='server1' → TSID=[1001, 1003]
   AND region='us'      → TSID=[1001, 1002]
-  交集                 → TSID=[1001, 1002]
-  读取 TSSP 文件中 series 1001 和 1002 的数据
+  交集                 → TSID=[1001]
+  读取 TSSP 文件中 series 1001 的数据
 ```
 
 ---
@@ -596,6 +609,7 @@ Step 4: 查询时通过索引找到 TSID，再通过 TSID 读取数据
 sequenceDiagram
     participant Shard as shard.WriteRows()
     participant Storage as storage.WriteIndex()
+    participant IB as IndexBuilder
     participant MSI as MergeSetIndex
     participant Cache as SeriesKeyToTSIDCache
     participant BF as BloomFilter
@@ -604,7 +618,9 @@ sequenceDiagram
     participant Table as MergeSet Table
 
     Shard->>Storage: WriteIndex(indexBuilder, rows)
-    Storage->>MSI: CreateIndexIfNotExists(mmRows)
+    Storage->>IB: CreateIndexIfNotExists(mmRows, needSecondaryIndex)
+    IB->>MSI: WriteRow(indexRow)（投递到队列）
+    Note over MSI: 队列 goroutine 调用 CreateIndexIfNotExistsByRow()
 
     loop 遍历每一行数据
         MSI->>MSI: 提取 seriesKey<br/>"cpu,host=server1"
@@ -617,7 +633,7 @@ sequenceDiagram
             Cache-->>MSI: TSID=1001
             MSI->>MSI: 检查 deletedTSIDs
             alt 未删除
-                MSI-->>Shard: TSID=1001（最快路径）
+                MSI->>MSI: 填充 row.SeriesId=1001（最快路径）
             else 已删除
                 MSI->>BF: 继续查找
             end
@@ -649,15 +665,17 @@ sequenceDiagram
 
             MSI->>MSI: createIndexes(seriesKey, name, tags)
 
-            Note over MSI: 写入 primary MergeSet 条目，条数=3+tag数
+            Note over MSI: 写入 primary MergeSet 条目，条数=3+tag数（普通路径）
             MSI->>Table: (1) [0x00]+seriesKey → TSID<br/>正向查找
             MSI->>Table: (2) [0x01]+TSID → seriesKey<br/>反向查找
             MSI->>Table: (3) [0x02]+tag → TSID<br/>条件查询（每个 tag 一条）<br/>(4) measurement 空 tag → TSID
 
             Table->>Table: tb.AddItems(items)<br/>写入内存 Part
-            MSI-->>Shard: TSID=3001
+            MSI->>MSI: 填充 row.SeriesId=3001
         end
     end
+    IB->>IB: wg.Wait()<br/>检查 row.Err
+    Storage-->>Shard: wait()
 ```
 
 **通俗解释 — 快递分拣流程**：
@@ -767,13 +785,15 @@ func (idx *MergeSetIndex) WriteRow(row *indexRow) {
 想象一个银行有多个窗口办理业务。每个客户（seriesKey）根据自己的身份证号（hash 值）被分配到固定的窗口。这样：
 - **同一个人**总是去同一个窗口，避免两个窗口同时处理同一个人的业务（并发冲突）
 - **不同的人**可以去不同窗口，实现并行处理（提高吞吐量）
-- 窗口数量 = 2 × CPU 核数，充分利用多核性能
+- 窗口数量默认 = CeilToPower2(2 × CPU 核数)（可由 `index.concurrency` 覆盖），充分利用多核性能
 
 ### 3.3 CreateIndexIfNotExists — 批量索引创建
 
+> 说明：tsstore 的常规写入链路是 `IndexBuilder.CreateIndexIfNotExists` → `WriteRow` 队列 → `CreateIndexIfNotExistsByRow`（见 3.1/3.2）。本节的 `MergeSetIndex.CreateIndexIfNotExists` 是遗留的批量接口，当前生产代码只在测试中调用，不在写入热路径上。
+
 ```mermaid
 sequenceDiagram
-    participant Caller as WriteIndex()
+    participant Caller as 批量调用方（仅测试/遗留路径）
     participant CIF as CreateIndexIfNotExists()
     participant Pool as kbPool (缓冲池)
     participant CI as createIndexesIfNotExists()
@@ -805,7 +825,7 @@ func (idx *MergeSetIndex) CreateIndexIfNotExists(mmRows *dictpool.Dict) error {
 	defer kbPool.Put(vname)
 
 	var err error
-	idx.mu.Lock()                           // 加写锁（保护 BloomFilter 和 Table）
+	idx.mu.Lock()                           // 加写锁（仅此批量接口；热路径不加此锁）
 	defer idx.mu.Unlock()
 
 	for mmIdx := range mmRows.D {           // 遍历每个 measurement
@@ -833,7 +853,7 @@ func (idx *MergeSetIndex) CreateIndexIfNotExists(mmRows *dictpool.Dict) error {
 
 **逐行解释**：
 - `kbPool.Get()`：从缓冲池获取 byte buffer，避免频繁内存分配（sync.Pool）
-- `idx.mu.Lock()`：加写锁，因为 BloomFilter 和 Table 的写入不是并发安全的
+- `idx.mu.Lock()`：该批量接口加写锁；它不在 tsstore 热路径上，热路径的 `CreateIndexIfNotExistsByRow` 不取此锁（见 11.1）
 - `if (*rows)[rowIdx].SeriesId != 0`：如果已有 TSID，说明这个 series 已经索引过，跳过
 - `createIndexesIfNotExists(vkey.B, vname.B, ...)`：核心逻辑——查找或创建索引
 
@@ -950,11 +970,11 @@ func (idx *MergeSetIndex) createIndexesIfNotExists(vkey, vname []byte, tags []in
 **通俗解释**：
 这个函数就像"查找或创建新用户"。想象一个会员系统：
 1. **查会员卡**（getSeriesIdBySeriesKey）：先看看这个人是不是已经是会员
-   - 先查记忆（缓存）→ 再查黑名单（BloomFilter）→ 最后查档案室（磁盘）
+   - 先查记忆（缓存）→ 再查布告栏（BloomFilter）→ 最后查档案室（磁盘）
 2. **如果是会员**（tsid != 0）：直接返回会员号，不用再登记
 3. **如果是新用户**：
    - 检查会员数量上限（SeriesLimited）
-   - 在黑名单上记一笔（AddNewSeriesKey），下次查得更快
+   - 在布告栏上记一笔（AddNewSeriesKey），下次查得更快
    - 创建新的会员档案（createIndexes）
    - 把会员号记到记忆里（defer 写回缓存）
 
@@ -986,7 +1006,7 @@ sequenceDiagram
     end
 
     Note over Decode: 条目 4: Measurement 索引
-    Decode->>Decode: [0x02] + name + [0xFE] → TSID（基于实际代码修正）
+    Decode->>Decode: [0x02] + [0xFE] + len(name) + name + [0x01] + [0x01] → TSID
 
     Decode-->>CI: TSID=3001
 
@@ -1037,12 +1057,14 @@ func (idx *MergeSetIndex) decode(ii *mergeindex.IndexItems, seriesKey []byte, na
 		tagMap := make(map[string]map[string]struct{})
 		for _, tags := range tagArray {
 			for i := range tags {
-				if len(tags[i].Value) == 0 { continue }
+				if len(tags[i].Value) == 0 {
+					continue
+				}
 				if _, ok := tagMap[tags[i].Key]; !ok {
 					tagMap[tags[i].Key] = make(map[string]struct{})
 				}
 				if _, ok := tagMap[tags[i].Key][tags[i].Value]; ok {
-					continue                   // 去重
+					continue
 				} else {
 					tagMap[tags[i].Key][tags[i].Value] = struct{}{}
 				}
@@ -1075,7 +1097,7 @@ func (idx *MergeSetIndex) decode(ii *mergeindex.IndexItems, seriesKey []byte, na
 - **条目 1**：`[0x00] + seriesKey + [0x02] + TSID`——正向查找，给定 seriesKey 找 TSID
 - **条目 2**：`[0x01] + TSID + seriesKey`——反向查找，给定 TSID 找 seriesKey
 - **条目 3**：每个 tag 生成一条 `[0x02] + compositeKey + tagValue + TSID`——用于 WHERE host='server1' 这类条件查询
-- **条目 4**：`[0x02] + name + [0xFE] + [0x00] + TSID`——measurement 级索引，用于无 tag 条件的查询（基于实际代码修正）
+- **条目 4**：`[0x02] + [0xFE] + len(name) + name + [0x01] + [0x01] + TSID`——measurement 级索引，用于无 tag 条件的查询
 - `tb.AddItems(ii.Items)`：所有条目一次性写入 Table 的 rawItems
 
 **通俗解释**：
@@ -1193,16 +1215,16 @@ func (idx *MergeSetIndex) getSeriesIdBySeriesKey(seriesKeyWithVersion []byte) (u
 ```
 
 **逐行解释**：
-- `cache.GetTSIDFromTSIDCache(&tsid, vkey)`：查内存缓存（HashMap），命中率 ~95%
+- `cache.GetTSIDFromTSIDCache(&tsid, vkey)`：查内存缓存（workingsetcache，命中率为经验值 ~95%，未确认）
 - `deletedTSIDs.Has(tsid)`：即使缓存命中，也要检查是否已删除（标记删除机制）
 - `bfExist() && !CheckSeriesKeyExist(vkey)`：BloomFilter 判断"一定不存在"时，直接返回 0，避免磁盘 IO
 - `defer func(id *uint64)`：用 defer 确保找到 TSID 后自动写回缓存（不管哪一级找到的）
 - `is.getTSIDBySeriesKey(vkey)`：去 MergeSet 磁盘查找（最慢路径）
 
 **通俗解释**：
-三级查找就像"找人"的过程：
+三级查找就像"找人"的过程（延迟为经验值，未确认）：
 1. **第一级：问身边的人**（缓存）——"你认识张三吗？" 如果认识，直接告诉你（最快，~1纳秒）
-2. **第二级：查黑名单**（BloomFilter）——"张三在黑名单上吗？" 如果在，肯定找不到（快速排除，~10纳秒）
+2. **第二级：查布告栏**（BloomFilter）——"张三在不在名单上？" 说"不在"就一定不在（快速排除，~10纳秒）；说"可能在"才继续查磁盘
 3. **第三级：去档案室查**（磁盘）——翻箱倒柜找档案（最慢，~100微秒）
 
 关键是：找到后会记在心里（写回缓存），下次再找同一个人就不用去档案室了！
@@ -1340,16 +1362,6 @@ func (idx *MergeSetIndex) CheckSeriesKeyExist(key []byte) bool {
 
 // AddNewSeriesKey 将新 seriesKey 加入 BloomFilter
 func (idx *MergeSetIndex) AddNewSeriesKey(key []byte) {
-
-**通俗解释**：
-BloomFilter 就像一个"黑名单系统"。想象一个小区的门禁：
-1. **分片管理**：小区有多个门（BF 分区），每个门有自己的黑名单
-2. **快速判断**：保安（BloomFilter）可以快速判断"这个人是不是业主"
-   - 如果保安说"不是"：那肯定不是（100% 准确）
-   - 如果保安说"可能是"：那可能是，也可能不是（有误判）
-3. **无锁操作**：每个门独立管理自己的黑名单，不需要协调
-
-这样写入时，先问保安"这个 series 存不存在"，如果保安说"肯定不存在"，就不用去档案室（磁盘）查了！
 	if !idx.bfExist() {
 		return
 	}
@@ -1357,6 +1369,16 @@ BloomFilter 就像一个"黑名单系统"。想象一个小区的门禁：
 	idx.bf[partId].Add(key)                      // 添加到对应分片的 BF
 }
 ```
+
+**通俗解释**：
+BloomFilter 就像一个"门禁名单系统"。想象一个小区的门禁：
+1. **分片管理**：小区有多个门（BF 分区），每个门有自己的名单
+2. **快速判断**：保安（BloomFilter）可以快速判断"这个人是不是业主"
+   - 如果保安说"不是"：那肯定不是（100% 准确）
+   - 如果保安说"可能是"：那可能是，也可能不是（有误判）
+3. **无锁操作**：每个门独立管理自己的名单，不需要协调
+
+这样写入时，先问保安"这个 series 存不存在"，如果保安说"肯定不存在"，就不用去档案室（磁盘）查了！
 
 **逐行解释**：
 - `meta.HashID(key) & queueSizeMask`：与 WriteRow 的队列路由使用相同的 hash 和 mask
@@ -1373,15 +1395,15 @@ sequenceDiagram
     participant BF0 as BF 分区 0
     participant BF1 as BF 分区 1
 
-    Flush->>Dir: MkdirAll(bloom_filter_dir)
+    Flush->>Dir: MkdirAll(<index path>/mergeset/bloomfilter)
     Flush->>Flush: wg.Add(len(queues))
 
     par 并行 flush
         Flush->>BF0: bf[0].WriteTo(buffer)
-        BF0->>Dir: FlushBloomFilter(0, data)
+        BF0->>Dir: FlushBloomFilter(0, data)<br/>写入 1_mergeset.bf
     and
         Flush->>BF1: bf[1].WriteTo(buffer)
-        BF1->>Dir: FlushBloomFilter(1, data)
+        BF1->>Dir: FlushBloomFilter(1, data)<br/>写入 2_mergeset.bf
     end
 
     Flush->>Flush: wg.Wait()
@@ -1418,7 +1440,7 @@ func (idx *MergeSetIndex) flushBloomFilter() {
 
 			err = mergeset.FlushBloomFilter(i, b, dirPath, buffer, lock)  // 写入磁盘
 			if err != nil {
-				idx.logger.Error("flush mergeSet bloom filter file error", zap.Error(err))
+				idx.logger.Error("flush mergeSet bloom filter file error", zap.Error(err), zap.String("path", dirPath))
 			}
 		}(i)
 	}
@@ -1432,7 +1454,7 @@ func (idx *MergeSetIndex) flushBloomFilter() {
 - 这样进程重启后 BloomFilter 不会丢失
 
 **通俗解释**：
-BloomFilter Flush 就像"定期备份黑名单"。小区的保安（BloomFilter）每天都会把最新的黑名单抄写一份，存到档案室（磁盘）。这样即使保安换班了（进程重启），新保安也能从档案室读出黑名单，继续工作。
+BloomFilter Flush 就像"定期备份名单"。小区的保安（BloomFilter）每天都会把最新的名单抄写一份，存到档案室（磁盘）。这样即使保安换班了（进程重启），新保安也能从档案室读出名单，继续工作。
 
 **具体例子**：
 
@@ -1446,20 +1468,20 @@ BloomFilter Flush 就像"定期备份黑名单"。小区的保安（BloomFilter�
   bf[7]: 包含 1250 个 seriesKey（hash & 7 = 7 的）
 
 Flush 过程：
-  1. 创建目录：data/db/0/measurements/cpu/index/bloom_filter/
+  1. 创建目录：<index path>/mergeset/bloomfilter/
   2. 并行 flush 8 个分片：
-     goroutine 0: bf[0].WriteTo() → 写入 bloom_filter_0.bin
-     goroutine 1: bf[1].WriteTo() → 写入 bloom_filter_1.bin
+     goroutine 0: bf[0].WriteTo() → 写入 1_mergeset.bf
+     goroutine 1: bf[1].WriteTo() → 写入 2_mergeset.bf
      ...
-     goroutine 7: bf[7].WriteTo() → 写入 bloom_filter_7.bin
+     goroutine 7: bf[7].WriteTo() → 写入 8_mergeset.bf
   3. wg.Wait() — 等待全部完成
 
 磁盘文件：
-  bloom_filter/
-  ├── bloom_filter_0.bin  (1250 个 key)
-  ├── bloom_filter_1.bin  (1250 个 key)
+  bloomfilter/
+  ├── 1_mergeset.bf  (1250 个 key)
+  ├── 2_mergeset.bf  (1250 个 key)
   ├── ...
-  └── bloom_filter_7.bin  (1250 个 key)
+  └── 8_mergeset.bf  (1250 个 key)
 
 重启后加载：
   启动时读取 8 个文件 → 恢复 bf[0..7] → 继续工作
@@ -1488,32 +1510,31 @@ sequenceDiagram
     Parser->>Filter1: tagFilter 1: host=server1
     Parser->>Filter2: tagFilter 2: region=us
 
-    par 并行查找
-        Search->>Filter1: getTSIDsByTagFilter()
-        Filter1->>Cache: 查找缓存
-        alt 缓存命中
-            Cache-->>Filter1: TSIDs=[100, 101, 103]
-        else 缓存未命中
-            Filter1->>MS: Seek([0x02]cpu\x01host)
-            MS->>MS: 二分查找定位
-            loop 遍历匹配条目
-                MS->>MS: NextItem()
-                MS->>MS: 检查前缀匹配
-                MS->>MS: 检查 tagValue 匹配 =, !=, =~, !~
-            end
-            MS-->>Filter1: TSIDs=[100, 101, 103]
-            Filter1->>Cache: 写入缓存
+    Note over Search: 按 cost 升序排序，先查代价小的
+    Search->>Filter1: searchTSIDsWithTagFilter()
+    Filter1->>Cache: 查找缓存
+    alt 缓存命中
+        Cache-->>Filter1: TSIDs=[100, 101, 103]
+    else 缓存未命中
+        Filter1->>MS: Seek([0x02]+[0xFE]+0x03+"cpu"+"host"+[0x01])
+        MS->>MS: 二分查找定位
+        loop 遍历匹配条目
+            MS->>MS: NextItem()
+            MS->>MS: 检查前缀匹配
+            MS->>MS: 检查 tagValue 匹配 =, !=, =~, !~
         end
-    and
-        Search->>Filter2: getTSIDsByTagFilter()
-        Filter2->>MS: Seek([0x02]cpu\x01region)
-        MS-->>Filter2: TSIDs=[100, 102, 103]
+        MS-->>Filter1: TSIDs=[100, 101, 103]
+        Filter1->>Cache: 写入缓存
     end
+
+    Search->>Filter2: searchTSIDsWithTagFilter()
+    Filter2->>MS: Seek([0x02]+[0xFE]+0x03+"cpu"+"region"+[0x01])
+    MS-->>Filter2: TSIDs=[100, 102, 103]
 
     Search->>Result: A ∩ B = [100, 103] AND 交集
 
     loop 对每个 TSID
-        Search->>MS: getSeriesKeyByTSID(TSID)
+        Search->>MS: searchSeriesKey(TSID)
         MS-->>Search: seriesKey
     end
 
@@ -1524,46 +1545,71 @@ sequenceDiagram
 
 查询 `WHERE host='server1' AND region='us'` 就像在快递仓库里找同时满足两个条件的包裹：
 1. **拆条件**：把 AND 拆成两个独立条件——"标签A=server1"和"标签B=us"
-2. **并行查**：两个快递员同时出发，一个查"标签A"的索引卡，一个查"标签B"的索引卡
-3. **取交集**：两个快递员各自拿到一堆包裹编号，取交集就是同时满足两个条件的
+2. **顺序查**：先估算每个条件的代价，代价小（结果集小）的先查，再用结果逐个与后面的条件取交集
+3. **取交集**：两个条件各自拿到一堆包裹编号，取交集就是同时满足两个条件的
 4. **还原信息**：拿到编号后，去反向索引卡查出完整的包裹信息（seriesKey）
 
-**核心代码** `engine/index/tsi/search.go:441-538`：
+**核心代码** `engine/index/tsi/search.go:441-539`：
 
 ```go
 func (is *indexSearch) seriesByTagFilters(name []byte) (index.SeriesIDIterator, error) {
-    // 快速路径：只有一个 tagFilter，直接查
-    if len(is.tfs) == 1 {
-        return is.seriesByOneTagFilter(name)
-    }
+	// 快速路径：只有一个 tagFilter，直接查
+	if len(is.tfs) == 1 {
+		return is.seriesByOneTagFilter(name)
+	}
 
-    // 按代价排序：便宜的先查（结果集小的先查，减少交集计算量）
-    tfcosts := make([]tagFilterWithCost, len(is.tfs))
-    for i := 0; i < len(is.tfs); i++ {
-        tfcosts[i].tf = &is.tfs[i]
-        tfcosts[i].cost = is.getTagFilterCost(name, &is.tfs[i])
-    }
-    is.sortTagFilterWithCost(tfcosts)
+	// 按代价排序：cost 小的先查（结果集小的先查，减少交集计算量）
+	tfcosts := make([]tagFilterWithCost, len(is.tfs))
+	for i := 0; i < len(is.tfs); i++ {
+		tfcosts[i].tf = &is.tfs[i]
+		tfcosts[i].cost = is.getTagFilterCost(name, &is.tfs[i])
+	}
+	is.sortTagFilterWithCost(tfcosts)
 
-    // 选起始 filter：结果集最小的作为起点
-    var set *uint64set.Set
-    for i, tfcost := range tfcosts {
-        this, cost, err := is.searchTSIDsWithTagFilter(tfcost.tf)
-        tfcost.set = this
-        if this.Len() < maxIndexMetrics {
-            set = this  // 找到结果集足够小的，作为起点
-            break
-        }
-    }
+	// 选起始 filter：找到第一个结果集足够小的作为起点
+	var err error
+	var set *uint64set.Set
+	lastTfCosts := tfcosts[:0]
+	startTfLoc := len(tfcosts)
+	for i, tfcost := range tfcosts {
+		this, cost, err := is.searchTSIDsWithTagFilter(tfcost.tf)
+		...
+		tfcost.set = this
+		if this.Len() < maxIndexMetrics {
+			lastTfCosts = append(lastTfCosts, tfcosts[i+1:]...)
+			set = this
+			is.storeTagFilterCost(name, tfcost.tf, cost)
+			startTfLoc = i
+			break
+		}
+		...
+	}
+	if startTfLoc == len(tfcosts) {
+		// 所有 tagFilter 结果集都太大，回退到按时间范围全量扫描
+		set, err = is.searchTSIDsByTimeRange(name)
+		...
+	}
+	...
 
-    // 与剩余 filter 取交集
-    for i, tfcost := range tfcosts {
-        set.Intersect(tfcost.set)  // AND 交集
-        if set.Len() == 0 {
-            break  // 交集为空，提前退出
-        }
-    }
-    return index.NewSeriesIDSetIterator(index.NewSeriesIDSetWithSet(set)), nil
+	// 与剩余 filter 顺序取交集；代价/结果集比值过高时改用 prune
+	tfcosts = lastTfCosts
+	for i, tfcost := range tfcosts {
+		if (tfcost.cost/int64(set.Len()) > int64(pruneThreshold)) ||
+			(tfcost.tf.IsFilterEmptyValue() && set.Len() < is.idx.config.TagScanPruneThreshold) {
+			set, err = is.doPrune(set, tfs)
+			break
+		}
+		if tfcost.set.Len() > 0 {
+			set.Intersect(tfcost.set)
+			...
+			continue
+		}
+		this, cost, err := is.searchTSIDsWithTagFilter(tfcost.tf)
+		...
+		set.Intersect(this)
+		...
+	}
+	return index.NewSeriesIDSetIterator(index.NewSeriesIDSetWithSet(set)), nil
 }
 ```
 
@@ -1576,8 +1622,10 @@ func (is *indexSearch) seriesByTagFilters(name []byte) (index.SeriesIDIterator, 
 | 3 | `sortTagFilterWithCost()` | 按代价升序排列，便宜的先查 |
 | 4 | `searchTSIDsWithTagFilter()` | 执行单个 tagFilter 的查找（缓存→BF→磁盘） |
 | 5 | `this.Len() < maxIndexMetrics` | 结果集小于阈值，适合作为起始集 |
-| 6 | `set.Intersect(tfcost.set)` | 两个有序集合取交集，O(n+m) |
-| 7 | `set.Len() == 0` | 交集为空，说明没有 series 同时满足所有条件 |
+| 6 | `set.Intersect(tfcost.set)` | 桶化集合按桶归并求交（`uint64set.Set`），不是双指针 |
+| 7 | `searchTSIDsByTimeRange(name)` | 所有过滤器结果集都过大时，回退到按时间范围全量扫描 |
+| 8 | `is.doPrune(set, tfs)` | 代价/结果集比值过高时，反查 seriesKey 剪枝 |
+| 9 | `set.Len() == 0` | 交集为空，说明没有 series 同时满足所有条件 |
 
 ### 5.1.1 查询实战：用具体数据走一遍完整流程
 
@@ -1606,33 +1654,32 @@ tagFilter[1]: name="cpu", key="region", value="us"
 ```
 tagFilter[0] (host=server1):
   compositeKey = marshalCompositeTagKey("cpu", "host")
-               = [0x00] + len("cpu") + "cpu" + "host"
-               = [0x00, 0x03, 0x63, 0x70, 0x75, 0x68, 0x6F, 0x73, 0x74]
+               = [0xFE] + len("cpu") + "cpu" + "host"
+               = [0xFE, 0x03, 0x63, 0x70, 0x75, 0x68, 0x6F, 0x73, 0x74]
                  (前缀)   (3)     (c)    (p)    (u)    (h)    (o)    (s)    (t)
 
   prefix = [0x02] + marshalTagValue(compositeKey)
-         = [0x02] + [长度] + [compositeKey]
-         = [0x02, 0x09, 0x00, 0x03, 0x63, 0x70, 0x75, 0x68, 0x6F, 0x73, 0x74]
+         = [0x02] + [compositeKey] + [0x01]
+         = [0x02, 0xFE, 0x03, 0x63, 0x70, 0x75, 0x68, 0x6F, 0x73, 0x74, 0x01]
 
 tagFilter[1] (region=us):
-  compositeKey = [0x00, 0x03, 0x63, 0x70, 0x75, 0x72, 0x65, 0x67, 0x69, 0x6F, 0x6E]
+  compositeKey = [0xFE, 0x03, 0x63, 0x70, 0x75, 0x72, 0x65, 0x67, 0x69, 0x6F, 0x6E]
   prefix = [0x02, ...]
 ```
 
-**Step 3: 并行执行 Seek + 遍历**
+**Step 3: 顺序执行 Seek + 遍历**
 
 ```
 tagFilter[0] (host=server1) 在 MergeSet 中的查找过程：
 
   Seek(prefix) → 定位到第一个 >= prefix 的条目
 
-  MergeSet 中的 [0x02] 条目（按字节序排列）：
+  MergeSet 中的 [0x02] 条目（按字节序排列；省略 compositeKey 的 [0xFE]+len 前缀）：
     [0x02]+"cpu"+"host"+"server1" → 1001  ← 匹配！
-    [0x02]+"cpu"+"host"+"server1" → 1002  ← 匹配！（同一个 tag 值对应多个 TSID）
     [0x02]+"cpu"+"host"+"server2" → 1002  ← 不匹配（value 不同）
     [0x02]+"cpu"+"region"+"us"    → 1001  ← 前缀不匹配，停止遍历
 
-  结果：TSIDs = [1001, 1002]
+  结果：TSIDs = [1001]
 
 tagFilter[1] (region=us) 在 MergeSet 中的查找过程：
 
@@ -1650,14 +1697,14 @@ tagFilter[1] (region=us) 在 MergeSet 中的查找过程：
 
 ```
 两个 tagFilter 的结果：
-  host='server1'  → TSIDs = [1001, 1002]
+  host='server1'  → TSIDs = [1001]
   region='us'     → TSIDs = [1001, 1002]
 
-AND 交集（双指针法）：
-  i=0, j=0: a[0]=1001 == b[0]=1001 → 加入结果，i++, j++
-  i=1, j=1: a[1]=1002 == b[1]=1002 → 加入结果，i++, j++
+AND 交集：
+  1001 同时出现在两个集合中 → 加入结果
+  1002 只在 region='us' 中 → 丢弃
 
-  最终结果：TSIDs = [1001, 1002]
+  最终结果：TSIDs = [1001]
 ```
 
 **Step 5: 还原 seriesKey**
@@ -1666,7 +1713,6 @@ AND 交集（双指针法）：
 对每个 TSID，通过反向索引 ([0x01] 前缀) 还原 seriesKey：
 
   TSID=1001 → 查找 [0x01]+1001 → "cpu,host=server1,region=us"
-  TSID=1002 → 查找 [0x01]+1002 → "cpu,host=server2,region=us"
 ```
 
 **Step 6: 根据 TSID 读取数据**
@@ -1674,7 +1720,6 @@ AND 交集（双指针法）：
 ```
 现在知道了需要读取哪些 series 的数据：
   TSID=1001 → TSSP 文件中 series 1001 的所有数据
-  TSID=1002 → TSSP 文件中 series 1002 的所有数据
 
 查询执行器会：
   1. 根据时间范围定位到哪些 TSSP 文件（通过 Trailer 中的 MinTime/MaxTime）
@@ -1697,30 +1742,23 @@ sequenceDiagram
     Parse->>F1: name="cpu", key="host", value="server1"
     Parse->>F2: name="cpu", key="region", value="us"
 
-    Note over F1,F2: ===== Step 2-3: 构造前缀 + 并行 Seek =====
+    Note over F1,F2: ===== Step 2-3: 构造前缀 + 顺序 Seek =====
 
-    par 并行查找
-        F1->>MS: Seek([0x02]+"cpu"+"host")
-        MS-->>F1: TSIDs=[1001, 1002]
-    and
-        F2->>MS: Seek([0x02]+"cpu"+"region")
-        MS-->>F2: TSIDs=[1001, 1002]
-    end
+    F1->>MS: Seek([0x02]+[0xFE]+0x03+"cpu"+"host"+[0x01])
+    MS-->>F1: TSIDs=[1001]
+    F2->>MS: Seek([0x02]+[0xFE]+0x03+"cpu"+"region"+[0x01])
+    MS-->>F2: TSIDs=[1001, 1002]
 
     Note over SQL: ===== Step 4: AND 交集 =====
-    SQL->>SQL: [1001, 1002] ∩ [1001, 1002] = [1001, 1002]
+    SQL->>SQL: [1001] ∩ [1001, 1002] = [1001]
 
     Note over SQL: ===== Step 5: 还原 seriesKey =====
-    SQL->>MS: getSeriesKeyByTSID(1001)
+    SQL->>MS: searchSeriesKey(1001)
     MS-->>SQL: "cpu,host=server1,region=us"
-    SQL->>MS: getSeriesKeyByTSID(1002)
-    MS-->>SQL: "cpu,host=server2,region=us"
 
     Note over SQL: ===== Step 6: 读取数据 =====
     SQL->>Data: 读取 TSID=1001 的数据
     Data-->>SQL: [(t1, 99.5), (t2, 88.3), …]
-    SQL->>Data: 读取 TSID=1002 的数据
-    Data-->>SQL: [(t1, 77.1), (t2, 66.2), …]
 
     SQL->>SQL: 聚合计算 mean(value)
     SQL-->>SQL: 返回结果
@@ -1734,14 +1772,14 @@ sequenceDiagram
 传统方式（全表扫描）：
   1. 读取 measurement="cpu" 的所有数据（假设 100 万个 series）
   2. 对每个 series 检查 host 和 region 条件
-  3. 只有 2 个 series 满足条件
-  → 浪费了 99.9998% 的 IO
+  3. 只有 1 个 series 满足条件
+  → 浪费了 99.9999% 的 IO
 
 索引方式（openGemini）：
   1. 查 BloomFilter → 快速排除不存在的 series
   2. 查 MergeSet 索引 → 直接找到满足条件的 TSID
-  3. 只读取这 2 个 series 的数据
-  → 只需要 2 次数据读取，IO 节省 99.9998%
+  3. 只读取这 1 个 series 的数据
+  → 只需要 1 次数据读取，IO 节省 99.9999%
 ```
 
 **通俗解释 — 从"大海捞针"到"精准定位"**：
@@ -1809,26 +1847,25 @@ func (tf *tagFilter) Init(name, key, value []byte, isNegative, isRegexp bool) er
 	tf.name = append(tf.name[:0], name...)
 	tf.isNegative = isNegative
 	tf.isRegexp = isRegexp
-
-	// 构造 Seek 前缀
+	...
 	compositeKey := kbPool.Get()
-	compositeKey.B = marshalCompositeTagKey(compositeKey.B[:0], name, key)  // "cpu" + len + "host"
-	tf.prefix = append(tf.prefix, nsPrefixTagToTSIDs)                       // [0x02]
-	tf.prefix = marshalTagValue(tf.prefix, compositeKey.B)                  // + compositeKey + 分隔符
+	compositeKey.B = marshalCompositeTagKey(compositeKey.B[:0], name, key)
+	tf.prefix = append(tf.prefix, nsPrefixTagToTSIDs)
+	tf.prefix = marshalTagValue(tf.prefix, compositeKey.B)
 	kbPool.Put(compositeKey)
 
-	// 编译正则表达式
 	if config.GetStoreConfig().EnablePerlRegrep {
-		rcv, err := tf.OpGeminiRegrep()        // Perl 风格正则
-		// ...
-		tf.orSuffixes = rcv.orValues           // OR 展开值
-		tf.reSuffixMatch = rcv.reMatch          // 匹配函数
-		tf.matchCost = rcv.reCost               // 匹配代价
+		rcv, err := tf.OpGeminiRegrep()
+		...
+		tf.orSuffixes = append(tf.orSuffixes[:0], rcv.orValues...)
+		tf.reSuffixMatch = rcv.reMatch
+		tf.matchCost = rcv.reCost
+		...
 	} else {
-		rcv, err := tf.InfluxRegrep()           // InfluxDB 风格正则
-		// ... 同上
+		rcv, err := tf.InfluxRegrep()
+		...
 	}
-
+	...
 	return nil
 }
 ```
@@ -1838,7 +1875,7 @@ func (tf *tagFilter) Init(name, key, value []byte, isNegative, isRegexp bool) er
 - `marshalTagValue(prefix, compositeKey)`：编码 compositeKey，转义特殊字符，追加分隔符
 - `tf.prefix`：最终的 Seek key = `[0x02] + encoded(compositeKey)`，用于在 MergeSet 中定位
 - `OpGeminiRegrep()` / `InfluxRegrep()`：编译正则表达式，提取 OR 展开值和匹配函数
-- `matchCost`：匹配代价，用于 seriesByTagFilters 的查询优化排序
+- `matchCost`：匹配计算代价（正则优化用），不参与 seriesByTagFilters 的 cost 排序（见 12.8）
 
 **通俗解释**：
 tagFilter 就像"查询条件卡片"。当你写 `WHERE host='server1'` 时，系统会制作一张卡片：
@@ -1895,63 +1932,61 @@ sequenceDiagram
 ```go
 func (is *indexSearch) seriesByTagFilters(name []byte) (index.SeriesIDIterator, error) {
 
-	// 快速路径：只有一个 tagFilter
+	// 1.fast way: one tag filter
 	if len(is.tfs) == 1 {
 		return is.seriesByOneTagFilter(name)
 	}
-
-	// ===== 步骤 1: 计算每个 tagFilter 的代价 =====
 	tfcosts := make([]tagFilterWithCost, len(is.tfs))
 	for i := 0; i < len(is.tfs); i++ {
 		tfcosts[i].tf = &is.tfs[i]
-		tfcosts[i].cost = is.getTagFilterCost(name, &is.tfs[i])  // 从缓存读取历史代价
+		tfcosts[i].cost = is.getTagFilterCost(name, &is.tfs[i])
 	}
-	is.sortTagFilterWithCost(tfcosts)           // 按 cost 升序排序
-
-	// ===== 步骤 2: 选择最优的 tagFilter 作为起始 =====
+	// if cost eq keep tf order in where clause
+	is.sortTagFilterWithCost(tfcosts)
+	var err error
+	var set *uint64set.Set
+	var isNegativeFilter bool
+	// 2.choose one tf as start tf by tfcost
 	lastTfCosts := tfcosts[:0]
 	startTfLoc := len(tfcosts)
 	for i, tfcost := range tfcosts {
 		this, cost, err := is.searchTSIDsWithTagFilter(tfcost.tf)
+		...
 		tfcost.set = this
-		if this.Len() < maxIndexMetrics {       // 结果集足够小
+		if this.Len() < maxIndexMetrics {
 			lastTfCosts = append(lastTfCosts, tfcosts[i+1:]...)
 			set = this
-			is.storeTagFilterCost(name, tfcost.tf, cost)  // 缓存代价
+			is.storeTagFilterCost(name, tfcost.tf, cost)
 			startTfLoc = i
 			break
 		}
-		is.storeTagFilterCost(name, tfcost.tf, math.MaxInt64-1)  // 代价太高
-		lastTfCosts = append(lastTfCosts, tfcost)
+		...
 	}
-
 	if startTfLoc == len(tfcosts) {
-		// 所有 tagFilter 结果集都太大，回退到全量扫描
+		// no start tag choose, all tag match too many series, back to search all tsids
 		set, err = is.searchTSIDsByTimeRange(name)
+		...
 	}
-
-	// ===== 步骤 3: 与剩余 tagFilter 取交集 =====
+	...
+	// 3.no start tf satisfy, search all tsids as start
 	tfcosts = lastTfCosts
+	if startTfLoc > 0 {
+		is.sortTagFilterWithCost(tfcosts)
+	}
 	for i, tfcost := range tfcosts {
-		// 剪枝优化：代价/结果集 > 阈值时，用 prune 替代遍历
+		...
 		if (tfcost.cost/int64(set.Len()) > int64(pruneThreshold)) ||
 			(tfcost.tf.IsFilterEmptyValue() && set.Len() < is.idx.config.TagScanPruneThreshold) {
-			set, err = is.doPrune(set, tfs)     // prune 优化
+			tfs := make([]*tagFilter, len(tfcosts)-i)
+			for j := 0; j < len(tfs); j++ {
+				tfs[j] = tfcosts[i+j].tf
+			}
+			set, err = is.doPrune(set, tfs)
+			...
 			break
 		}
-
-		if tfcost.set.Len() > 0 {
-			set.Intersect(tfcost.set)            // 已有结果，直接交集
-			if set.Len() == 0 { break }
-			continue
-		}
-
-		this, cost, err := is.searchTSIDsWithTagFilter(tfcost.tf)  // 重新搜索
-		is.storeTagFilterCost(name, tfcost.tf, cost)
-		set.Intersect(this)                     // 交集
-		if set.Len() == 0 { break }             // 提前退出
+		...
 	}
-
 	return index.NewSeriesIDSetIterator(index.NewSeriesIDSetWithSet(set)), nil
 }
 ```
@@ -2043,67 +2078,69 @@ sequenceDiagram
 
 ```go
 func (is *indexSearch) getTSIDsForTagFilterSlow(tf *tagFilter, filter *uint64set.Set, hook indexSearchHook) error {
+	...
 	ts := &is.ts
 	kb := &is.kb
 	mp := &is.mp
 	mp.Reset()
 
-	var prevMatchingSuffix []byte               // 缓存上次匹配的 suffix
+	var prevMatchingSuffix []byte
 	var prevMatch bool
 	prefix := tf.prefix
 
-	ts.Seek(prefix)                             // 定位到第一个匹配前缀的条目
+	ts.Seek(prefix)
 
 	for ts.NextItem() {
 		item := ts.Item
 
 		if !bytes.HasPrefix(item, prefix) {
-			return nil                          // 前缀不匹配，遍历结束
+			return nil
 		}
 
-		// 解析条目：分离 suffix 和 TSID 部分
 		tail := item[len(prefix):]
 		sepIndex := bytes.IndexByte(tail, tagSeparatorChar)
-		suffix := tail[:sepIndex+1]             // tag value 部分
-		tsidTail := tail[sepIndex+1:]           // TSID 部分
+		...
+		suffix := tail[:sepIndex+1]
+		tsidTail := tail[sepIndex+1:]
 
-		mp.InitOnlyTail(item, tsidTail)         // 初始化解析器
-		mp.ParseTSIDs()                         // 解析 TSID 列表
+		if err := mp.InitOnlyTail(item, tsidTail); err != nil {
+			return err
+		}
+		mp.ParseTSIDs()
 
-		// 快速路径 1：空值匹配
 		if tf.isEmptyValue && !tf.isRegexp {
-			is.processMatchingTSIDs(mp.TSIDs, filter, hook)
+			...
 			continue
 		}
 
-		// 快速路径 2：复用上次匹配结果（相同 suffix）
 		if prevMatch && bytes.Equal(suffix, prevMatchingSuffix) {
-			is.processMatchingTSIDs(mp.TSIDs, filter, hook)
+			...
 			continue
 		}
 
-		// 优化：当前行的 TSIDs 与 filter 无交集，跳过
 		if filter != nil && !mp.HasCommonTSIDs(filter) {
 			continue
 		}
 
-		// 慢路径：执行 suffix 匹配（可能包含正则）
 		matches, err := tf.matchSuffix(suffix)
+		...
 		if !matches {
 			prevMatch = false
 			if mp.TSIDsLen() < mergeindex.MaxTSIDsPerRow/2 {
-				continue                        // TSID 少，继续下一条
+				continue
 			}
-			is.seekToNextTagValue(kb, item, tsidTail, ts)  // TSID 多，跳到下一个 tag 值
+
+			if err := is.seekToNextTagValue(kb, item, tsidTail, ts); err != nil {
+				return err
+			}
 			continue
 		}
 
-		// 匹配成功，缓存结果
 		prevMatch = true
 		prevMatchingSuffix = append(prevMatchingSuffix[:0], suffix...)
-		is.processMatchingTSIDs(mp.TSIDs, filter, hook)
+		...
 	}
-
+	...
 	return nil
 }
 ```
@@ -2358,32 +2395,39 @@ sequenceDiagram
 
 ```go
 func (ps *partSearch) Seek(k []byte) {
+	...
 	if string(k) > string(ps.p.ph.lastItem) {
-		ps.err = io.EOF                         // k 大于最大 item，直接返回
+		// Not matching items in the part.
+		ps.err = io.EOF
 		return
 	}
 
-	if ps.tryFastSeek(k) { return }             // 快速路径
-
-	// ===== 三级二分查找 =====
-
-	// 第一级：二分查找 metaindexRow（稀疏索引）
+	if ps.tryFastSeek(k) {
+		return
+	}
+	...
+	// Locate the first metaindexRow to scan.
+	...
 	n := sort.Search(len(ps.mrs), func(i int) bool {
 		return string(k) <= string(ps.mrs[i].firstItem)
 	})
-	if n > 0 { n-- }                            // 回退一个，确保不漏
+	if n > 0 {
+		// The given k may be located in the previous metaindexRow, so go to it.
+		n--
+	}
 	ps.mrs = ps.mrs[n:]
-
-	// 第二级：二分查找 blockHeader（稠密索引）
-	ps.nextBHS()                                // 读取 block headers
+	...
+	// Locate the first block to scan.
 	n = sort.Search(len(ps.bhs), func(i int) bool {
 		return string(k) <= string(ps.bhs[i].firstItem)
 	})
-	if n > 0 { n-- }
+	if n > 0 {
+		// The given k may be located in the previous block, so go to it.
+		n--
+	}
 	ps.bhs = ps.bhs[n:]
-
-	// 第三级：在 block 内二分查找 item
-	ps.nextBlock()                              // 读取 block 到内存
+	...
+	// Locate the first item to scan in the block.
 	items := ps.ib.items
 	data := ps.ib.data
 	cpLen := commonPrefixLen(ps.ib.commonPrefix, k)
@@ -2397,6 +2441,7 @@ func (ps *partSearch) Seek(k []byte) {
 	} else {
 		ps.ibItemIdx = binarySearchKey(data, items, k)
 	}
+	...
 }
 ```
 
@@ -2448,6 +2493,7 @@ type IndexCache struct {
     tagFilterCache       *workingsetcache.Cache   // tagFilterKey → []TSID（条件过滤）
     TagKeyValueCache     *workingsetcache.Cache   // tagKey+tagValue → exists（Tag 存在性）
     TagFilterCostCache   *workingsetcache.Cache   // tagFilter → cost（查询优化）
+    ...
 }
 ```
 
@@ -2455,35 +2501,54 @@ type IndexCache struct {
 - `SeriesKeyToTSIDCache`：写入时用，查找 series 是否已存在，比如 `"cpu,host=server1"` → `TSID=1001`
 - `TSIDToSeriesKeyCache`：查询时用，根据 TSID 反查 series key，比如 `TSID=1001` → `"cpu,host=server1"`
 - `tagFilterCache`：查询时用，缓存 tag 过滤结果，比如 `host=server1` → `[1001, 1002, 1003]`
-- `TagKeyValueCache`：写入时用，检查 tag 值是否存在
+- `TagKeyValueCache`：写入时用（列存 label 索引路径），检查 tag 值是否存在
 - `TagFilterCostCache`：查询优化时用，记录每个 tag 过滤的代价，用于选择最优过滤顺序
 
 **缓存初始化** `engine/index/tsi/cache.go:219-250`：
 
 ```go
-func newIndexCache(mem int64) *IndexCache {
-    tsidCacheSize := mem / 32    // SeriesKeyToTSID 缓存大小 = 总内存的 1/32
-    skeyCacheSize := mem / 32    // TSIDToSeriesKey 和 TagKeyValue 缓存大小
-    tagCacheSize := mem / 16     // tagFilter 缓存大小 = 总内存的 1/16
-    tagFilterCostSize := mem / 128  // TagFilterCost 缓存大小
-
-    return &IndexCache{
-        SeriesKeyToTSIDCache: workingsetcache.New(tsidCacheSize),
-        TSIDToSeriesKeyCache: workingsetcache.New(skeyCacheSize),
-        tagFilterCache:       workingsetcache.New(tagCacheSize),
-        TagKeyValueCache:     workingsetcache.New(skeyCacheSize),
-        TagFilterCostCache:   workingsetcache.New(tagFilterCostSize),
-    }
+func newIndexCache(tsidCacheSize, skeyCacheSize, tagCacheSize, tagFilterCostSize int, path string, store, compress bool) *IndexCache {
+	var mem = memory.Allowed()
+	if tsidCacheSize == 0 {
+		tsidCacheSize = mem / 32
+	}
+	if skeyCacheSize == 0 {
+		skeyCacheSize = mem / 32
+	}
+	if tagCacheSize == 0 {
+		tagCacheSize = mem / 16
+	}
+	if tagFilterCostSize == 0 {
+		tagFilterCostSize = mem / 128
+	}
+	ic := &IndexCache{
+		tagFilterCache: workingsetcache.New(tagCacheSize, time.Hour),
+		path:           path,
+	}
+	if store {
+		ic.SeriesKeyToTSIDCache = LoadCache(SeriesKeyToTSIDCacheName, path, tsidCacheSize)
+		ic.TSIDToSeriesKeyCache = LoadCache(TSIDToSeriesKeyCacheName, path, skeyCacheSize)
+		ic.TagKeyValueCache = LoadCache(TagKeyToTagValueCacheName, path, skeyCacheSize)
+	} else {
+		ic.SeriesKeyToTSIDCache = workingsetcache.New(tsidCacheSize, time.Hour)
+		ic.TSIDToSeriesKeyCache = workingsetcache.New(skeyCacheSize, time.Hour)
+		ic.TagKeyValueCache = workingsetcache.New(skeyCacheSize, time.Hour)
+	}
+	ic.TagFilterCostCache = workingsetcache.New(tagFilterCostSize, time.Hour)
+	ic.store = store
+	ic.keyCompressed = compress
+	return ic
 }
 ```
 
 **逐行解释**：
-- `tsidCacheSize = mem / 32`：如果总内存 8GB，SeriesKeyToTSID 缓存 = 256MB
-- `tagCacheSize = mem / 16`：tagFilter 缓存 = 512MB（查询最常用，所以最大）
-- `workingsetcache.New(size)`：创建一个 LRU 缓存，自动淘汰最久未使用的条目
+- `tsidCacheSize = mem / 32`：仅在配置为 0 时使用；总内存 8GB 时 SeriesKeyToTSID 缓存默认 = 256MB
+- `tagCacheSize = mem / 16`：仅在配置为 0 时使用；8GB 时 tagFilter 缓存默认 = 512MB（查询最常用，所以最大）
+- 实际大小由 `idx.config.TSIDCacheSize/SKeyCacheSize/TagCacheSize/TagFilterCostCacheSize` 传入（`engine/index/tsi/mergeset_index.go:354-355`），只有传 0 才回退到 `mem / N`
+- `workingsetcache.New(size, time.Hour)`：创建一个带 TTL 的缓存（map + fastcache，并非严格 LRU），自动淘汰过期/低命中条目
 
 **通俗解释**：
-五级缓存就像"五个记忆层级"：
+五级缓存就像"五个记忆层级"（这里指 `IndexCache` 内的 5 个缓存；field index 另有独立的 `TSIDToFieldCache`）：
 1. **SeriesKeyToTSID**（写入时用）：记住 "张三" 的会员号是 "1001"
 2. **TSIDToSeriesKey**（查询时用）：记住会员号 "1001" 是 "张三"
 3. **tagFilterCache**（查询时用）：记住 "住在北京的人" 有哪些会员号
@@ -2513,16 +2578,16 @@ func newIndexCache(mem int64) *IndexCache {
 
 ### 8.2 缓存失效机制
 
-> 当新 series 写入时，之前缓存的查询结果可能不再正确。openGemini 选择了"粗粒度失效"策略 — 新 series 写入时，**所有** tagFilterCache 都失效，而不是只失效受影响的缓存。
+> 当新增 series 使索引内容变化后，之前缓存的查询结果可能不再正确。openGemini 选择了"粗粒度失效"策略 — `invalidateTagCache` 作为 mergeset Table 的 `flushCallback`，在索引 flush 后被调用（非 final flush 时由 10 秒 ticker 节流，见 `lib/util/lifted/vm/mergeset/table.go:356-374`），递增版本号 `tagFilterKeyGen`，使**所有** tagFilterCache 逻辑失效，而不是只失效受影响的缓存。版本号由 `marshalTagFilterKey` 拼进缓存 key（`engine/index/tsi/search.go:1004-1008`），旧 key 自然不再命中。
 
 ```mermaid
 sequenceDiagram
-    participant New as 新 series 写入
+    participant Flush as 索引 flush 完成
     participant Gen as tagFilterKeyGen
     participant Cache as tagFilterCache
 
-    New->>Gen: invalidateTagCache()<br/>tagFilterKeyGen++
-    Note over Gen: 所有 tagFilterCache 逻辑失效<br/>（粗粒度失效）
+    Flush->>Gen: flushCallback = invalidateTagCache()<br/>tagFilterKeyGen++
+    Note over Gen: 所有 tagFilterCache 逻辑失效<br/>（版本号进入缓存 key）
 
     Note over Cache: 为什么粗粒度？<br/>新 series 可能影响任何 tag 的结果<br/>精确失效太复杂
 ```
@@ -2623,7 +2688,7 @@ openGemini 选择了粗粒度失效，因为：
 
 ## 9. TagArray 处理
 
-### 9.1 组合爆炸问题
+### 9.1 TagArray 展开与等长约束
 
 ```mermaid
 sequenceDiagram
@@ -2640,33 +2705,33 @@ sequenceDiagram
     Expand->>Index: seriesKey 2: cpu,host=server2
     Index->>Index: 生成 TSID=1002<br/>创建 5 条索引
 
-    Note over Index: 如果 host=[a,b,c], region=[x,y]<br/>3 × 2 = 6 个组合<br/>6 个 TSID，6 组索引条目
+    Note over Index: 所有 array tag 必须等长<br/>host=[a,b,c], region=[x,y,z] → 3 个组合（按位置配对）<br/>长度不一致直接报错
 ```
 
 **通俗解释 — 快递批量发货**：
 
-TagArray 就像快递批量发货：你一次发3个包裹到不同地址，系统会自动拆成3个独立的快递单，每个快递单有自己的单号（TSID）。如果同时有多个维度（host=[a,b,c], region=[x,y]），就像"3个收件人 × 2个商品 = 6个包裹"，笛卡尔积组合。
+TagArray 就像快递批量发货：你一次发3个包裹到不同地址，系统会自动拆成3个独立的快递单，每个快递单有自己的单号（TSID）。多个 array tag 时按位置一一配对（host 的第 i 个值配 region 的第 i 个值），不是笛卡尔积；所有 array tag 的元素个数必须相同，否则 `AnalyzeTagSets` 直接报错。
 
 **核心代码** `engine/index/tsi/tag_array.go:101-133`：
 
 ```go
 func AnalyzeTagSets(dstTagSets *tagSets, tags []influx.Tag) error {
-    // 检查所有 array tag 的元素数量是否一致
-    arrayLen := 0
-    for i := range tags {
-        if tags[i].IsArray {
-            tagCount := strings.Count(tags[i].Value, ",") + 1
-            if arrayLen == 0 {
-                arrayLen = tagCount
-            } else if arrayLen != tagCount {
-                return errno.NewError(errno.ErrorTagArrayFormat)  // 数量不一致，报错
-            }
-        }
-    }
-    // 展开为 arrayLen 个 tag 组合
-    dstTagSets.resize(arrayLen, len(tags))
-    // 非 array tag 复制到所有行，array tag 拆分到各行
-    ...
+	var arrayLen int
+	for i := range tags {
+		if tags[i].IsArray {
+			tagCount := strings.Count(tags[i].Value, ",") + 1
+			if arrayLen == 0 {
+				arrayLen = tagCount
+			}
+
+			if arrayLen != tagCount {
+				return errno.NewError(errno.ErrorTagArrayFormat)
+			}
+		}
+	}
+
+	dstTagSets.resize(arrayLen, len(tags))
+	...
 }
 ```
 
@@ -2713,22 +2778,22 @@ flowchart LR
 
 ```go
 func AnalyzeTagSets(dstTagSets *tagSets, tags []influx.Tag) error {
-    // 检查所有 array tag 的元素数量是否一致
-    arrayLen := 0
-    for i := range tags {
-        if tags[i].IsArray {
-            tagCount := strings.Count(tags[i].Value, ",") + 1
-            if arrayLen == 0 {
-                arrayLen = tagCount
-            } else if arrayLen != tagCount {
-                return errno.NewError(errno.ErrorTagArrayFormat)  // 数量不一致，报错
-            }
-        }
-    }
-    // 展开为 arrayLen 个 tag 组合
-    dstTagSets.resize(arrayLen, len(tags))
-    // 非 array tag 复制到所有行，array tag 拆分到各行
-    ...
+	var arrayLen int
+	for i := range tags {
+		if tags[i].IsArray {
+			tagCount := strings.Count(tags[i].Value, ",") + 1
+			if arrayLen == 0 {
+				arrayLen = tagCount
+			}
+
+			if arrayLen != tagCount {
+				return errno.NewError(errno.ErrorTagArrayFormat)
+			}
+		}
+	}
+
+	dstTagSets.resize(arrayLen, len(tags))
+	...
 }
 ```
 
@@ -2772,17 +2837,18 @@ flowchart LR
     end
 
     subgraph Process["marshalCombineIndexKeys"]
-        C["写入 count=2"]
-        D["写入 len1=17 + key1"]
-        E["写入 len2=17 + key2"]
+        C["写入 uint32(0) 占位"]
+        D["写入 uint16(count=2)"]
+        E["写入 uint16(len1=26) + key1"]
+        F["写入 uint16(len2=26) + key2"]
     end
 
     subgraph Output["序列化结果"]
-        F["[2][17][cpu,host=server1][17][cpu,host=server2]"]
+        G["[0x00000000][0x0002][0x001A][key1][0x001A][key2]"]
     end
 
-    A --> C --> D --> E --> F
-    B --> D
+    A --> C --> D --> E --> F --> G
+    B --> E
 
     style Input fill:#e1f5fe
     style Process fill:#fff3e0
@@ -2792,45 +2858,69 @@ flowchart LR
 **代码位置**：`engine/index/tsi/tag_array.go:193-229`
 
 ```go
-func marshalCombineIndexKeys(dst []byte, indexkeys [][]byte, tagIndex []int) []byte {
-    // 快速路径：单个 key，直接返回
-    if len(tagIndex) == 1 {
-        dst = append(dst, indexkeys[0][:tagIndex[0]]...)
-        return dst
-    }
-    // 多个 key：格式 = count + len(key1) + key1 + len(key2) + key2 + ...
-    dst = append(dst, byte(len(indexkeys)))
-    for i := range indexkeys {
-        keyLen := tagIndex[i]
-        dst = append(dst, byte(keyLen))
-        dst = append(dst, indexkeys[i][:keyLen]...)
-    }
-    return dst
+func marshalCombineIndexKeys(name []byte, tagsArray [][]influx.Tag, dst []byte) ([]byte, error) {
+	indexkey := kbPool.Get()
+	defer kbPool.Put(indexkey)
+
+	var tagIndex []int
+	var keyLen int
+	var emptyTagValue bool
+	for i := range tagsArray {
+		indexkey.B, keyLen, emptyTagValue = unmarshalIndexKeys(name, tagsArray[i], indexkey.B)
+		if emptyTagValue {
+			continue
+		}
+		tagIndex = append(tagIndex, keyLen)
+	}
+
+	if len(tagIndex) == 0 {
+		return nil, errors.New("error row")
+	}
+
+	// fast path, only one indexkey
+	if len(tagIndex) == 1 {
+		// marshal count=1
+		dst = append(dst, indexkey.B[:tagIndex[0]]...)
+		return dst, nil
+	}
+
+	// slow path, multi indexkeys
+	dst = encoding.MarshalUint32(dst, uint32(0))
+	dst = encoding.MarshalUint16(dst, uint16(len(tagIndex)))
+	start := 0
+	for i := range tagIndex {
+		dst = encoding.MarshalUint16(dst, uint16(tagIndex[i]))
+		dst = append(dst, indexkey.B[start:start+tagIndex[i]]...)
+		start += tagIndex[i]
+	}
+	return dst, nil
 }
 ```
 
 **逐行解释**：
-- 单个 key 快速路径：直接返回 key 的前 tagIndex[0] 个字节
-- 多个 key：先写 count（key 数量），然后每个 key 写长度 + 内容
-- 格式：`[count][len1][key1][len2][key2]...`
+- 单个 key 快速路径：直接返回该 IndexKey（其前 4 字节是 IndexKey 自身的总长度，非 0）
+- 多个 key：先写 4 字节 `uint32(0)` 占位，再写 `uint16(count)`，然后每个 key 写 `uint16(len)` + 内容
+- 解析侧 `unmarshalCombineIndexKeys` 用前 4 字节判断：非 0 视为单 key，0 则按多 key 慢路径解析（`engine/index/tsi/tag_array.go:231-262`）
+- 格式：`[uint32(0)][uint16(count)][uint16(len1)][key1][uint16(len2)][key2]...`
 
 **通俗解释**：
 组合索引键序列化就像"打包多个地址"。假设你要寄快递给 3 个人，可以把 3 个地址打包成一个包裹：
-- **包裹格式**：[人数] [地址1长度] [地址1] [地址2长度] [地址2] [地址3长度] [地址3]
+- **包裹格式**：[4 字节占位] [2 字节人数] [2 字节地址1长度] [地址1] [2 字节地址2长度] [地址2] ...
 - **优点**：一次传输多个地址，比分别寄 3 个包裹更高效
 
 **具体例子**：
 
 输入：2 个 series key
-- key1 = `cpu,host=server1`（tagIndex[0] = 17）
-- key2 = `cpu,host=server2`（tagIndex[1] = 17）
+- key1 = `cpu,host=server1`（IndexKey 长度 = 26）
+- key2 = `cpu,host=server2`（IndexKey 长度 = 26）
 
 序列化结果：
 ```
-[2]           ← count = 2 个 key
-[17]          ← key1 长度
+[0x00000000]  ← 4 字节占位（多 key 标记）
+[0x0002]      ← uint16 count = 2 个 key
+[0x001A]      ← uint16 key1 长度 = 26
 [cpu,host=server1]  ← key1 内容
-[17]          ← key2 长度
+[0x001A]      ← uint16 key2 长度 = 26
 [cpu,host=server2]  ← key2 内容
 ```
 
@@ -2849,7 +2939,7 @@ sequenceDiagram
 
     loop 对每个 TSID
         Index->>Series: 反查 seriesKey
-        Series->>Series: 检查是否是组合 key（含 '[' 字符）
+        Series->>Series: 检查是否是组合 key（前 4 字节是否为 0）
         alt 是组合 key
             Series->>Series: unmarshalCombineIndexKeys()
             Series->>Series: 解析出子 key
@@ -2869,7 +2959,7 @@ sequenceDiagram
 
 1. 查找 host=server1 匹配的 TSID
 2. 对于每个 TSID，反查 seriesKey
-3. 检查 seriesKey 是否是组合 key（包含 '[' 字符）
+3. 检查组合 key：前 4 字节非 0 视为单 key，为 0 则按多 key 解析
 4. 如果是组合 key，解析出所有子 key
 5. 检查子 key 中是否有匹配 host=server1 的
 6. 只返回匹配的子 key 对应的数据
@@ -2879,12 +2969,14 @@ sequenceDiagram
 
 ```go
 func (idx *MergeSetIndex) searchSeriesWithTagArray(tsid uint64, seriesKeys [][]byte, ...) ([][]byte, ...) {
-    // 根据 TSID 反查组合 key
-    combineKey, err = idx.searchSeriesKey(combineKey, tsid)
-    // 解析组合 key 为多个子 key
-    seriesKeys, _, err = unmarshalCombineIndexKeys(seriesKeys, combineKey)
-    // 检查子 key 是否匹配查询条件
-    _, isExpectSeries, exprs, err = analyzeSeriesWithCondition(seriesKeys, exprs, condition, ...)
+	combineKey = combineKey[:0]
+	combineKey, err := idx.searchSeriesKey(combineKey, tsid)
+	...
+	seriesKeys, _, err = unmarshalCombineIndexKeys(seriesKeys, combineKey)
+	...
+	_, isExpectSeries, exprs, err = analyzeSeriesWithCondition(seriesKeys, exprs, condition, ...)
+	...
+	return seriesKeys, exprs, isExpectSeries, combineKey, nil
 }
 ```
 
@@ -2911,7 +3003,7 @@ sequenceDiagram
     participant Delete as 删除 series
     participant Set as deletedTSIDs 集合
     participant Query as 查询请求
-    participant Compact as 后台合并
+    participant Drop as drop-series 任务/DDL
 
     Delete->>Set: 将 TSID 加入 deletedTSIDs
     Note over Set: 不立即删除索引条目<br/>（延迟清理）
@@ -2926,8 +3018,8 @@ sequenceDiagram
         Query->>Query: 正常使用
     end
 
-    Note over Compact: 后台合并时
-    Compact->>Compact: 物理删除索引条目
+    Note over Drop: DropSeries() 调用 RemoveItemsByDelTsidsFromParts()
+    Drop->>Drop: 重写 Part，物理删除索引条目
 ```
 
 **通俗解释 — 图书馆的"注销卡"**：
@@ -2935,7 +3027,7 @@ sequenceDiagram
 删除一个 series 就像注销图书馆会员卡：
 1. **不立即销毁**：图书馆不会马上把你的会员卡剪掉，而是先在"待注销名单"上记一笔
 2. **查询时过滤**：有人查你的借阅记录时，管理员看到你在注销名单上，就说"查无此人"
-3. **后台清理**：等图书馆整理档案时，才真正把你的资料销毁
+3. **后台清理**：等 drop-series 周期任务或 DDL 执行 `DropSeries()` 时，才真正把你的资料销毁
 
 这种"标记删除"的好处是：删除操作非常快（只需要往名单上加一个编号），不需要立即修改大量索引文件。
 
@@ -2952,15 +3044,15 @@ Step 2: 查找要删除的 TSID
 
 Step 3: 标记删除（内存 + 磁盘）
   内存：deletedTSIDs.Add(1002)
-  磁盘：写入删除 MergeSet → [0x03] + 1002
+  磁盘：写入删除 MergeSet → 直接序列化的 8 字节 TSID（1002，无前缀）
 
 Step 4: 后续查询时过滤
   查到 TSID=[1001, 1002]
   检查 deletedTSIDs → 1002 已删除
   返回 TSID=[1001]
 
-Step 5: 后台合并时物理删除
-  Compactor 合并索引时，跳过 TSID=1002 的条目
+Step 5: drop-series 任务/DDL 物理删除
+  DropSeries() 调用 RemoveItemsByDelTsidsFromParts()，重写 Part 时跳过 TSID=1002 的条目
   → 物理删除完成
 ```
 
@@ -3104,23 +3196,26 @@ flowchart LR
 **代码位置**：`engine/index/tsi/search.go:1370`
 
 ```go
-func (is *indexSearch) scanTSIDsForTagFilter(...) {
-    for ... {
-        tsid := ...
-        // 检查 TSID 是否已删除
-        if is.deleted != nil && is.deleted.Has(tsid) {
-            return true  // 跳过已删除的 TSID
-        }
-        // 正常处理
-        ...
-    }
+func (is *indexSearch) scanTSIDsForTagFilter(tf *tagFilter) (*uint64set.Set, error) {
+	tsids := &uint64set.Set{}
+	// Use nil filter for faster scanning in production scenarios
+	err := is.getTSIDsForTagFilterSlow(tf, nil, func(tsid uint64) bool {
+		// Skip deleted TSIDs
+		if is.deleted != nil && is.deleted.Has(tsid) {
+			return true
+		}
+		tsids.Add(tsid)
+		return true
+	})
+	return tsids, err
 }
 ```
 
 **逐行解释**：
+- `getTSIDsForTagFilterSlow(tf, nil, func(tsid uint64) bool {...})`：慢扫描通过回调逐个交出 TSID
 - `is.deleted != nil`：检查是否有已删除的 TSID 集合
-- `is.deleted.Has(tsid)`：检查当前 TSID 是否在已删除集合中
-- `return true`：跳过已删除的 TSID，不返回给查询
+- `is.deleted.Has(tsid)`：检查当前 TSID 是否在已删除集合中；命中则不加入结果集
+- `return true`：回调返回 true 表示继续遍历（不是 `return` 出函数）
 
 **通俗解释**：
 查询时过滤就像"查会员时跳过已注销的"。当你查询会员列表时：
@@ -3139,47 +3234,46 @@ sequenceDiagram
     participant Index as 索引系统
     participant Mem as deletedTSIDs
     participant Disk as 删除 MergeSet
-    participant Compact as Compactor
+    participant Drop as drop-series 任务/DDL
 
-    User->>SQL: DELETE FROM cpu WHERE host='server1'
-    SQL->>Index: DeleteTSIDs("cpu", host='server1', tr)
+    User->>SQL: DELETE FROM cpu WHERE region='us'
+    SQL->>Index: DeleteTSIDs("cpu", region='us', tr)
     Index->>Index: searchTSIDs() → [1001, 1002]
     Index->>Mem: AddMulti([1001, 1002])
     Index->>Disk: 写入删除标记
 
     Note over User: 后续查询
-    User->>SQL: SELECT * FROM cpu WHERE host='server1'
+    User->>SQL: SELECT * FROM cpu WHERE region='us'
     SQL->>Index: 查到 TSID=[1001, 1002]
     Index->>Mem: Has(1001)=true, Has(1002)=true
     Index-->>SQL: 返回空结果
 
-    Note over Compact: 后台合并
-    Compact->>Compact: 跳过 TSID=1001, 1002
-    Compact->>Compact: 物理删除索引条目
+    Note over Drop: DropSeries()
+    Drop->>Drop: RemoveItemsByDelTsidsFromParts()，重写 Part 时跳过 TSID=1001, 1002
 ```
 
-假设要删除 `cpu,host=server1` 的所有数据：
+假设要删除 `cpu` 中 `region='us'` 的所有数据：
 
 ```
 步骤 1：执行 DELETE 语句
-  DELETE FROM cpu WHERE host='server1'
+  DELETE FROM cpu WHERE region='us'
 
 步骤 2：DeleteTSIDs() 查找要删除的 TSID
-  searchTSIDs("cpu", host='server1', timeRange) → [1001, 1002]
+  searchTSIDs("cpu", region='us', timeRange) → [1001, 1002]
 
 步骤 3：WriteDeleteTsids() 持久化删除标记
   内存：deletedTSIDs = {1001, 1002}
   磁盘：写入删除 MergeSet
 
 步骤 4：查询时过滤
-  SELECT * FROM cpu WHERE host='server1'
+  SELECT * FROM cpu WHERE region='us'
   → 查到 TSID = [1001, 1002]
   → deletedTSIDs.Has(1001) = true → 跳过
   → deletedTSIDs.Has(1002) = true → 跳过
   → 返回空结果
 
-步骤 5：后台合并时物理删除
-  合并索引文件时，跳过 deletedTSIDs 中的 TSID
+步骤 5：drop-series 任务/DDL 物理删除
+  DropSeries() 调用 RemoveItemsByDelTsidsFromParts()，重写 Part 时跳过 deletedTSIDs 中的 TSID
   → 索引条目被物理删除，释放磁盘空间
 ```
 
@@ -3189,38 +3283,39 @@ sequenceDiagram
 |------|-----------------|---------|
 | **删除速度** | 极快（只写标记） | 慢（需要遍历删除） |
 | **并发安全** | 安全（不影响查询） | 不安全（删除时查询可能出错） |
-| **空间回收** | 延迟到合并时 | 立即回收 |
+| **空间回收** | 延迟到 DropSeries 重写 Part 时 | 立即回收 |
 | **实现复杂度** | 简单 | 复杂（需要处理并发） |
 
 **通俗解释**：
-标记删除就像在书上贴"待处理"标签。书还在书架上，但下次找书时会跳过贴了标签的书。等整理书架时（后台合并），再把贴了标签的书真正移除。这样删除操作很快，不影响其他人的查询。
+标记删除就像在书上贴"待处理"标签。书还在书架上，但下次找书时会跳过贴了标签的书。等 drop-series 周期任务或 DDL 执行 `DropSeries()` 时，再把贴了标签的书真正移除。这样删除操作很快，不影响其他人的查询。
 
 ---
 
 ## 11. 潜在隐患
 
-### 11.1 MergeSet 写入的全局锁
+### 11.1 批量接口的全局锁与热路径的无锁队列
 
 ```mermaid
 sequenceDiagram
     participant G1 as goroutine 1
     participant G2 as goroutine 2
-    participant CIF as CreateIndexIfNotExists()
+    participant Q0 as 队列 0
+    participant Q1 as 队列 1
+    participant W0 as 消费 goroutine 0
+    participant W1 as 消费 goroutine 1
 
-    G1->>CIF: 调用
-    CIF->>CIF: idx.mu.Lock()
-    G2->>CIF: 调用
-    Note over G2: 等待锁…
-    CIF->>CIF: idx.mu.Unlock()
-    G2->>CIF: idx.mu.Lock()
-    Note over G2: 高并发时<br/>锁竞争成为瓶颈
+    G1->>Q0: WriteRow(indexRow)（hash & mask = 0）
+    G2->>Q1: WriteRow(indexRow)（hash & mask = 1）
+    Q0->>W0: CreateIndexIfNotExistsByRow()
+    Q1->>W1: CreateIndexIfNotExistsByRow()
+    Note over W0,W1: 热路径不取 idx.mu<br/>不同队列并行处理
 ```
 
-**通俗解释 — 只有一个窗口的银行**：
+**通俗解释 — 多窗口 vs 一个批量窗口**：
 
-全局锁就像银行只有一个窗口：所有客户（goroutine）都必须排队，一个办完才能办下一个。高并发时，窗口前排起长队，后面的客户等得不耐烦。
+热路径像银行有多个窗口：每个 goroutine 按 hash 去固定队列，各窗口并行办理，不需要全局排队。只有遗留的批量接口 `MergeSetIndex.CreateIndexIfNotExists` 会在整个批次期间持有 `idx.mu`；它不在 tsstore 的写入热路径上，当前只在测试中调用。
 
-**核心代码** `engine/index/tsi/mergeset_index.go:681-711`（基于实际代码修正）：
+**核心代码** `engine/index/tsi/mergeset_index.go:681-711`（仅批量接口，非热路径）：
 
 ```go
 func (idx *MergeSetIndex) CreateIndexIfNotExists(mmRows *dictpool.Dict) error {
@@ -3230,7 +3325,7 @@ func (idx *MergeSetIndex) CreateIndexIfNotExists(mmRows *dictpool.Dict) error {
     defer kbPool.Put(vname)
 
     var err error
-    idx.mu.Lock()           // 全局锁：所有写入串行化
+    idx.mu.Lock()           // 仅此批量接口加锁；热路径不加此锁
     defer idx.mu.Unlock()
 
     for mmIdx := range mmRows.D {
@@ -3257,20 +3352,15 @@ func (idx *MergeSetIndex) CreateIndexIfNotExists(mmRows *dictpool.Dict) error {
 
 **具体例子**：
 
-4 核 CPU，4 个 goroutine 同时写入：
+4 核 CPU，4 个 goroutine 同时写入（热路径）：
 ```
-goroutine 1: idx.mu.Lock() ✓ 获得锁
-goroutine 2: idx.mu.Lock() ✗ 等待…
-goroutine 3: idx.mu.Lock() ✗ 等待…
-goroutine 4: idx.mu.Lock() ✗ 等待…
+goroutine 1 → queue[hash & 7] → 消费 goroutine 调用 CreateIndexIfNotExistsByRow
+goroutine 2 → queue[hash & 7] → 消费 goroutine 调用 CreateIndexIfNotExistsByRow
+goroutine 3 → queue[hash & 7] → 消费 goroutine 调用 CreateIndexIfNotExistsByRow
+goroutine 4 → queue[hash & 7] → 消费 goroutine 调用 CreateIndexIfNotExistsByRow
 
-goroutine 1: 处理完 → idx.mu.Unlock()
-goroutine 2: idx.mu.Lock() ✓ 获得锁
-goroutine 3: 继续等待…
-goroutine 4: 继续等待…
-
-→ 只有 1 个 goroutine 在工作，其他 3 个在等待
-→ CPU 利用率只有 25%！
+→ 不同队列并行处理，无全局锁；同一 seriesKey 固定落到同一队列
+→ 只有测试/遗留路径调用批量接口时才会在 idx.mu 上串行
 ```
 
 ### 11.2 BloomFilter 误判
@@ -3287,67 +3377,68 @@ sequenceDiagram
     Caller->>Disk: Seek(key)
     Disk-->>Caller: 没找到！
 
-    Note over Caller: BF 误判！<br/>~1% 概率<br/>不必要的磁盘 Seek
+    Note over Caller: BF 误判（概率取决于 BF 容量与 series 数）<br/>不必要的磁盘 Seek
 ```
 
 **通俗解释 — 保安误报**：
 
-BloomFilter 误判就像保安偶尔会误报：保安说"这个人可能来过"（BF 返回 true），但翻遍档案（磁盘查找）发现其实没来过。概率约 1%，虽然不高，但在高并发时会积累很多不必要的磁盘查找。
+BloomFilter 误判就像保安偶尔会误报：保安说"这个人可能来过"（BF 返回 true），但翻遍档案（磁盘查找）发现其实没来过。概率取决于 BF 容量与 series 数（未确认），在高并发时会积累不必要的磁盘查找。
 
 **核心代码** `engine/index/tsi/mergeset_index.go:635-679`：
 
 ```go
-func (idx *MergeSetIndex) getSeriesIdBySeriesKey(seriesKey []byte) (uint64, error) {
-    // 第一级：Cache 查找
-    exist, err := idx.cache.GetTSIDFromTSIDCache(&tsid, seriesKey)
-    if exist { return tsid, nil }  // 缓存命中
-
-    // 第二级：BloomFilter
-    if idx.bfExist() && !idx.CheckSeriesKeyExist(seriesKey) {
-        return 0, nil  // BF 说"一定不存在" → 100% 准确
-    }
-
-    // 第三级：磁盘查找（BF 说"可能存在"时才执行）
-    tsid, err = is.getTSIDBySeriesKey(seriesKey)
-    // 如果 BF 误判 → tsid=0，浪费了一次磁盘 Seek
+func (idx *MergeSetIndex) getSeriesIdBySeriesKey(seriesKeyWithVersion []byte) (uint64, error) {
+	var tsid uint64
+	...
+	exist, err := idx.cache.GetTSIDFromTSIDCache(&tsid, seriesKeyWithVersion)
+	if err != nil {
+		return 0, err
+	}
+	if exist {
+		...
+		return tsid, nil
+	}
+	...
+	if idx.bfExist() && !idx.CheckSeriesKeyExist(seriesKeyWithVersion) {
+		return 0, nil
+	}
+	...
+	tsid, err = is.getTSIDBySeriesKey(seriesKeyWithVersion)
+	...
 }
 ```
 
 **具体例子**：
 
-10000 次查找，假设 1% 误判率：
+10000 次查找，假设 Cache 命中率 95%、BF 误判率 1%：
 ```
-正常查找：9900 次
-  → Cache 命中 9405 次 (95%)
-  → BF 排除 495 次 (5%)
-  → 磁盘查找 0 次
+Cache 命中：9500 次
+Cache 未命中：500 次，进入 BF
+  → BF 判"不存在" 495 次（正确排除，直接返回 0）
+  → BF 误判"可能存在" 5 次 → 5 次不必要的磁盘 Seek
 
-误判查找：100 次
-  → Cache 未命中 100 次
-  → BF 误判 100 次（说"可能存在"）
-  → 不必要的磁盘 Seek 100 次！
-
-→ 浪费了 100 次磁盘 IO，性能下降约 1%
+→ 浪费 5 次磁盘 IO（约占 0.05%）
+→ 误判率取决于 BF 容量与 series 数，这里 1% 为示例值（未确认）
 ```
 
 ### 11.3 缓存粗粒度失效
 
 ```mermaid
 sequenceDiagram
-    participant New as 新 series 写入
+    participant Flush as 索引 flush 完成
     participant Gen as tagFilterKeyGen
     participant Cache as tagFilterCache
 
-    New->>Gen: invalidateTagCache()<br/>atomic.AddUint64(&tagFilterKeyGen, 1)
+    Flush->>Gen: flushCallback = invalidateTagCache()<br/>atomic.AddUint64(&tagFilterKeyGen, 1)
     Note over Gen: 版本号递增（~10ns）
     Note over Cache: 所有缓存通过版本号逻辑失效
 
-    Note over Cache: 只新增了一个 series<br/>但所有缓存都逻辑失效了<br/>粗粒度失效的代价（基于实际代码修正）
+    Note over Cache: 每次 flush 后（最多 10 秒一次）<br/>所有缓存都逻辑失效<br/>粗粒度失效的代价
 ```
 
 **通俗解释 — 清空整个停车场**：
 
-缓存粗粒度失效就像停车场管理员说"有新车进来了，所有人重新找车位"：只新增了一辆车，但所有人的缓存（车位信息）都失效了，需要重新查找。
+缓存粗粒度失效就像停车场管理员说"索引更新了，所有人重新找车位"：缓存版本号一变，所有旧缓存（车位信息）都失效了，需要重新查找。
 
 **核心代码** `engine/index/tsi/mergeset_index.go:102-106`（基于实际代码修正）：
 
@@ -3359,6 +3450,8 @@ func invalidateTagCache() {
 }
 ```
 
+> 注意：函数内注释写的是“每次新增 timeseries 调用”，但实际注入点是 mergeset Table 的 `flushCallback`（`engine/index/tsi/mergeset_index.go:347`）；非 final flush 时由 10 秒 ticker 节流（`lib/util/lifted/vm/mergeset/table.go:356-374`）。
+
 **具体例子**：
 
 ```
@@ -3368,9 +3461,9 @@ func invalidateTagCache() {
   region=us → TSIDs=[1001, 1002, 1003]
   ... (共 1000 个)
 
-新增一个 series：cpu,host=server3,region=us (TSID=1005)
+新增一个 series：cpu,host=server3,region=us (TSID=1005)，索引 flush 后
 
-→ 调用 invalidateTagCache()
+→ flushCallback 调用 invalidateTagCache()
 → tagFilterKeyGen 原子递增（~10ns）
 → 所有 tagFilterCache 通过 tagFilterKeyGen 版本号逻辑失效
 → 下次查询需要重新从磁盘查找
@@ -3381,8 +3474,8 @@ func invalidateTagCache() {
 
 **通俗解释**：
 这三个隐患就像"交通拥堵点"：
-1. **全局锁**：就像只有一个窗口办理业务，所有人排队等候。高并发时，锁竞争成为瓶颈
-2. **BloomFilter 误判**：就像保安偶尔会认错人，把不是业主的人放进去（~1% 概率），导致不必要的磁盘查找
+1. **全局锁**：批量接口的 `idx.mu` 只影响测试/遗留路径；热路径是分片队列，各队列并行处理
+2. **BloomFilter 误判**：就像保安偶尔会认错人，把不存在的人误判为可能存在（概率取决于 BF 容量与 series 数，未确认），导致不必要的磁盘查找
 3. **缓存粗粒度失效**：就像新来了一个客人，就把所有人的记忆都清空了，虽然简单但有点浪费
 
 ---
@@ -3397,7 +3490,8 @@ func invalidateTagCache() {
 sequenceDiagram
     participant Shard as shard.WriteRows()
     participant Storage as storage.WriteIndex()
-    participant CIF as CreateIndexIfNotExists()
+    participant IB as IndexBuilder
+    participant CIF as CreateIndexIfNotExistsByRow()
     participant CI as createIndexesIfNotExists()
     participant Lookup as getSeriesIdBySeriesKey()
     participant L1 as Cache (L1)
@@ -3408,12 +3502,13 @@ sequenceDiagram
     participant Table as MergeSet Table
 
     Shard->>Storage: WriteIndex(indexBuilder, rows)
-    Storage->>CIF: CreateIndexIfNotExists(mmRows)
-    CIF->>CIF: idx.mu.Lock() 加写锁
+    Storage->>IB: CreateIndexIfNotExists(mmRows, needSecondaryIndex)
+    IB->>CIF: WriteRow(indexRow)（投递到队列）
+    Note over CIF: 队列 goroutine 调用 CreateIndexIfNotExistsByRow()<br/>不取 idx.mu
 
-    Note over CIF: 遍历 measurement="cpu_0001" 的每一行
+    Note over CIF: 遍历 measurement="cpu" 的每一行
     CIF->>CI: createIndexesIfNotExists(vkey, vname, tags)
-    Note over CI: vkey = IndexKey 字节<br/>vname = "cpu_0001"<br/>tags = [(host,server1),(region,us)]
+    Note over CI: vkey = IndexKey 字节<br/>vname = "cpu"<br/>tags = [(host,server1),(region,us)]
 
     Note over CI: ===== 第一级：Cache 查找 =====
     CI->>Lookup: getSeriesIdBySeriesKey(vkey)
@@ -3441,20 +3536,22 @@ sequenceDiagram
     Decode->>Decode: [0x01]+TSID+IndexKey
 
     Note over Decode: 条目 3: Tag 索引 (host=server1)
-    Decode->>Decode: [0x02]+"cpu"+[0x01]+"host"+[0x01]+"server1"+TSID
+    Decode->>Decode: [0x02]+[0xFE]+0x03+"cpu"+"host"+[0x01]+"server1"+[0x01]+TSID
 
     Note over Decode: 条目 4: Tag 索引 (region=us)
-    Decode->>Decode: [0x02]+"cpu"+[0x01]+"region"+[0x01]+"us"+TSID
+    Decode->>Decode: [0x02]+[0xFE]+0x03+"cpu"+"region"+[0x01]+"us"+[0x01]+TSID
 
     Note over Decode: 条目 5: Measurement 索引
-    Decode->>Decode: [0x02]+"cpu"+[0xFE]+[0x00]+TSID（基于实际代码修正）
+    Decode->>Decode: [0x02]+[0xFE]+0x03+"cpu"+[0x01]+[0x01]+TSID
 
     Decode-->>CI: TSID=1099511627775289
 
     CI->>Table: tb.AddItems(ii.Items) 写入 rawItems
     Table->>Table: rawItems.addItems() 写入内存
     CI-->>CIF: TSID=1099511627775289
-    CIF-->>Storage: TSID=1099511627775289
+    CIF->>CIF: 填充 row.SeriesId=1099511627775289
+    IB->>IB: wg.Wait() 检查 row.Err
+    Storage-->>Shard: wait()
 ```
 
 ### 12.2 Step 1 详解：IndexKey 构造 — 从 Row 到索引键
@@ -3494,41 +3591,42 @@ flowchart LR
 
 **输入**：`Row{Name:"cpu", Tags:[{host,server1},{region,us}], Fields:[{value,99.5}]}`
 
-**代码路径**：`lib/util/lifted/vm/protoparser/influx/parser.go:792-817`
+**代码路径**：生产路径由 `lib/util/lifted/vm/protoparser/influx/parser.go:857-884` 的 `Row.UnmarshalIndexKeys` 构造；下面展示同格式的 `MakeIndexKey`（`lib/util/lifted/vm/protoparser/influx/parser.go:792-817`，当前仅测试调用）：
 
 ```go
-// IndexKey = 二进制编码的 seriesKey
 func MakeIndexKey(name string, tags PointTags, dst []byte) []byte {
-    // 计算总长度
-    indexKl := 4 + 2 + len(name) + 2 + 4*len(tags) + tags.TagsSize()
-    // = 4 + 2 + 3 + 2 + 8 + (4+7+6+2) = 38
+	indexKl := 4 + // total length of indexkey
+		2 + // measurment name length
+		len(name) + // measurment name with version
+		2 + // tag count
+		4*len(tags) + // length of each tag key and value
+		tags.TagsSize() // size of tag keys/values
+	start := len(dst)
 
-    // 编码过程
-    dst = encoding.MarshalUint32(dst, 38)      // 总长度
-    dst = encoding.MarshalUint16(dst, 3)       // name 长度
-    dst = append(dst, "cpu"...)                 // name
-    dst = encoding.MarshalUint16(dst, 2)       // tag 数量
-
-    // Tag 1: host=server1
-    dst = encoding.MarshalUint16(dst, 4)       // key 长度
-    dst = append(dst, "host"...)                // key
-    dst = encoding.MarshalUint16(dst, 7)       // value 长度
-    dst = append(dst, "server1"...)             // value
-
-    // Tag 2: region=us
-    dst = encoding.MarshalUint16(dst, 6)       // key 长度
-    dst = append(dst, "region"...)              // key
-    dst = encoding.MarshalUint16(dst, 2)       // value 长度
-    dst = append(dst, "us"...)                  // value
-
-    return dst[start:]
+	// marshal total len
+	dst = encoding.MarshalUint32(dst, uint32(indexKl))
+	// marshal measurement
+	dst = encoding.MarshalUint16(dst, uint16(len(name)))
+	dst = append(dst, name...)
+	// marshal tags
+	dst = encoding.MarshalUint16(dst, uint16(len(tags)))
+	for i := range tags {
+		kl := len(tags[i].Key)
+		dst = encoding.MarshalUint16(dst, uint16(kl))
+		dst = append(dst, tags[i].Key...)
+		vl := len(tags[i].Value)
+		dst = encoding.MarshalUint16(dst, uint16(vl))
+		dst = append(dst, tags[i].Value...)
+	}
+	return dst[start:]
 }
 ```
 
 **逐行解释**：
-- `MakeIndexKey()` 将 measurement name + 所有 tags 编码为二进制字节数组
-- 这个字节数组就是 seriesKey，用于索引查找
-- Tags 排序确保相同 tag 组合（不管写入顺序）生成相同的 seriesKey
+- `indexKl = 4 + 2 + len(name) + 2 + 4*len(tags) + tags.TagsSize()`：对本例 = 4+2+3+2+8+(4+7+6+2) = 38
+- `MarshalUint32/MarshalUint16`：总长度与各字段长度均按大端写入
+- 这个字节数组就是 IndexKey（seriesKey），用于索引查找
+- 写入前的 tag 排序由解析器完成（`lib/util/lifted/vm/protoparser/influx/parser.go:1191`），确保相同 tag 组合生成相同 IndexKey
 
 **最终 IndexKey 字节布局**：
 ```
@@ -3586,55 +3684,66 @@ flowchart TB
 
 ```go
 func (idx *MergeSetIndex) getSeriesIdBySeriesKey(seriesKeyWithVersion []byte) (uint64, error) {
-    var tsid uint64
+	var tsid uint64
+	hitRatioStat.AddSeriesKeyToTSIDCacheGetTotal(1)
+	exist, err := idx.cache.GetTSIDFromTSIDCache(&tsid, seriesKeyWithVersion)
+	if err != nil {
+		return 0, err
+	}
+	if exist {
+		if delTsidSet := idx.GetDeletedTSIDs(); delTsidSet == nil || !delTsidSet.Has(tsid) {
+			return tsid, nil
+		}
+	}
 
-    // ===== 第一级：Cache 查找 =====
-    exist, err := idx.cache.GetTSIDFromTSIDCache(&tsid, seriesKeyWithVersion)
-    // 假设缓存未命中 → exist=false
+	hitRatioStat.AddSeriesKeyToTSIDCacheGetMissTotal(1)
+	if idx.bfExist() && !idx.CheckSeriesKeyExist(seriesKeyWithVersion) {
+		return 0, nil
+	}
 
-    if exist {
-        // 检查是否已删除
-        if delTsidSet := idx.GetDeletedTSIDs(); delTsidSet == nil || !delTsidSet.Has(tsid) {
-            return tsid, nil  // 缓存命中且未删除，直接返回（最快路径）
-        }
-    }
+	defer func(id *uint64) {
+		if *id != 0 {
+			if err = idx.cache.PutTSIDToTSIDCache(id, seriesKeyWithVersion); err != nil {
+				idx.logger.Error("failed to put tsid to tsid cache", zap.Error(err))
+			}
+		} else {
+			hitRatioStat.AddSeriesKeyToTSIDCacheGetNewSeriesTotal(1)
+		}
+	}(&tsid)
 
-    // ===== 第二级：BloomFilter =====
-    if idx.bfExist() && !idx.CheckSeriesKeyExist(seriesKeyWithVersion) {
-        return 0, nil  // BF 说"一定不存在"，返回 0（新 series）
-    }
+	is := idx.getIndexSearch()
+	defer idx.putIndexSearch(is)
 
-    // ===== 第三级：磁盘查找 =====
-    is := idx.getIndexSearch()
-    defer idx.putIndexSearch(is)
+	tsid, err = is.getTSIDBySeriesKey(seriesKeyWithVersion)
 
-    tsid, err = is.getTSIDBySeriesKey(seriesKeyWithVersion)
-    // 如果找到 → tsid > 0
-    // 如果没找到 → tsid = 0, err = io.EOF
+	if err == nil {
+		if delTsidSet := idx.GetDeletedTSIDs(); delTsidSet == nil || !delTsidSet.Has(tsid) {
+			return tsid, nil
+		}
+	}
 
-    // defer: 找到后自动写回缓存
-    defer func(id *uint64) {
-        if *id != 0 {
-            idx.cache.PutTSIDToTSIDCache(id, seriesKeyWithVersion)
-        }
-    }(&tsid)
-
-    return tsid, nil
+	if err != io.EOF {
+		return 0, err
+	}
+	return 0, nil
 }
 ```
 
 **逐行解释**：
-- `GetTSIDFromTSIDCache()`：查内存缓存（HashMap），命中率 ~95%
+- `GetTSIDFromTSIDCache()`：查内存缓存（workingsetcache），命中率为经验值（~95%，未确认）
 - `CheckSeriesKeyExist()`：查 BloomFilter，如果返回 false 则 100% 不存在（无假阴性）
-- `getTSIDBySeriesKey()`：去 MergeSet 磁盘查找（最慢路径）
-- `defer func()`：用 defer 确保找到 TSID 后自动写回缓存
+- `getTSIDBySeriesKey()`：去 MergeSet 磁盘查找（最慢路径）；找到后还要再查一次 deletedTSIDs
+- 未找到时区分 `io.EOF` 与其他错误，`io.EOF` 返回 `(0, nil)`
+- `defer func()`：磁盘路径找到 TSID 后自动写回缓存（缓存命中路径已提前返回）
 
-**三级查找的性能对比**：
+**三级查找的性能对比（经验值，未确认）**：
 | 级别 | 数据结构 | 命中率 | 延迟 |
 |------|----------|--------|------|
-| L1 Cache | HashMap | ~95% | ~100ns |
-| L2 BloomFilter | BloomFilter | ~99% (排除不存在) | ~200ns |
+| L1 Cache | workingsetcache | ~95% | ~100ns |
+| L2 BloomFilter | BloomFilter | 排除不存在（无假阴性） | ~200ns |
 | L3 磁盘 | MergeSet (LSM-tree) | 100% | ~1ms |
+
+> 上表命中率/延迟为经验值，代码中没有对应常量或测量，未确认。
 
 ### 12.4 Step 3 详解：GenerateUUID — 生成 64-bit TSID
 
@@ -3707,9 +3816,9 @@ func (iBuilder *IndexBuilder) GenerateUUID() uint64 {
 - 使用 `atomic.AddUint64` 而非互斥锁，保证高并发下的性能
 - `sequenceID` 是 `*uint64`（指针类型），便于在 IndexBuilder 和 Options 间共享
 - 从 kbPool 获取 buffer 并归还，减少 GC 压力
-- 64 位足够大，不会溢出
+- 低 40 位在约 2^40 次递增后回绕；高 24 位 logicalClock 用于区分不同的逻辑时钟区间
 
-### 12.5 Step 4 详解：decode — 生成 5 类索引条目
+### 12.5 Step 4 详解：decode — 生成 5 条索引条目（4 种类型）
 
 ```mermaid
 flowchart TB
@@ -3718,12 +3827,12 @@ flowchart TB
         B["seriesKey = cpu,host=server1,region=us"]
     end
 
-    subgraph Process["decode() 生成 5 类索引条目"]
+    subgraph Process["decode() 生成 5 条索引条目（4 种类型）"]
         C["[0x00] + seriesKey → TSID<br/>正向查找"]
         D["[0x01] + TSID → seriesKey<br/>反向查找"]
-        E["[0x02] + cpu + host + server1 → TSID<br/>Tag索引1"]
-        F["[0x02] + cpu + region + us → TSID<br/>Tag索引2"]
-        G["[0x02] + cpu + [0xFE] → TSID<br/>Measurement索引（基于实际代码修正）"]
+        E["[0x02] + [0xFE] + len + cpu + host + [0x01] + server1 + [0x01] → TSID<br/>Tag索引1"]
+        F["[0x02] + [0xFE] + len + cpu + region + [0x01] + us + [0x01] → TSID<br/>Tag索引2"]
+        G["[0x02] + [0xFE] + len + name + [0x01] + [0x01] → TSID<br/>Measurement索引"]
     end
 
     A --> C
@@ -3740,7 +3849,7 @@ flowchart TB
 
 **通俗解释 — 建 primary MergeSet 索引卡**：
 
-decode 函数就像给新会员建立索引卡。固定有 3 类基础卡，再为每个 tag 各建一张标签卡，所以总数是 `3 + tag 数`：
+decode 函数就像给新会员建立索引卡。固定有 3 条基础条目（正向、反向、Measurement），再为每个 tag 各建一条标签条目，所以总数是 `3 + tag 数`：
 1. **正向卡**：会员名 → 会员号（写入时用）
 2. **反向卡**：会员号 → 会员名（查询结果展示用）
 3. **标签卡**：每个标签 → 会员号（条件查询用，如"找所有host=server1的"）
@@ -3749,40 +3858,33 @@ decode 函数就像给新会员建立索引卡。固定有 3 类基础卡，再�
 **代码路径**：`engine/index/tsi/mergeset_index.go:841-893`
 
 ```go
-func (idx *MergeSetIndex) decode(ii *mergeindex.IndexItems, seriesKey []byte, name []byte, tags []influx.Tag, ...) uint64 {
-    tsid := idx.indexBuilder.GenerateUUID()  // TSID = 1099511627775289
+func (idx *MergeSetIndex) decode(ii *mergeindex.IndexItems, seriesKey []byte, name []byte, tags []influx.Tag, tagArray [][]influx.Tag, enableTagArray bool) uint64 {
+	tsid := idx.indexBuilder.GenerateUUID()
+	// Create Series key -> TSID index
+	ii.B = append(ii.B, nsPrefixKeyToTSID)
+	ii.B = append(ii.B, seriesKey...)
+	ii.B = append(ii.B, kvSeparatorChar)
+	ii.B = encoding.MarshalUint64(ii.B, tsid)
+	ii.Next()
 
-    // ===== 条目 1: SeriesKey → TSID（正向查找）=====
-    ii.B = append(ii.B, nsPrefixKeyToTSID)   // 前缀 [0x00]
-    ii.B = append(ii.B, seriesKey...)        // seriesKey (38 bytes)
-    ii.B = append(ii.B, kvSeparatorChar)     // 分隔符 [0x02]
-    ii.B = encoding.MarshalUint64(ii.B, tsid) // TSID (8 bytes)
-    ii.Next()  // 提交一个条目
+	// Create TSID -> Series key index
+	ii.B = append(ii.B, nsPrefixTSIDToKey)
+	ii.B = encoding.MarshalUint64(ii.B, tsid)
+	ii.B = append(ii.B, seriesKey...)
+	ii.Next()
 
-    // ===== 条目 2: TSID → SeriesKey（反向查找）=====
-    ii.B = append(ii.B, nsPrefixTSIDToKey)   // 前缀 [0x01]
-    ii.B = encoding.MarshalUint64(ii.B, tsid) // TSID
-    ii.B = append(ii.B, seriesKey...)        // seriesKey
-    ii.Next()
+	// Create Tag -> TSID index
+	compositeKey := kbPool.Get()
+	...
+	compositeKey.B = marshalCompositeTagKey(compositeKey.B[:0], name, nil)
+	ii.B = append(ii.B, nsPrefixTagToTSIDs)
+	ii.B = marshalTagValue(ii.B, compositeKey.B)
+	ii.B = marshalTagValue(ii.B, nil)
+	ii.B = encoding.MarshalUint64(ii.B, tsid)
+	ii.Next()
 
-    // ===== 条目 3: Tag → TSID（条件查询）=====
-    for i := range tags {
-        // 每个 tag 生成一条索引
-        ii.B = idx.marshalTagToTSIDs(compositeKey.B, ii.B, name, tags[i], tsid)
-        // 对于 tag={host,server1}:
-        //   [0x02] + "cpu" + [0x01] + "host" + [0x01] + "server1" + TSID
-        ii.Next()
-    }
-
-    // ===== 条目 4: Measurement → TSID（measurement 级索引）=====
-    compositeKey.B = marshalCompositeTagKey(compositeKey.B[:0], name, nil)
-    ii.B = append(ii.B, nsPrefixTagToTSIDs)  // 前缀 [0x02]
-    ii.B = marshalTagValue(ii.B, compositeKey.B)
-    ii.B = marshalTagValue(ii.B, nil)        // tagValue = nil（measurement 级）
-    ii.B = encoding.MarshalUint64(ii.B, tsid)
-    ii.Next()
-
-    return tsid
+	kbPool.Put(compositeKey)
+	return tsid
 }
 ```
 
@@ -3815,19 +3917,19 @@ decode 就像"创建新会员的完整档案"。当一个新会员注册时，�
   用途: 查询时根据 TSID 还原 seriesKey
 
 条目 3 (Tag 索引 - host=server1):
-  Key: [0x02] + "cpu" + [0x01] + "host" + [0x01] + "server1"
+  Key: [0x02] + [0xFE] + [0x03] + "cpu" + "host" + [0x01] + "server1" + [0x01]
   Value: TSID(8B)
   用途: WHERE host='server1' 条件查询
 
 条目 4 (Tag 索引 - region=us):
-  Key: [0x02] + "cpu" + [0x01] + "region" + [0x01] + "us"
+  Key: [0x02] + [0xFE] + [0x03] + "cpu" + "region" + [0x01] + "us" + [0x01]
   Value: TSID(8B)
   用途: WHERE region='us' 条件查询
 
 条目 5 (Measurement 索引):
-  Key: [0x02] + "cpu" + [0xFE] + [0x00]
+  Key: [0x02] + [0xFE] + [0x03] + "cpu" + [0x01] + [0x01]
   Value: TSID(8B)
-  用途: 无 tag 条件的查询（基于实际代码修正）
+  用途: 无 tag 条件的查询
 ```
 
 ### 12.6 索引查询实战：`SELECT * FROM cpu WHERE host='server1' AND region='us'`
@@ -3847,36 +3949,34 @@ sequenceDiagram
     SQL->>Search: SELECT * FROM cpu WHERE host='server1' AND region='us'
     Search->>Search: 解析 WHERE 条件 → 2 个 tagFilter
 
-    Note over Search: ===== 并行查找每个 tagFilter =====
+    Note over Search: ===== 按 cost 顺序逐个查找 =====
 
-    par 并行
-        Search->>Filter1: getTSIDsByTagFilter()
-        Filter1->>Cache: 查找缓存
-        Cache-->>Filter1: 缓存未命中
-        Filter1->>MS: Seek([0x02]+"cpu"+[0x01]+"host")
-        Note over MS: 构造前缀 prefix
-        MS->>MS: 二分查找定位到第一个匹配条目
-        loop 遍历匹配条目
-            MS->>MS: NextItem()
-            MS->>MS: 检查前缀 [0x02]+"cpu"+[0x01]+"host"+[0x01]+"server1"
-            MS->>MS: 提取 TSID
-        end
-        MS-->>Filter1: TSIDs=[100, 101, 103]
-        Filter1->>Cache: 写入缓存
-    and
-        Search->>Filter2: getTSIDsByTagFilter()
-        Filter2->>MS: Seek([0x02]+"cpu"+[0x01]+"region")
-        MS-->>Filter2: TSIDs=[100, 102, 103]
+    Search->>Filter1: searchTSIDsWithTagFilter()
+    Filter1->>Cache: 查找缓存
+    Cache-->>Filter1: 缓存未命中
+    Filter1->>MS: Seek([0x02]+[0xFE]+0x03+"cpu"+"host"+[0x01])
+    Note over MS: 构造前缀 prefix
+    MS->>MS: 二分查找定位到第一个匹配条目
+    loop 遍历匹配条目
+        MS->>MS: NextItem()
+        MS->>MS: 检查前缀 [0x02]+[0xFE]+0x03+"cpu"+"host"+[0x01]
+        MS->>MS: 提取 TSID
     end
+    MS-->>Filter1: TSIDs=[100, 101, 103]
+    Filter1->>Cache: 写入缓存
+
+    Search->>Filter2: searchTSIDsWithTagFilter()
+    Filter2->>MS: Seek([0x02]+[0xFE]+0x03+"cpu"+"region"+[0x01])
+    MS-->>Filter2: TSIDs=[100, 102, 103]
 
     Note over Search: ===== AND 交集 =====
     Search->>Result: [100, 101, 103] ∩ [100, 102, 103] = [100, 103]
 
     Note over Search: ===== 还原 seriesKey =====
     loop 对每个 TSID
-        Search->>MS: getSeriesKeyByTSID(100)
+        Search->>MS: searchSeriesKey(100)
         MS-->>Search: seriesKey = "cpu,host=server1,region=us"
-        Search->>MS: getSeriesKeyByTSID(103)
+        Search->>MS: searchSeriesKey(103)
         MS-->>Search: seriesKey = "cpu,host=server1,region=us,zone=a"
     end
 
@@ -3886,82 +3986,63 @@ sequenceDiagram
 **代码路径**：`engine/index/tsi/tag_filters.go:34-71` 和 `engine/index/tsi/mergeset_index.go`
 
 ```go
-// tagFilter 结构
-type tagFilter struct {
-    key   []byte    // "host"
-    value []byte    // "server1"
-    name  []byte    // "cpu"
-    prefix []byte   // MergeSet Seek 前缀
-    // ...
-}
-
-// Init 初始化
-func (tf *tagFilter) Init() {
-    // 构造 compositeKey = [prefix] + len(name) + name + key
-    compositeKey := marshalCompositeTagKey(nil, tf.name, tf.key)
-    // compositeKey = [0xFE] + [0x03] + "cpu" + "host"（基于实际代码修正）
-
-    // 构造前缀 = [0x02] + marshalTagValue(compositeKey)
-    tf.prefix = marshalTagValue(tf.prefix[:0], compositeKey)
-    // tf.prefix = [0x02] + [0x07] + [0xFE]+[0x03]+"cpu"+"host"（基于实际代码修正）
+// Init 初始化（节选：前面对字段做 reset，此处只保留前缀构造）
+func (tf *tagFilter) Init(name, key, value []byte, isNegative, isRegexp bool) error {
+	...
+	compositeKey := kbPool.Get()
+	compositeKey.B = marshalCompositeTagKey(compositeKey.B[:0], name, key)
+	tf.prefix = append(tf.prefix, nsPrefixTagToTSIDs)
+	tf.prefix = marshalTagValue(tf.prefix, compositeKey.B)
+	kbPool.Put(compositeKey)
+	...
 }
 ```
 
 **逐行解释**：
-- `marshalCompositeTagKey()`：构造组合键 = name + key
-- `marshalTagValue()`：将组合键编码为带长度前缀的字节数组
-- `tf.prefix`：用于 MergeSet 的 Seek 操作，快速定位到第一个匹配的条目
+- `marshalCompositeTagKey()`：构造组合键 = `[0xFE] + len(name) + name + key`
+- `marshalTagValue()`：原样追加组合键并补 `[0x01]`（没有长度前缀）
+- `tf.prefix`：`[0x02] + [0xFE] + 0x03 + "cpu" + "host" + [0x01]`，用于 MergeSet 的 Seek 定位
 
 ```go
-// getTSIDsByTagFilter 查询满足条件的 TSIDs
-func (tf *tagFilter) getTSIDsByTagFilter(ts *TableSearch) ([]uint64, error) {
-    ts.Seek(tf.prefix)  // 定位到第一个匹配的条目
+func (is *indexSearch) getTSIDsByTagFilterNoRegex(tf *tagFilter) (*uint64set.Set, int64, error) {
+	if !tf.isNegative {
+		if len(tf.value) != 0 {
+			tsids, err := is.searchTSIDsByTagFilter(tf)
+			return tsids, int64(tsids.Len()), err
+		}
 
-    var tsids []uint64
-    for ts.NextItem() {
-        if !bytes.HasPrefix(ts.Item, tf.prefix) {
-            break  // 前缀不匹配，结束遍历
-        }
+		tsids, err := is.getTSIDsByMeasurementName(tf.name)
+		if err != nil {
+			return nil, math.MaxInt64, err
+		}
 
-        // 提取 tagValue
-        tagValue := extractTagValue(ts.Item, tf.prefix)
+		m, err := is.searchTSIDsByTagFilter(tf)
+		if err != nil {
+			return nil, math.MaxInt64, err
+		}
 
-        // 检查 tagValue 是否匹配
-        if tf.matchValue(tagValue) {
-            tsid := extractTSID(ts.Item)
-            tsids = append(tsids, tsid)
-        }
-    }
-    return tsids, nil
-}
-
-// matchValue 检查 tagValue 是否匹配
-func (tf *tagFilter) matchValue(tagValue []byte) bool {
-    if tf.isRegexp {
-        return tf.reSuffixMatch(tagValue)  // 正则匹配
-    }
-    if tf.isNegative {
-        return !bytes.Equal(tagValue, tf.value)  // != 匹配
-    }
-    return bytes.Equal(tagValue, tf.value)  // = 匹配
+		cost := int64(tsids.Len() + m.Len())
+		tsids.Subtract(m)
+		return tsids, cost, nil
+	}
+	...
 }
 ```
 
 **逐行解释**：
-- `ts.Seek(tf.prefix)`：在 MergeSet 中二分查找，定位到第一个 >= prefix 的条目
-- `bytes.HasPrefix(ts.Item, tf.prefix)`：检查当前条目是否以 prefix 开头
-- `extractTagValue()`：从条目中提取 tagValue 部分
-- `matchValue()`：检查 tagValue 是否满足条件（=, !=, =~, !~）
-- `extractTSID()`：从条目中提取 TSID
+- `getTSIDsByTagFilterNoRegex()`：非正则 tagFilter 的入口；正则走 `getTSIDsByTagFilterWithRegex`（`engine/index/tsi/search.go:1238`）
+- `searchTSIDsByTagFilter(tf)`：按 `tf.prefix` 在 MergeSet 中 Seek 并遍历（最终调用 5.4 的 `getTSIDsForTagFilterSlow`）
+- `getTSIDsByMeasurementName(tf.name)`：`tag=''`/`tag!=''` 时先取整个 measurement 的 TSID 集合
+- `tsids.Subtract(m)`：实现 `tag=''` 的差集；返回的 `cost` 用于查询优化排序
 
 **通俗解释**：
 查询实战就像"按条件找人"。假设你要找"住在北京、姓张、身高180cm以上的人"：
 1. **解析条件**：把 WHERE 条件拆成 3 个独立的过滤器
-2. **并行查找**：同时在 3 个索引中查找
+2. **顺序查找**：按 cost 从小到大逐个查，先用结果集最小的条件缩小范围
    - 查"住在北京"的人 → [1001, 1002, 1003]
    - 查"姓张"的人 → [1001, 1003, 1005]
    - 查"身高180cm以上"的人 → [1001, 1002, 1005]
-3. **取交集**：找出同时满足 3 个条件的人 → [1001]
+3. **取交集**：按顺序逐个交集，找出同时满足 3 个条件的人 → [1001]
 4. **还原信息**：根据会员号查出完整信息
 
 ### 12.7 AND 交集计算
@@ -3986,55 +4067,37 @@ sequenceDiagram
 
 AND 交集不是盲目并行查完所有条件，而是先查代价更小的条件，把候选集缩小后再顺序交集。这样后面的过滤条件处理的数据更少；如果候选集已经很小，还可以用 prune 反查 seriesKey 直接剪枝。
 
-**代码路径**：`engine/index/tsi/mergeset_index.go`
+**代码路径**：`lib/util/lifted/vm/uint64set/uint64set.go:313-350`（交集）；排序/剪枝见 5.3 的 `seriesByTagFilters`（`engine/index/tsi/search.go:441-539`）
 
 ```go
-// seriesByTagFilters 处理多个 tagFilter 的 AND 条件
-func (idx *MergeSetIndex) seriesByTagFilters(filters []tagFilter) ([]uint64, error) {
-    // 1. 计算 cost 并升序排序
-    costs := buildTagFilterCosts(filters)
-    sortByCost(costs)
-
-    // 2. 先用代价最低的 filter 建初始集合
-    result := searchTSIDsWithTagFilter(costs[0].filter)
-
-    // 3. 后续 filter 顺序交集；必要时用 prune 剪枝
-    for i := 1; i < len(costs); i++ {
-        if shouldPrune(costs[i], len(result)) {
-            result = doPrune(result, costs[i:])
-            break
-        }
-        next := searchTSIDsWithTagFilter(costs[i].filter)
-        result = intersect(result, next)
-        if len(result) == 0 {
-            break
-        }
-    }
-    return result, nil
-}
-
-// intersect 计算两个有序切片的交集
-func intersect(a, b []uint64) []uint64 {
-    var result []uint64
-    i, j := 0, 0
-    for i < len(a) && j < len(b) {
-        if a[i] == b[j] {
-            result = append(result, a[i])
-            i++
-            j++
-        } else if a[i] < b[j] {
-            i++
-        } else {
-            j++
-        }
-    }
-    return result
+func (s *Set) Intersect(a *Set) {
+	if s.Len() == 0 || a.Len() == 0 {
+		// Fast path - the result is empty.
+		*s = Set{}
+		return
+	}
+	// Make shallow copy of `a`, since it can be modified by a.sort().
+	a = a.cloneShallow()
+	a.sort()
+	s.sort()
+	i := 0
+	j := 0
+	for {
+		...
+		if s.buckets[i].hi == a.buckets[j].hi {
+			s.buckets[i].intersect(&a.buckets[j])
+			i++
+			j++
+		}
+	}
+	s.fixItemsCount()
 }
 ```
 
 **逐行解释**：
-- `filters[i].getTSIDsByTagFilter(ts)`：并行查找每个 tagFilter 的结果
-- `intersect(result, results[i])`：计算两个有序切片的交集（双指针法）
+- `a.sort()` / `s.sort()`：先按桶的 `hi` 排序
+- 按桶归并：`hi` 小的桶丢弃，`hi` 相同的桶调用 `bucket32.intersect` 求交
+- 不是 `[]uint64` 的双指针；`seriesByTagFilters` 的排序/剪枝逻辑见 5.3
 - 最终结果是所有 filter 的交集（AND 语义）
 
 **通俗解释**：
@@ -4054,19 +4117,19 @@ AND 交集计算就像"找共同好友"。假设你有 3 个社交圈：
 ```mermaid
 flowchart LR
     subgraph Input["输入: 3个 tagFilter"]
-        A["host='server1' (cost=0)"]
-        B["region='us' (cost=0)"]
-        C["host =~ /^server/ (cost=100)"]
+        A["host='server1' (cost=5000)"]
+        B["region='us' (cost=20000)"]
+        C["rack='r1' (cost=120)"]
     end
 
-    subgraph Process["sortFiltersByCost()"]
-        D["按 cost 升序排列"]
+    subgraph Process["sortTagFilterWithCost()"]
+        D["按 cost 升序排列<br/>tag='' 的过滤器排最后"]
     end
 
     subgraph Output["输出: 排序后的 filter"]
-        E["host='server1' (cost=0) ← 先查"]
-        F["region='us' (cost=0) ← 次之"]
-        G["host =~ /^server/ (cost=100) ← 最后查"]
+        E["rack='r1' (cost=120) ← 先查"]
+        F["host='server1' (cost=5000) ← 次之"]
+        G["region='us' (cost=20000) ← 最后查"]
     end
 
     A --> D
@@ -4081,33 +4144,37 @@ flowchart LR
     style Output fill:#e8f5e9
 ```
 
-**通俗解释 — 先查精确条件**：
+**通俗解释 — 先查结果集小的条件**：
 
-cost-based 排序就像查快递时先查最精确的条件：
-- **先查**：`host='server1'`（精确匹配，结果集小）
-- **次之**：`region='us'`（精确匹配，结果集小）
-- **最后查**：`host =~ /^server/`（正则匹配，结果集大）
+cost-based 排序不是按“匹配是否精确”，而是按历史统计的结果集大小（cost）从小到大执行：
+- **先查**：`rack='r1'`（历史结果集 120，最小）
+- **次之**：`host='server1'`（历史结果集 5000）
+- **最后查**：`region='us'`（历史结果集 20000，最大）
 
-这样先用精确条件缩小范围，再用模糊条件过滤，总工作量最小。
+这样先用结果集小的条件缩小范围，再做交集，总工作量最小。
 
-**代码路径**：`engine/index/tsi/tag_filters.go`
+**代码路径**：`engine/index/tsi/search.go:411-439`
 
 ```go
-// 按 matchCost 排序 filter，代价小的先查
-func sortFiltersByCost(filters []tagFilter) []tagFilter {
-    sort.Slice(filters, func(i, j int) bool {
-        return filters[i].matchCost < filters[j].matchCost
-    })
-    return filters
+func (is *indexSearch) sortTagFilterWithCost(tfcosts []tagFilterWithCost) {
+	...
+	sort.Slice(tfcosts, func(i, j int) bool {
+		a, b := &tfcosts[i], &tfcosts[j]
+		...
+		if a.tf.IsFilterEmptyValue() && b.tf.IsFilterEmptyValue() {
+			return a.cost < b.cost
+		}
+		...
+		return a.cost < b.cost
+	})
 }
 ```
 
 **逐行解释**：
-- `matchCost`：匹配代价，值越小越先查
-- 等值匹配 `host='server1'` → matchCost = 0（最精确）
-- 正则匹配 `host=~'server.*'` → matchCost = 10（需要遍历更多条目）
-- 全匹配 `host=~'.*'` → matchCost = 100（需要遍历所有条目）
-- 先查代价小的 filter，可以尽早缩小结果集，减少后续 filter 的遍历范围
+- `cost`（int64）：来自 `TagFilterCostCache` 的历史结果集大小（`getTagFilterCost`），不是 `matchCost`
+- `sortTagFilterWithCost()`：按 `cost` 升序排序；`IsFilterEmptyValue()` 的过滤器（`tag=''`/`tag!=''`）排到最后
+- `tagFilter.matchCost` 是另一套“匹配计算代价”，常量为 fullMatchCost=1、prefixMatchCost=2、literalMatchCost=3、suffixMatchCost=4、middleMatchCost=6、reMatchCost=100（`engine/index/tsi/tag_filters.go:124-129`），不参与这里的排序
+- 先查 cost 小的 filter，可以尽早缩小结果集，减少后续 filter 的遍历范围
 
 **通俗解释**：
 查询优化就像"找人策略"。假设你要找"住在北京、姓张、身高180cm以上的人"：
@@ -4125,10 +4192,11 @@ func sortFiltersByCost(filters []tagFilter) []tagFilter {
 flowchart TB
     subgraph Write["写入路径"]
         W1["写入请求"] --> W2["构造 seriesKey"]
-        W2 --> W3["三级查找：Cache → BF → 磁盘"]
+        W2 --> W2b["IndexBuilder.CreateIndexIfNotExists → WriteRow 队列"]
+        W2b --> W3["三级查找：Cache → BF → 磁盘"]
         W3 --> W4{"TSID=0?"}
         W4 -->|是| W5["GenerateUUID → 新 TSID"]
-        W5 --> W6["创建 5 类索引条目"]
+        W5 --> W6["创建 5 条索引条目（4 种类型）"]
         W4 -->|否| W7["使用已有 TSID"]
         W6 --> W8["写入 MergeSet Table"]
         W7 --> W9["写入 TSSP 数据文件"]
@@ -4137,7 +4205,7 @@ flowchart TB
     subgraph Read["查询路径"]
         R1["SELECT * FROM cpu WHERE host='server1'"] --> R2["解析为 tagFilter"]
         R2 --> R3["按 cost 排序"]
-        R3 --> R4["并行 Seek MergeSet"]
+        R3 --> R4["顺序 Seek MergeSet"]
         R4 --> R5["AND 交集"]
         R5 --> R6["过滤 deletedTSIDs"]
         R6 --> R7["还原 seriesKey"]
@@ -4159,30 +4227,30 @@ Step 4: GenerateUUID → TSID=3001
 Step 5: 创建索引条目：
   [0x00] + "cpu,host=server1,region=us" → 3001  (正向)
   [0x01] + 3001 → "cpu,host=server1,region=us"  (反向)
-  [0x02] + "cpu" + "host" + "server1" → 3001    (Tag)
-  [0x02] + "cpu" + "region" + "us" → 3001       (Tag)
-  [0x02] + "cpu" + [0xFE] → 3001                  (Measurement)（基于实际代码修正）
+  [0x02] + [0xFE] + [0x03] + "cpu" + "host" + [0x01] + "server1" + [0x01] → 3001    (Tag)
+  [0x02] + [0xFE] + [0x03] + "cpu" + "region" + [0x01] + "us" + [0x01] → 3001       (Tag)
+  [0x02] + [0xFE] + [0x03] + "cpu" + [0x01] + [0x01] → 3001       (Measurement)
 Step 6: 写入 TSSP：SeriesID=3001, Time=1234567890, Value=99.5
 ```
 
 | 设计点 | 实现方式 | 优势 |
 |--------|----------|------|
-| 三级查找 | Cache → BloomFilter → 磁盘 | 95% 命中缓存，99% 通过 BF 排除 |
+| 三级查找 | Cache → BloomFilter → 磁盘 | 缓存命中率高（经验值 ~95%，未确认），BF 可排除不存在的 series |
 | 分片 BF | 与队列路由一致的 hash 分片 | 无锁操作，并发安全 |
-| 5 类索引条目 | 正向/反向/Tag×N/Measurement | 支持各种查询模式 |
+| 4 种索引条目（2 tag 时 5 条） | 正向/反向/Tag×N/Measurement | 支持各种查询模式 |
 | 并行写入队列 | hash 分片的 channel | 避免全局锁竞争 |
-| 延迟删除 | deletedTSIDs 标记集合 | 删除操作 O(1)，后台物理清理 |
-| cost-based 优化 | 按 matchCost 排序 filter | 先查精确条件，减少遍历范围 |
+| 延迟删除 | deletedTSIDs 标记集合 | 按批量标记；由 DropSeries 重写 Part 清理 |
+| cost-based 优化 | 按 cost（历史结果集大小）排序 filter | 先查结果集小的条件，减少遍历范围 |
 | LSM-tree 存储 | MergeSet Table | 写入高效，后台合并优化读取 |
 
 **通俗解释**：
 索引系统的设计就像一个高效的"会员管理系统"：
-1. **三级查找**：先问身边的人（缓存），再查黑名单（BloomFilter），最后去档案室（磁盘）
+1. **三级查找**：先问身边的人（缓存），再查布告栏（BloomFilter），最后去档案室（磁盘）
 2. **分片 BF**：多个保安同时工作，互不干扰
-3. **5 类索引条目**：从多个角度建立索引，无论怎么查都能快速找到
+3. **4 种索引条目（2 tag 时 5 条）**：从多个角度建立索引，无论怎么查都能快速找到
 4. **并行写入队列**：多个窗口同时办理业务，避免排队
-5. **延迟删除**：先标记"待注销"，等整理时再真正删除
-6. **cost-based 优化**：先执行最精确的条件，减少后续工作量
+5. **延迟删除**：先标记"待注销"，等 drop-series 任务/DDL 执行时再真正删除
+6. **cost-based 优化**：先执行结果集最小的条件，减少后续工作量
 7. **LSM-tree 存储**：写入时先记在便签上，定期整理到笔记本
 
 这样系统就能高效处理大量的写入和查询请求了！

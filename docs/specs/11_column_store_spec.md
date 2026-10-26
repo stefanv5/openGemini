@@ -1,5 +1,7 @@
 # Module 11: 列存（Column Store）存储引擎深度审计报告（庖丁解牛版 v3）
 
+> 代码基线：`origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）。
+>
 > 时序图 + 核心代码逐行解释。先画图，再对照代码，一步一步拆解。
 
 ---
@@ -18,7 +20,7 @@ openGemini 的列存引擎（Column Store，简称 CS）是专门为**分析型�
 | 适用场景 | 点查、写入密集 | 聚合扫描、分析查询 |
 | 编码方式 | 按 series 组织 block | 按列独立编码 |
 | 索引 | SeriesKey + BlockIndex | PrimaryKey(COLX) + 二级索引 |
-| NULL 支持 | Bitmap 标记 | 数据列使用 bitmap / nil 标记表达 NULL；PK 列通过 `nil_indicator` 编码 NULL |
+| NULL 支持 | Bitmap 标记 | 数据列使用 bitmap / nil 标记表达 NULL；PK 列通过每字段第 2 字节的 NULL 标记（0=nil，1=非 nil）编码 NULL |
 | Schema 演进 | 动态扩展 | `padCol` 填充 |
 
 ### 1.2 为什么需要列存
@@ -36,7 +38,9 @@ graph TB
     subgraph 写入路径
         A[Arrow Flight / Line Protocol] --> B[ColumnStoreImpl]
         B --> C[CSMemTableImpl]
-        C --> D[IndexBuilder]
+        B -.->|WriteIndexForCols| T[tsi.IndexBuilder]
+        C -.->|快照刷盘| MB[MsBuilder]
+        MB --> D[colstore.IndexBuilder]
         D --> E[ChunkBuilder]
         E --> F[ColumnBuilder]
     end
@@ -49,7 +53,8 @@ graph TB
 
     F --> G
     C --> H
-    D --> I
+    MB --> I
+    T --> I
 
     subgraph 查询路径
         J0[SparseIndexScanTransform] --> J1[Store.ScanWithSparseIndex]
@@ -59,7 +64,7 @@ graph TB
         J --> K[initReadCursor]
         K --> N[Location.Contains / segment range]
         N --> R[ColumnStoreReader.Run]
-        R --> L[列解码 column_reader.go]
+        R --> L[列解码（TSSP 数据列）]
     end
 
     G --> M
@@ -67,7 +72,7 @@ graph TB
 ```
 
 **通俗解释**：
-- 写入时：数据经过 ColumnStoreImpl -> CSMemTableImpl -> IndexBuilder -> ChunkBuilder -> ColumnBuilder 逐层编码
+- 写入时：数据先经 ColumnStoreImpl -> CSMemTableImpl 进入内存表；快照刷盘时经 MsBuilder 交给 colstore.IndexBuilder，再由 ChunkBuilder -> ColumnBuilder 编码 **PK 记录**（不是数据列）。另有并行的 `WriteIndexForCols` 写 tsi 的 tag/series 倒排索引
 - 存储时：PK 信息写入 COLX 文件，数据写入 TSSP 文件，索引单独存储
 - 查询时：端到端 sparse index scan 先在 Store/Shard 侧生成 fragment 结果；`ColumnStoreReader.Work()` / `Run()` 消费这些 frags，并在 `initReadCursor` 中通过 `Location.Contains` 和 segment range 映射定位数据。PK/SK/Sparse Index 是 Reader 前置剪枝组件，不是 Reader 内部的顶层入口。
 
@@ -147,12 +152,17 @@ classDiagram
         +FlushChunksDetached(table, ...)
     }
 
-    class IndexBuilder {
+    class ColStoreIndexBuilder {
         +chunkBuilder *ChunkBuilder
         -fd fileops.File
         +WriteData(rec, tcLocation)
         +WriteDetachedData(rec, tcLocation)
         +WriteDetachedMeta(startId, endId, offset, size, fd)
+    }
+
+    class TSIIndexBuilder {
+        +CreateIndexIfNotExistsByCol(rec, tagIndex, mst)
+        +Flush()
     }
 
     class ChunkBuilder {
@@ -184,17 +194,18 @@ classDiagram
     }
 
     ColumnStoreImpl --> CSMemTableImpl
-    CSMemTableImpl --> IndexBuilder
-    IndexBuilder --> ChunkBuilder
+    ColumnStoreImpl --> TSIIndexBuilder : WriteIndexForCols
+    CSMemTableImpl --> ColStoreIndexBuilder : 快照刷盘经 MsBuilder
+    ColStoreIndexBuilder --> ChunkBuilder
     ChunkBuilder --> ColumnBuilder
-    MstManager --> IndexBuilder
+    MstManager --> ColStoreIndexBuilder
     PrimaryKeyReader --> PrimaryKeyFetcher
 ```
 
 **通俗解释**：
 - `ColumnStoreImpl` 是列存引擎的顶层控制器，管理快照和刷盘
 - `CSMemTableImpl` 是内存表实现，管理并发写入和数据合并
-- `IndexBuilder` 负责构建 PK 索引，内部使用 `ChunkBuilder` 编码数据块
+- `colstore.IndexBuilder` 负责构建 COLX 主键文件，内部使用 `ChunkBuilder` 编码 **PK 记录**（不是数据列）；`tsi.IndexBuilder` 负责 tag/series 倒排索引
 - `ChunkBuilder` 逐列调用 `ColumnBuilder` 编码
 - `MstManager` 是全局单例，管理所有 measurement 的元数据
 
@@ -235,14 +246,14 @@ func (storage *ColumnStoreImpl) WriteCols(s *shard, cols *record.Record,
         return nil
     }
 
-    // 第 217 行：更新最后写入时间
+    // 第 216 行：更新最后写入时间
     atomic.StoreUint64(&s.lastWriteTime, fasttime.UnixTimestamp())
 
-    // 第 218 行：获取写入上下文（带超时）
+    // 第 217 行：获取写入上下文（带超时）
     mw := getMstWriteRecordCtx(nodeMutableLimit.timeOut, s.engineType)
     defer putMstWriteRecordCtx(mw)
 
-    // 第 222-227 行：分配内存资源（限流）
+    // 第 221-228 行：分配内存资源（限流）
     start := time.Now()
     curSize := int64(cols.Size())
     err := nodeMutableLimit.allocResource(curSize, mw.timer)
@@ -251,7 +262,7 @@ func (storage *ColumnStoreImpl) WriteCols(s *shard, cols *record.Record,
         return fmt.Errorf("failed to allocate mutable resource: %w", err)
     }
 
-    // 第 231-239 行：异步写入索引
+    // 第 230-240 行：异步写入 tag/series 倒排索引
     var indexErr error
     var indexWg sync.WaitGroup
     indexWg.Add(1)
@@ -282,9 +293,9 @@ func (storage *ColumnStoreImpl) WriteCols(s *shard, cols *record.Record,
 - **第 192 行**：`WriteCols` 是列存写入的总入口，接收 `record.Record`（列式数据）。`binaryCols` 参数用于 Arrow Flight 路径传递预编码的二进制列数据（如某些列已由客户端完成编码），在 `shard.writeCols` 中传递给 WAL 持久化（`s.wal.Write(binaryCols, WriteWalArrowFlight, 0)`），用于崩溃恢复；`binaryCols` 不会传递给 CSMemTableImpl，内存表写入仅使用解码后的 `record.Record`。
 - **第 196-200 行**：使用 `WaitGroup` 确保写入期间 shard 不会被强制关闭
 - **第 203-215 行**：降采样 shard 标记为只读，禁止直接写入
-- **第 218 行**：`getMstWriteRecordCtx` 从对象池获取写入上下文，带超时计时器
-- **第 222-227 行**：`allocResource` 是内存限流机制，防止内存溢出
-- **第 231-239 行**：索引写入在独立 goroutine 中异步执行，与数据写入并行
+- **第 217 行**：`getMstWriteRecordCtx` 从对象池获取写入上下文，带超时计时器
+- **第 221-228 行**：`allocResource` 是内存限流机制，防止内存溢出
+- **第 230-240 行**：tag/series 倒排索引写入在独立 goroutine 中异步执行（`WriteIndexForCols` → `tsi.IndexBuilder.CreateIndexIfNotExistsByCol`），与数据写入并行
 - **第 243 行**：数据写入是同步的，必须在当前 goroutine 完成
 - **第 248 行**：写入成功后累加内存使用量，用于后续快照决策
 
@@ -305,8 +316,8 @@ Step 2: 内存限流
   → nodeMutableLimit.allocResource(1024, timer) → 等待或成功
 
 Step 3: 并行执行
-  → goroutine: WriteIndexForCols → 构建 PK 索引
-  → 主协程: writeCols → 写入 CSMemTableImpl
+  → goroutine: WriteIndexForCols → 写入 tag/series 倒排索引（tsi.IndexBuilder）
+  → 主协程: shard.writeCols → ColumnStoreImpl.writeCols → 写入 CSMemTableImpl
 
 Step 4: 等待完成
   → indexWg.Wait() → 确保索引写入完成
@@ -414,52 +425,74 @@ sequenceDiagram
 ### 3.3 writeCols 内部实现
 
 ```go
-// 第 252 行：内部写入方法
-func (storage *ColumnStoreImpl) writeCols(s *shard, cols *record.Record,
-    binaryCols []byte, mst string) error {
-
-    // 第 254-256 行：更新行数统计
+// 第 252 行：ColumnStoreImpl.writeCols —— 只负责内存表写入
+func (storage *ColumnStoreImpl) writeCols(s *shard, cols *record.Record, mst string) error {
+    // update the row count for each mst
     storage.mu.Lock()
     mutable.UpdateMstRowCount(s.msRowCount, mst, int64(cols.RowNums()))
     storage.mu.Unlock()
+    return s.activeTbl.MTable.WriteCols(s.activeTbl, cols, mst)
+}
 
-    // 第 257 行：先写入 CSMemTableImpl
-    if err := s.activeTbl.MTable.WriteCols(s.activeTbl, cols, mst); err != nil {
-        return err
+// 第 452 行：(*shard).writeCols —— 先写内存表，再写 Arrow Flight WAL
+func (s *shard) writeCols(cols *record.Record, binaryCols []byte, mst string) error {
+    s.snapshotLock.RLock()
+    defer s.snapshotLock.RUnlock()
+    // write data to mem table
+    // Token is released during the snapshot process, the number of tokens needs to be recorded before data is written.
+    start := time.Now()
+    failpoint.Inject("SlowDownActiveTblWrite", nil)
+    cs, ok := s.storage.(*ColumnStoreImpl)
+    if !ok {
+        return errors.New("unsupported storage engine")
     }
 
-    // 第 260 行：Arrow Flight 路径再写 WAL，用于崩溃恢复
-    return s.wal.Write(binaryCols, WriteWalArrowFlight, 0)
+    err := cs.writeCols(s, cols, mst)
+    if err != nil {
+        log.Error("write cols rec to memory table fail", zap.Uint64("shard", s.ident.ShardID), zap.Error(err))
+        return fmt.Errorf("failed to write cols to memtable: %w", err)
+    }
+    atomic.AddInt64(&statistics.PerfStat.WriteRowsDurationNs, time.Since(start).Nanoseconds())
+
+    // write wal
+    if err = s.wal.Write(binaryCols, WriteWalArrowFlight, 0); err != nil {
+        log.Error("write cols rec to wal fail", zap.Uint64("shard", s.ident.ShardID), zap.Error(err))
+        return fmt.Errorf("failed to write cols to WAL: %w", err)
+    }
+    return nil
 }
 ```
 
 **逐行解释**：
-- **第 254-256 行**：使用互斥锁保护行数统计更新，避免并发竞争
-- **第 257 行**：先委托给 `CSMemTableImpl.WriteCols` 写入列存 MemTable，保证查询可见的内存结构先完成
-- **第 260 行**：随后写 Arrow Flight WAL。`binaryCols` 只用于 WAL 持久化和崩溃恢复，不传给 `CSMemTableImpl`
+- **第 252-258 行**：`ColumnStoreImpl.writeCols` 只做两件事——加锁更新 measurement 行数，然后委托 `CSMemTableImpl.WriteCols` 写入列存 MemTable
+- **第 452-477 行**：真正的 WAL 持久化在 `(*shard).writeCols` 中完成：先调用 `cs.writeCols` 写内存表，成功后再写 WAL
+- **第 472 行**：`s.wal.Write(binaryCols, WriteWalArrowFlight, 0)`。`binaryCols` 只用于 WAL 持久化和崩溃恢复，不传给 `CSMemTableImpl`
 
 **流程图**：
 
 ```mermaid
 sequenceDiagram
+    participant Shard as shard.writeCols
     participant WriteCols as ColumnStoreImpl.writeCols
     participant Mem as CSMemTableImpl
     participant WAL as ArrowFlight WAL
 
+    Shard->>WriteCols: cs.writeCols(s, cols, mst)
     WriteCols->>WriteCols: 更新 measurement 行数
     WriteCols->>Mem: MTable.WriteCols(activeTbl, cols, mst)
     Mem-->>WriteCols: 内存表写入完成
-    WriteCols->>WAL: wal.Write(binaryCols, WriteWalArrowFlight, 0)
-    WAL-->>WriteCols: WAL 持久化完成
+    WriteCols-->>Shard: 返回
+    Shard->>WAL: wal.Write(binaryCols, WriteWalArrowFlight, 0)
+    WAL-->>Shard: WAL 持久化完成
 ```
 
 **具体例子**：
 
 ```text
 Arrow Flight 写入 cpu 100 行:
-  1. WriteCols 收到解码后的 record.Record 和原始 binaryCols
-  2. writeCols 先把 record.Record 追加到 CSMemTableImpl
-  3. 再把 binaryCols 写入 WAL，崩溃恢复时直接回放 ArrowFlight WAL
+  1. ColumnStoreImpl.WriteCols 收到解码后的 record.Record 和原始 binaryCols
+  2. 调用 (*shard).writeCols：先经 ColumnStoreImpl.writeCols 把 record.Record 追加到 CSMemTableImpl
+  3. 同一函数内再把 binaryCols 写入 WAL，崩溃恢复时直接回放 ArrowFlight WAL
   4. binaryCols 不参与 MemTable 写入，避免重复解码路径混淆
 ```
 
@@ -476,7 +509,7 @@ Arrow Flight 写入 cpu 100 行:
 const defaultWriteRecNum = 8
 ```
 
-**通俗解释**：`defaultWriteRecNum = 8` 意味着每个 measurement 最多支持 8 个并发写入协程同时操作不同的 WriteChunk。这是通过 channel 信号量实现的。
+**通俗解释**：`defaultWriteRecNum = 8` 意味着在 Line Protocol 写入路径（`WriteRows`）下，每个 measurement 最多支持 8 个并发写入协程同时操作不同的 WriteChunk；Arrow Flight 路径（`WriteCols`）不创建并发槽，直接对单个 `writeChunk` 加锁。槽位通过 channel 信号量实现。
 
 ### 4.2 WriteCols Arrow Flight 路径
 
@@ -750,6 +783,8 @@ padCol 执行过程:
 
 **源码文件**：`engine/immutable/colstore/chunk_builder.go`
 
+> 注意：§5-§6 的 `ChunkBuilder`/`ColumnBuilder` 只被 `colstore.IndexBuilder` 使用，编码对象是 **PK 记录**（写入 COLX 主键文件），不是 TSSP 数据列；数据列编码见 `engine/immutable/column_builder.go`。图中 TypeTag 指 1 字节类型标记，源码中对应 `encoding.BlockInteger` 等常量。
+
 ```go
 // 第 28 行：ChunkBuilder 结构体
 type ChunkBuilder struct {
@@ -803,7 +838,7 @@ func (b *ChunkBuilder) EncodeChunk(rec *record.Record, dst []byte,
 ```
 
 **逐行解释**：
-- **第 53-55 行**：这里描述的是 `engine/immutable/colstore/chunk_builder.go` 的历史/局部校验逻辑；列存整体并不是“不支持 NULL”。NULL 通过 `record.ColVal` 的 nil bitmap / nil 标记保存，PK 文件还会在 `FetchKeyAtRow` 中写入 `nil_indicator`
+- **第 53-55 行**：这里描述的是 `engine/immutable/colstore/chunk_builder.go` 的历史/局部校验逻辑；列存整体并不是“不支持 NULL”。NULL 通过 `record.ColVal` 的 nil bitmap / nil 标记保存，PK 文件还会在 `FetchKeyAtRow` 中写入 1 字节 NULL 标记
 - **第 57 行**：`offset` 数组记录每列在 chunk 中的起始偏移，用于后续随机访问
 - **第 58 行**：每列数据前附加 CRC32 校验和，用于数据完整性验证
 - **第 59-63 行**：调用 `ColumnBuilder.EncodeColumn` 编码单列数据
@@ -899,49 +934,74 @@ func (b *ColumnBuilder) EncodeColumn(ref *record.Field,
 
 **逐行解释**：
 - **第 101-114 行**：根据 `ref.Type` 类型标记分发到对应的编码方法
-- 每种类型的编码方法都会先写入 1 字节的类型标记（TypeTag），再写入编码后的数据
+- 每种类型的编码方法都会先写入 1 字节的类型标记（图中记作 TypeTag），再写入编码后的数据
 
 ### 6.2 各类型编码实现
 
 ```go
 // 第 37 行：整数列编码
 func (b *ColumnBuilder) encIntegerColumn(col *record.ColVal) error {
-    b.data = append(b.data, encoding.BlockInteger)  // 1 字节类型标记
+    b.data = append(b.data, encoding.BlockInteger)  // 1 字节类型标记（文档注释）
     var err error
     b.data, err = encoding.EncodeIntegerBlock(col.Val, b.data, b.coder)
-    return err
+    if err != nil {
+        b.log.Error("encode integer value fail", zap.Error(err))
+        return err
+    }
+
+    return nil
 }
 
 // 第 49 行：浮点数列编码
 func (b *ColumnBuilder) encFloatColumn(col *record.ColVal) error {
-    b.data = append(b.data, encoding.BlockFloat64)  // 1 字节类型标记
+    b.data = append(b.data, encoding.BlockFloat64)  // 1 字节类型标记（文档注释）
     var err error
     b.data, err = encoding.EncodeFloatBlock(col.Val, b.data, b.coder)
-    return err
+    if err != nil {
+        b.log.Error("encode float value fail", zap.Error(err))
+        return err
+    }
+
+    return nil
 }
 
 // 第 61 行：字符串列编码
 func (b *ColumnBuilder) encStringColumn(col *record.ColVal) error {
-    b.data = append(b.data, encoding.BlockString)  // 1 字节类型标记
+    b.data = append(b.data, encoding.BlockString)  // 1 字节类型标记（文档注释）
     var err error
     b.data, err = encoding.EncodeStringBlock(col.Val, col.Offset, b.data, b.coder)
-    return err
+    if err != nil {
+        b.log.Error("encode string value fail", zap.Error(err))
+        return err
+    }
+
+    return nil
 }
 
 // 第 73 行：Tag 列编码（与字符串相同格式）
 func (b *ColumnBuilder) encTagColumn(col *record.ColVal) error {
-    b.data = append(b.data, encoding.BlockTag)  // 1 字节类型标记
+    b.data = append(b.data, encoding.BlockTag)  // 1 字节类型标记（文档注释）
     var err error
     b.data, err = encoding.EncodeStringBlock(col.Val, col.Offset, b.data, b.coder)
-    return err
+    if err != nil {
+        b.log.Error("encode string value fail", zap.Error(err))
+        return err
+    }
+
+    return nil
 }
 
 // 第 85 行：布尔列编码
 func (b *ColumnBuilder) encBooleanColumn(col *record.ColVal) error {
-    b.data = append(b.data, encoding.BlockBoolean)  // 1 字节类型标记
+    b.data = append(b.data, encoding.BlockBoolean)  // 1 字节类型标记（文档注释）
     var err error
     b.data, err = encoding.EncodeBooleanBlock(col.Val, b.data, b.coder)
-    return err
+    if err != nil {
+        b.log.Error("encode boolean value fail", zap.Error(err))
+        return err
+    }
+
+    return nil
 }
 ```
 
@@ -964,7 +1024,7 @@ BlockTag      = 6  // Tag（byte(influx.Field_Type_Tag)）
 | (1 byte)   | (variable length)   |
 +------------+---------------------+
 
-整数列: [0x01] [delta-of-delta 编码的时间序列]
+整数列: [0x01] [常量差分编码（默认）/ Simple8b / ZSTD]
 浮点列: [0x03] [XOR 编码的浮点序列]
 字符串列: [0x04] [offset 数组 + 字符串数据]
 布尔列: [0x05] [位压缩的布尔序列]
@@ -978,6 +1038,8 @@ Tag 列:  [0x06] [offset 数组 + 字符串数据]
 ### 7.1 解码分发表
 
 **源码文件**：`engine/immutable/colstore/column_reader.go`
+
+> 注意：本节解码路径只服务于 PK 索引文件（`PrimaryKeyReader.ReadData` → `decodePKData`），不用于 TSSP 数据列解码。
 
 ```go
 // 第 77 行：解码函数分发表
@@ -1090,7 +1152,7 @@ func decodeColumnData(ref *record.Field, data []byte, col *record.ColVal,
 
 ```mermaid
 graph TD
-    A[data 字节数组] --> B[读取 data[0] 类型标记]
+    A[data 字节数组] --> B["读取 data[0] 类型标记"]
     B --> C{类型验证}
     C --> |不匹配| D[返回错误]
     C --> |匹配| E[查找 decFuncs]
@@ -1247,9 +1309,9 @@ var snapshotWriteLimiter = fileops.NewLimiter(48*1024*1024, 64*1024*1024)
 ```
 
 **通俗解释**：
-- `snapshotWriteLimiter` 限制快照写入速度为 **48 MB/s**（突发最大 64 MB/s）
-- 使用 `fileops.NewLimitWriter` 包装文件写入器，自动限速
-- 目的是防止快照刷盘时占用过多磁盘 I/O，影响正常写入
+- `snapshotWriteLimiter` 限制 **PK 索引文件（.idx）** 写入速度为 **48 MB/s**（突发最大 64 MB/s）；TSSP 数据文件刷盘不经过该限流器
+- 使用 `fileops.NewLimitWriter` 包装 `newIndexWriter` 的文件写入器，自动限速
+- 目的是防止 PK 索引刷盘时占用过多磁盘 I/O，影响正常写入
 
 **限流实现**：
 
@@ -1428,7 +1490,7 @@ func (b *IndexBuilder) WriteDetachedMeta(startId, endId uint64,
 
 **通俗解释**：
 - **Attached 模式**：PK 数据和 Meta 在同一个文件中，结构简单但不灵活
-- **Detached 模式**：PK 数据和 Meta 分离存储，支持按块范围索引，便于查询优化
+- **Detached 模式**：数据块与 Meta 块分区存放在同一个 .idx 文件中（文件头 + Meta 头 + 数据块… + 尾部 Meta 块），支持按块范围索引，便于查询优化
 - **WriteDetachedMeta** 将每个数据块的范围信息（startBlockId, endBlockId）和列偏移写入 Meta 块
 
 ---
@@ -1537,10 +1599,10 @@ func FetchKeyAtRow(dst []byte, cols []*record.ColVal,
 **PK 二进制编码格式**：
 
 ```
-每个字段: [type_flag (1 byte)] [nil_indicator (1 byte)] [value (variable)]
+每个字段: [类型标记 (1 byte)] [NULL 标记 (1 byte)] [value (variable)]
 
-type_flag:    字段类型 (Int=1, Float=3, String=4, Boolean=5, Tag=6)
-nil_indicator: 0=nil, 1=非nil
+类型标记: 字段类型 (Int=1, Float=3, String=4, Boolean=5, Tag=6)
+NULL 标记: 0=nil, 1=非nil
 value:
   - Int:     8 bytes (int64)
   - Float:   8 bytes (float64)
@@ -1626,6 +1688,8 @@ func (ks *KeySorter) less(i, j int) bool {
             if b1 != b2 {
                 return b1 == 0
             }
+        default:
+            panic(fmt.Sprintf("[BUG] invalid type: %d", flag1>>8))
         }
     }
     return false
@@ -1692,8 +1756,8 @@ func (oks *OffsetKeySorter) IteratorSegment(
 
 **通俗解释**：
 - `OffsetKeySorter` 在 `KeySorter` 基础上增加了时间和偏移量
-- 用于合并多个时间段的 PK 数据，按 `maxRowPreSegment` 分段
-- 每段独立排序和索引，支持按段查询
+- 用于合并多个主键分组的时间/偏移数据，`Append` 按 `maxRowPreSegment` 计算 `segmentIndex`（段边界）
+- 排序由调用方对每个主键分组执行 `sort.Sort(oksSwap)`，段只记录时间/偏移范围，支持按段查询
 
 ---
 
@@ -1712,8 +1776,10 @@ type PrimaryKeyReader struct {
     reader   fileops.BasicFileReader
 }
 
-// 第 41-57 行：sync.Pool 复用
-var fileReaderPool = sync.Pool{}
+// 第 41-62 行：sync.Pool 复用
+var (
+    fileReaderPool = sync.Pool{}
+)
 
 func getPrimaryKeyReader() *PrimaryKeyReader {
     v := fileReaderPool.Get()
@@ -1740,22 +1806,29 @@ func putPrimaryKeyReader(r *PrimaryKeyReader) {
 func NewPrimaryKeyReader(name string, lockPath *string) (*PrimaryKeyReader, error) {
     var header [headerSize]byte
 
-    // 第 66-68 行：检查文件大小
+    // 第 66-71 行：检查文件大小
     fi, err := fileops.Stat(name)
     if err != nil {
+        log.Error("stat file failed", zap.String("file", name), zap.Error(err))
+        err = errno.NewError(errno.OpenFileFailed, err)
         return nil, err
     }
     if fi.Size() < int64(headerSize) {
-        // 第 76 行：文件太小，删除并报错
+        // 第 72-77 行：文件太小，删除并报错
+        err = fmt.Errorf("invalid file(%v) size:%v", name, fi.Size())
+        log.Error(err.Error())
+        err = errno.NewError(errno.OpenFileFailed, err)
         _ = fileops.Remove(name, fileops.FileLockOption(*lockPath))
         return nil, err
     }
 
-    // 第 79-82 行：打开文件
+    // 第 79-86 行：打开文件
     pri := fileops.FilePriorityOption(fileops.IO_PRIORITY_NORMAL)
     lock := fileops.FileLockOption("")
     fd, err := fileops.Open(name, lock, pri)
     if err != nil {
+        err = errno.NewError(errno.OpenFileFailed, err)
+        log.Error("open file failed", zap.String("file", name), zap.Error(err))
         return nil, err
     }
 
@@ -2063,6 +2136,8 @@ MeasurementInfo:
 
 ### 13.1 策略接口
 
+**源码文件**：`engine/mutable/cs_table.go`
+
 ```go
 // cs_table.go 第 45 行：FlushManager 接口
 type FlushManager interface {
@@ -2077,6 +2152,8 @@ type FlushManager interface {
 ```
 
 ### 13.2 writeDetached 策略
+
+**源码文件**：`engine/mutable/cs_table.go`
 
 ```go
 // cs_table.go 第 53 行：Detached 模式刷盘
@@ -2114,6 +2191,8 @@ func (w *writeDetached) WriteDetached(rec *record.Record,
 ```
 
 ### 13.3 WriteAttached 策略
+
+**源码文件**：`engine/mutable/attached.go`
 
 ```go
 // attached.go 第 34 行：Attached 模式刷盘
@@ -2153,6 +2232,8 @@ func (w *WriteAttached) FlushRecord(tbStore immutable.TablesStore,
 
 ### 13.4 AccumulateMetaIndex 累积索引
 
+**源码文件**：`engine/mutable/cs_table.go`
+
 ```go
 // cs_table.go 第 127 行：获取累积 Meta 索引
 func (c *CSMemTableImpl) getAccumulateMetaIndex(name string) *immutable.AccumulateMetaIndex {
@@ -2176,6 +2257,8 @@ func (c *CSMemTableImpl) updateAccumulateMetaIndexInfo(name string,
 - 累积信息用于后续查询时快速定位数据块
 
 ### 13.5 getFlushManager 策略选择
+
+**源码文件**：`engine/mutable/cs_table.go`
 
 ```go
 // cs_table.go 第 139 行：获取刷盘管理器
@@ -2693,7 +2776,7 @@ func FilterByTime(rec *record.Record, tr util.TimeRange) *record.Record {
 
 #### FilterByField — 字段过滤（条件评估 + Bitmap）
 
-`FilterByField` 对时间过滤后的数据逐行评估 WHERE 条件，使用 Bitmap 记录满足条件的行号，最终按行号提取有效数据。
+`FilterByField` 对时间过滤后的数据逐行评估 WHERE 条件。命中编译过滤函数时走 `FilterByFieldFuncs` 并用 `FilterBitmap` 记录行号；否则用 `reserveId []int` 收集行号，最终按行号提取有效数据。
 
 ```go
 // 第 895-974 行：FilterByField — 字段条件过滤
@@ -2734,6 +2817,7 @@ func FilterByField(rec *record.Record, filterRec *record.Record, filterOption *B
     var reserveId []int
     times := rec.Times()
     rowNum := rec.RowNums()
+    // ...（省略 rowNum==0 早退、ColAux 初始化、getValues 调用）
     // 逐行评估 WHERE 条件
     for i := 0; i < rowNum; i++ {
         rowCon = getRowCondition(con, rowFilters, times[i])
@@ -2762,7 +2846,7 @@ func FilterByField(rec *record.Record, filterRec *record.Record, filterOption *B
 | 902-904 | `FilterByFieldFuncs(...)` | 高性能路径：使用预编译的过滤函数 + Bitmap |
 | 910-917 | `FilterTags` | 设置 Tag 过滤值到 FilterMap |
 | 919-924 | `ValuerEval` | 构建表达式求值器 |
-| 928-965 | `for i := 0; i < rowNum; i++` | 逐行评估 WHERE 条件，收集满足条件的行号 |
+| 946-965 | `for i := 0; i < rowNum; i++` | 逐行评估 WHERE 条件，收集满足条件的行号 |
 | 962 | `FilterMapEvalBool` | 对当前行的字段值求值 WHERE 表达式 |
 | 963 | `reserveId = append(reserveId, i)` | 记录满足条件的行号 |
 | 973 | `genRecByRowNumbers(...)` | 按行号从原始 Record 中提取有效数据 |
@@ -2966,8 +3050,8 @@ WHERE host='server1'
      → CondFunctions = NewCondition(nil, "host='server1'", inSchema, opt)
 
   5. 创建对象池:
-     recordPool = NewCircularRecordPool(16, inSchema)
-     chunkPool = NewCircularChunkPool(8, NewChunkBuilder(outSchema))
+     recordPool = NewCircularRecordPool(7, inSchema)      // ColumnStoreReaderRecordNum
+     chunkPool = NewCircularChunkPool(7, NewChunkBuilder(outSchema))  // ColumnStoreReaderChunkNum（TopN 时为 12）
 ```
 
 **Step 3: Run 主循环 — 第一轮读取**
@@ -3084,6 +3168,8 @@ Query Executor 聚合:
 
 ### 15.1 NULL 编码路径容易混淆
 
+**源码文件**：`engine/immutable/colstore/chunk_builder.go`、`engine/immutable/colstore/pk_fetcher.go`
+
 **问题**：列存文档和源码里有两套相近的 builder 名称，容易把局部校验误读成“列存不支持 NULL”。
 
 ```go
@@ -3093,16 +3179,16 @@ if col.NilCount != 0 {
 }
 ```
 
-PK 文件的编码路径 `FetchKeyAtRow`（pk_fetcher.go 第 89-118 行）支持 NULL 值处理：通过 `nil_indicator`（0=nil, 1=非nil）标记每个字段是否为 NULL，在 `KeySorter.less` 中 NULL 值被视为最小值参与排序。数据列侧则依赖 `record.ColVal` 的 nil bitmap / nil 标记表达 NULL。
+PK 文件的编码路径 `FetchKeyAtRow`（pk_fetcher.go 第 89-118 行）支持 NULL 值处理：每个字段先写 1 字节类型标记，再写 1 字节 NULL 标记（0=nil, 1=非nil），在 `KeySorter.less` 中 NULL 值被视为最小值参与排序。数据列侧则依赖 `record.ColVal` 的 nil bitmap / nil 标记表达 NULL。
 
 ```go
 // pk_fetcher.go 第 103-106 行：PK 列的 NULL 处理
 b, isNil := ColValBytesAtRow(cols[i], rowNum, typ)
 if isNil {
-    dst = append(dst, 0)  // nil_indicator = 0，标记为 NULL
+    dst = append(dst, 0)
     continue
 }
-dst = append(dst, 1)      // nil_indicator = 1，标记为非 NULL
+dst = append(dst, 1)
 ```
 
 **影响**：
@@ -3122,7 +3208,7 @@ sequenceDiagram
 
     Rec->>Rec: 保存 Val + nil bitmap
     Rec->>Data: EncodeColumn 按类型编码数据列
-    Rec->>PK: FetchKeyAtRow 生成 nil_indicator
+    Rec->>PK: FetchKeyAtRow 生成 NULL 标记
     PK-->>PK: NULL 参与 PK 排序
     Reader->>Rec: 读取时按 bitmap 还原 NULL
 ```
@@ -3137,7 +3223,7 @@ Record:
 编码:
   value.Val 保存 10.0 和 12.0 的实际值
   value nil bitmap 标记第 2 行为 NULL
-  如果 value 是 PK 字段，PK 文件额外写 nil_indicator=0
+  如果 value 是 PK 字段，PK 文件额外写 NULL 标记=0
 
 查询:
   ColumnStoreReader 读取列块后按 bitmap 还原第 2 行 NULL
@@ -3145,7 +3231,9 @@ Record:
 
 ### 15.2 48MB/s 写入限流瓶颈
 
-**问题**：`snapshotWriteLimiter` 限制快照写入速度为 48 MB/s。
+**源码文件**：`engine/immutable/colstore/writer.go`
+
+**问题**：`snapshotWriteLimiter` 将 PK 索引文件（.idx）写入速度限制为 48 MB/s（TSSP 数据文件不受此限流）。
 
 ```go
 // writer.go 第 27 行
@@ -3153,7 +3241,7 @@ var snapshotWriteLimiter = fileops.NewLimiter(48*1024*1024, 64*1024*1024)
 ```
 
 **影响**：
-- 高吞吐场景下，快照刷盘可能成为瓶颈
+- 高吞吐场景下，PK 索引文件刷盘可能成为瓶颈
 - 突发数据量大时，内存积压风险增加
 - 硬编码限流值无法根据硬件能力动态调整
 
@@ -3164,6 +3252,8 @@ var snapshotWriteLimiter = fileops.NewLimiter(48*1024*1024, 64*1024*1024)
 
 ### 15.3 Schema 演进 padCol 开销
 
+**源码文件**：`engine/mutable/cs_table.go`
+
 **问题**：`padCol` 需要为已有数据填充新列的空值。
 
 ```go
@@ -3172,8 +3262,9 @@ func padCol(rec *record.Record, writeRec *WriteRec, idx []int) {
     oldRowNum, oldColNum := writeRec.rec.RowNums(), writeRec.rec.ColNums()
     writeRec.rec.ReserveSchemaAndColVal(len(idx))
     for i := 0; i < len(idx); i++ {
-        writeRec.rec.ColVals[oldColNum+i].PadColVal(
-            rec.Schema[idx[i]].Type, oldRowNum)
+        writeRec.rec.Schema[oldColNum+i].Name = stringinterner.InternSafe(rec.Schema[idx[i]].Name)
+        writeRec.rec.Schema[oldColNum+i].Type = rec.Schema[idx[i]].Type
+        writeRec.rec.ColVals[oldColNum+i].PadColVal(rec.Schema[idx[i]].Type, oldRowNum)
     }
     sort.Sort(writeRec.rec)
 }
@@ -3190,6 +3281,8 @@ func padCol(rec *record.Record, writeRec *WriteRec, idx []int) {
 - 优化排序算法，避免全量重排
 
 ### 15.4 Detached vs Attached 模式复杂性
+
+**源码文件**：`engine/mutable/cs_table.go`
 
 **问题**：两种刷盘模式增加了代码复杂度。
 
@@ -3212,6 +3305,8 @@ if immutable.GetDetachedFlushEnabled() || config.GetProductType() == config.LogK
 - 考虑渐进式迁移，逐步废弃 Attached 模式
 
 ### 15.5 8 槽位并发池固定大小
+
+**源码文件**：`engine/mutable/cs_table.go`
 
 **问题**：`defaultWriteRecNum = 8` 硬编码，无法动态调整。
 
@@ -3245,8 +3340,11 @@ sequenceDiagram
     participant CS as ColumnStoreImpl
     participant CSM as CSMemTableImpl
     participant WAL as WAL
+    participant Shard as shard.Snapshot()（后台）
     participant Snapshot as 快照容器
-    participant IB as IndexBuilder
+    participant MB as MsBuilder
+    participant TSI as tsi.IndexBuilder
+    participant IB as colstore.IndexBuilder
     participant CB as ChunkBuilder
     participant CBuilder as ColumnBuilder
     participant Disk as COLX 文件
@@ -3259,8 +3357,8 @@ sequenceDiagram
 
     Note over CS: 2. 并行写入索引和数据
     par 异步索引写入
-        CS->>IB: WriteIndexForCols
-        IB->>IB: CreateIndexIfNotExistsByCol
+        CS->>TSI: WriteIndexForCols
+        TSI->>TSI: CreateIndexIfNotExistsByCol（tag/series 倒排索引）
     and 同步数据写入
         CS->>CSM: WriteCols(table, Record, mst)
         CSM->>CSM: CreateMsInfo
@@ -3271,18 +3369,19 @@ sequenceDiagram
     Note over CS: 3. 更新内存统计
     CS->>CS: AddMemSize(curSize)
 
-    Note over CS: 4. 触发快照条件
-    CS->>CS: timeToSnapshot() == true
+    Note over Shard: 4. 后台 100ms ticker 触发快照条件
+    Shard->>Shard: timeToSnapshot() == true
+    Shard->>CS: writeSnapshot(shard)
 
     Note over CS: 5. 执行快照
-    CS->>CS: writeSnapshot(shard)
     CS->>WAL: Switch() 获取旧 WAL
     CS->>Snapshot: 放入当前 MemTable
     CS->>CSM: NewCSMemTableImpl() 替换活跃表
 
-    Note over CS: 6. 异步刷盘
-    CS->>IB: Flush()
-    IB->>CB: EncodeChunk(Record)
+    Note over CS: 6. 异步刷盘（commitSnapshot → FlushChunks）
+    CS->>MB: 经 MsBuilder 刷盘
+    MB->>IB: WritePrimaryIndex → colstore.IndexBuilder
+    IB->>CB: EncodeChunk(pkRec)
     CB->>CBuilder: EncodeColumn(每列)
     CBuilder->>CBuilder: type tag + 编码数据
     CB->>CB: CRC32 + offset 记录
@@ -3337,8 +3436,8 @@ WriteIndexForCols(shard, Record, "cpu_monitor")
 执行:
   1. 创建 MeasurementIdent: {DB: "mydb", RP: "autogen", Name: "cpu_monitor"}
   2. 从 MstManager 获取 Measurement
-  3. 获取 PK Schema: [{Name: "host", Type: String}]
-  4. 调用 indexBuilder.CreateIndexIfNotExistsByCol()
+  3. 按 MeasurementInfo.Schema 计算 tagIndex（findTagIndex）
+  4. 调用 s.indexBuilder.CreateIndexIfNotExistsByCol()，写入 tag/series 倒排索引（MergeSetIndex）
 ```
 
 **Step 3: 同步数据写入**
@@ -3472,6 +3571,8 @@ indexWriter.WriteData(encodeChunk)
 
 ### 16.3 性能指标
 
+> 以下数字为经验量级估算，仓库中没有对应 benchmark 或常量支撑，不应作为实测值引用。
+
 ```
 写入延迟:
   - WriteCols 入口到写入完成: ~50-200 μs
@@ -3485,7 +3586,7 @@ indexWriter.WriteData(encodeChunk)
 
 内存使用:
   - 每个 measurement: ~1 KB 基础开销
-  - 每行数据: ~24 bytes (3 列 × 8 bytes)
+  - 每行数据: 定长列约 8 bytes/列；字符串列按实际长度另计
   - 8 槽位池: ~200 bytes 固定开销
 
 磁盘 I/O:
@@ -3781,8 +3882,9 @@ func UnmarshalPkMetaBlock(src []byte) (*PkMetaBlock, error) {
 **源码文件**：`engine/immutable/colstore/util.go`
 
 ```go
-// 第 46-51 行：索引文件后缀常量
 const (
+    // 第 33-39 行：索引文件后缀常量（节选自第 25-44 行的 const 块）
+    // ...
     IndexFileSuffix            string = ".idx"   // PK 索引文件
     MinMaxIndexFileSuffix      string = ".mm"    // MinMax 索引
     SetIndexFileSuffix         string = ".set"   // Set 索引
@@ -3790,17 +3892,25 @@ const (
     TextIndexDataFileSuffix    string = ".pos"   // 全文索引 posting list
     TextIndexHeadFileSuffix    string = ".bh"    // 全文索引 block header
     TextIndexPartFileSuffix    string = ".ph"    // 全文索引 part header
+    // ...
+)
+
+const (
+    // 第 46-51 行：全文索引 fileType 常量
+    TextIndexData = iota
+    TextIndexHead
+    TextIndexPart
+    TextIndexMax
 )
 
 // 第 53 行：追加 PK 索引后缀
 func AppendPKIndexSuffix(dataPath string) string {
-    return dataPath + IndexFileSuffix
+    indexPath := dataPath + IndexFileSuffix
+    return indexPath
 }
 
 // 第 58 行：追加二级索引后缀
-func AppendSecondaryIndexSuffix(dataPath string, fieldName string,
-    indexType index.IndexType, fileType int) string {
-
+func AppendSecondaryIndexSuffix(dataPath string, fieldName string, indexType index.IndexType, fileType int) string {
     var indexFileSuffix string
     switch indexType {
     case index.MinMax:
@@ -3810,16 +3920,20 @@ func AppendSecondaryIndexSuffix(dataPath string, fieldName string,
     case index.BloomFilter, index.BloomFilterFullText, index.BloomFilterIp:
         indexFileSuffix = BloomFilterIndexFileSuffix
     case index.Text:
-        switch fileType {
-        case TextIndexData:
+        if fileType == TextIndexData {
             indexFileSuffix = TextIndexDataFileSuffix
-        case TextIndexHead:
+        } else if fileType == TextIndexHead {
             indexFileSuffix = TextIndexHeadFileSuffix
-        case TextIndexPart:
+        } else if fileType == TextIndexPart {
             indexFileSuffix = TextIndexPartFileSuffix
+        } else {
+            panic(fmt.Sprintf("unsupported index file type{%d} for text index", fileType))
         }
+    default:
+        panic(fmt.Sprintf("unsupported the secondary index: %d", indexType))
     }
-    return dataPath + "." + fieldName + indexFileSuffix
+    indexPath := dataPath + "." + fieldName + indexFileSuffix
+    return indexPath
 }
 ```
 
@@ -3883,13 +3997,15 @@ func newShardMoveStrategy(layoutSwitchEnabled bool) shardMoveStrategy {
 }
 
 // 第 342 行：压缩策略（空实现）
-type compactStrategy struct{}
+type compactStrategy struct {
+}
 func (c *compactStrategy) doShardMove(s *shard) error {
     return nil
 }
 
 // 第 349 行：写入策略
-type writeStrategy struct{}
+type writeStrategy struct {
+}
 func (w *writeStrategy) doShardMove(s *shard) error {
     return s.doShardMove()
 }
@@ -3898,7 +4014,7 @@ func (w *writeStrategy) doShardMove(s *shard) error {
 **通俗解释**：
 - `getAllFiles` 获取某个 measurement 的所有 CS 文件，用于查询或迁移
 - `shardMoveStrategy` 是策略模式，控制 shard 迁移行为
-- `compactStrategy` 在布局切换启用时不执行迁移（数据已在新布局中）
+- `compactStrategy` 在布局切换启用时 `doShardMove` 直接返回 nil（不执行迁移；代码与注释均未说明原因）
 - `writeStrategy` 在布局切换未启用时执行标准迁移
 
 ### 17.0.8 createMsBuilder MsBuilder 创建
@@ -4225,36 +4341,40 @@ FlushChunks 被调用时机: 快照刷盘时
 
 | 文件路径 | 功能 | 行数 |
 |---------|------|------|
-| `engine/cs_storage.go` | ColumnStoreImpl 写入入口 | ~354 |
-| `engine/mutable/cs_table.go` | CSMemTableImpl 并发控制 | ~635 |
-| `engine/immutable/colstore/chunk_builder.go` | ChunkBuilder 编码 | ~67 |
-| `engine/immutable/colstore/column_builder.go` | ColumnBuilder 类型编码 | ~129 |
-| `engine/immutable/column_builder.go` | 普通 TSSP ColumnBuilder 类型编码 | ~通用行存路径 |
-| `engine/immutable/colstore/column_reader.go` | 列解码分发 | ~106 |
-| `engine/immutable/colstore/index_builder.go` | IndexBuilder PK 索引构建 | ~231 |
-| `engine/immutable/colstore/measurement.go` | MstManager 元数据管理 | ~220 |
-| `engine/immutable/colstore/meta.go` | PK Meta 序列化 | ~232 |
-| `engine/immutable/colstore/pk_fetcher.go` | PrimaryKeyFetcher 主键提取 | ~341 |
-| `engine/immutable/colstore/reader.go` | PrimaryKeyReader 文件读取 | ~165 |
-| `engine/immutable/colstore/writer.go` | PK 文件写入与限流 | ~172 |
-| `engine/immutable/colstore/util.go` | 常量定义 | ~87 |
-| `engine/immutable/colstore/pk_files.go` | PK Meta Block 序列化 | ~92 |
+| `engine/cs_storage.go` | ColumnStoreImpl 写入入口 | 354 |
+| `engine/mutable/cs_table.go` | CSMemTableImpl 并发控制 | 634 |
+| `engine/immutable/colstore/chunk_builder.go` | ChunkBuilder 编码 | 67 |
+| `engine/immutable/colstore/column_builder.go` | ColumnBuilder 类型编码 | 128 |
+| `engine/immutable/column_builder.go` | 普通 TSSP ColumnBuilder 类型编码 | 502 |
+| `engine/immutable/colstore/column_reader.go` | 列解码分发 | 105 |
+| `engine/immutable/colstore/index_builder.go` | IndexBuilder PK 索引构建 | 230 |
+| `engine/immutable/colstore/measurement.go` | MstManager 元数据管理 | 219 |
+| `engine/immutable/colstore/meta.go` | PK Meta 序列化 | 231 |
+| `engine/immutable/colstore/pk_fetcher.go` | PrimaryKeyFetcher 主键提取 | 340 |
+| `engine/immutable/colstore/reader.go` | PrimaryKeyReader 文件读取 | 164 |
+| `engine/immutable/colstore/writer.go` | PK 文件写入与限流 | 171 |
+| `engine/immutable/colstore/util.go` | 常量定义 | 86 |
+| `engine/immutable/colstore/pk_files.go` | PK Meta Block 序列化 | 91 |
 
 ### 17.2 常量定义
 
 ```go
 // engine/immutable/colstore/util.go
 primaryKeyMagic            string = "COLX"           // Magic Number
-fileMagicSize              int    = 4                 // Magic 长度
+fileMagicSize              int    = len(primaryKeyMagic) // Magic 长度
 version                    uint32 = 0                 // 文件版本
-headerSize                 int    = 8                 // Header 长度 (4+4)
-accMetaSize                int    = 24                // 累积 Meta 大小 (8+8+4+4)
+headerSize                 int    = fileMagicSize + util.Uint32SizeBytes // Header 长度 (4+4)
+accMetaSize                int    = util.Uint64SizeBytes*2 + util.Uint32SizeBytes*2 // 累积 Meta 大小 (8+8+4+4)
 DefaultTCLocation          int8   = -1                // 默认时间簇位置
 crcSize                    uint32 = 4                 // CRC32 长度
-pKMetaItemSize             int    = 24                // PK Meta 项大小 (8+8+4+4)
+pKMetaItemSize             int    = util.Uint64SizeBytes*2 + util.Uint32SizeBytes*2 // PK Meta 项大小 (8+8+4+4)
+
+// engine/mutable/cs_table.go
 defaultWriteRecNum                              = 8   // 默认并发写入槽数
-defaultWriterBufferSize                         = 1MB // 默认写入缓冲区
-snapshotWriteLimiter                            = 48MB/s (burst 64MB/s)
+
+// engine/immutable/colstore/writer.go
+defaultWriterBufferSize                         = 1024 * 1024 // 默认写入缓冲区
+snapshotWriteLimiter                            = fileops.NewLimiter(48*1024*1024, 64*1024*1024) // 48MB/s，突发 64MB/s
 ```
 
 ### 17.3 类型标记

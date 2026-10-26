@@ -1,5 +1,7 @@
 # Module 13: TSSP 文件格式深度审计报告（庖丁解牛版）
 
+> 代码基线：`origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11，main + 19 个提交）。本文所有 `file:line` 均指该基线。
+
 > TSSP（Time Series Store Partition）是 openGemini 的核心磁盘存储格式。所有 MemTable flush 和 Compaction 的最终产物都是 TSSP 文件。理解 TSSP 格式，就理解了 openGemini 存储引擎的"地基"。
 
 ---
@@ -65,7 +67,7 @@ type TSSPFileName struct {
 **文件后缀**：
 - `.tssp` — 正常文件
 - `.tssp.init` — 临时文件（正在写入，尚未提交）
-- `unordered/` 子目录 — 存放无序文件（迟到数据、乱序写入）
+- `out-of-order/` 子目录 — 存放无序文件（迟到数据、乱序写入）
 
 **验证正则**：`^[0-9a-f]{8,16}-[0-9a-f]{4}-[0-9a-f]{8}.tssp(.init)?`
 
@@ -81,7 +83,7 @@ data/db0/0/cpu_0001/
   00000001-0001-00010001.tssp    ← L1，Compaction L0→L1 产出
   00000001-0002-00020001.tssp    ← L2，Compaction L1→L2 产出
 
-data/db0/0/cpu_0001/unordered/
+data/db0/0/cpu_0001/out-of-order/
   00000010-0000-00000001.tssp    ← 无序数据（迟到的数据点）
 ```
 
@@ -155,7 +157,7 @@ graph TB
 - `tableMagic = "53ac2021"` — 魔数，用于验证文件格式
 - `version = uint64(2)` — 当前版本号
 - `fileHeaderSize = 16` 字节（8B magic + 8B version）
-- `minTableSize = magic + trailerSize + 8 + 8`（最小合法文件大小）
+- `minTableSize()` — 函数（`engine/immutable/table.go:51-53`），返回 `magic + trailerSize + 8 + 8`（最小合法文件大小）
 
 ### 3.2 为什么这样布局？
 
@@ -241,7 +243,7 @@ sequenceDiagram
 dataOffset(8B) + dataSize(8B) + indexSize(8B) + metaIndexSize(8B)
 + bloomSize(8B) + idTimeSize(8B) + idCount(8B) + minId(8B) + maxId(8B)
 + minTime(8B) + maxTime(8B) + metaIndexItemNum(8B) + bloomM(8B) + bloomK(8B)
-+ ExtraDataLen(2B) + ExtraData(变长) + nameLen(2B) + name(变长)
++ ExtraDataLen(2B，固定为 8) + flags(8B) + headerLen(2B) + header(变长) + nameLen(2B) + name(变长)
 ```
 
 ### 4.3 ExtraData 结构
@@ -251,6 +253,7 @@ type ExtraData struct {
     hasMetaHeader         bool    // 是否有 ChunkMetaHeader（列名字典）
     TimeStoreFlag         uint8   // 1 = 时间戳存储在 IdTime 区
     ChunkMetaCompressFlag uint8   // ChunkMeta 压缩模式
+    size                  int     // ExtraData 实际字节数（记录在 flags 高 32 位）
     ChunkMetaHeader       *ChunkMetaHeader  // 列名字典（自压缩模式用）
 }
 ```
@@ -294,12 +297,10 @@ graph LR
     subgraph "Segment 内部"
         T["time 列 (编码后)"]
         V["value 列 (编码后)"]
-        H["host 列 (编码后)"]
     end
 
     S1 --> T
     S1 --> V
-    S1 --> H
 ```
 
 **关键配置**：
@@ -314,19 +315,19 @@ openGemini 支持 5 种数据类型的列编码：
 
 | 类型 | 编码方式 | 适用场景 |
 |------|---------|---------|
-| Integer (int64) | Delta + ZigZag + 变长编码 | 时间戳、整数字段 |
+| Integer (int64) | Delta + ZigZag，再按数据选 const-delta / simple8b / 变长编码 / ZSTD | 时间戳、整数字段 |
 | Float (float64) | Gorilla 编码（XOR + 前导零压缩） | 浮点数字段 |
-| Boolean | Bitmap 编码 | 布尔字段 |
-| String | 字典编码 + 变长编码 | 字符串字段 |
+| Boolean | Bitpack 位打包 | 布尔字段 |
+| String | 整块压缩（snappy / lz4 / zstd，压缩率不足时回退不压缩）+ 4B 长度前缀 | 字符串字段 |
 | Timestamp | Delta 编码 + 变长编码 | 时间列 |
 
 **具体例子**：
 
-假设写入以下数据：
+假设写入以下数据（`host` 是 tag，不进入 TSSP 数据块，只记录在索引中）：
 ```
-time=1000, value=99.5, host="server1"
-time=1001, value=88.3, host="server1"
-time=1002, value=77.1, host="server2"
+time=1000, value=99.5
+time=1001, value=88.3
+time=1002, value=77.1
 ```
 
 Data Blocks 中的存储：
@@ -335,7 +336,6 @@ SID=1001 的 Chunk:
   Segment 0:
     time 列:    [Delta编码: 1000, +1, +1] → 变长字节
     value 列:   [Gorilla编码: 99.5, 88.3, 77.1] → 变长字节
-    host 列:    [字典编码: "server1"→0, "server1"→0, "server2"→1] → 变长字节
 ```
 
 ---
@@ -424,13 +424,12 @@ ChunkMeta{
     sid: 1001,
     offset: 1048576,      // 数据在文件偏移 1MB 处
     size: 8192,           // 数据大小 8KB
-    columnCount: 3,       // 3 列：time, value, host
+    columnCount: 2,       // 2 列：time, value
     segCount: 2,          // 2 个 segment
     timeRange: [[1000,1500], [1501,2000]],
     colMeta: [
         {name:"time",   type:INT,   entries:[{offset:1048576,size:2048}, ...]},
         {name:"value",  type:FLOAT, entries:[{offset:1050624,size:2048}, ...]},
-        {name:"host",   type:STRING,entries:[{offset:1052672,size:2048}, ...]},
     ]
 }
 ```
@@ -493,36 +492,61 @@ MetaIndex 就像字典的"大目录"。它告诉你"A-F 在第几页到第几页
 
 **代码位置**：`engine/immutable/msbuilder.go`（`genBloomFilter()` 方法）
 
-- **误判率**：8%（`falsePositiveRate = 0.08`）
+- **误判率**：8%（`falsePositive = 0.08`）
 - **缓冲区大小**：`pow2((m + 7) / 8)` 字节（始终为 2 的幂）
 - **插入方式**：每个 series ID 作为 8 字节大端序 key 插入
 
 ### 8.2 查询时的使用
 
 ```go
-// tssp_file.go
+// engine/immutable/tssp_file.go:760
 func (r *tsspFileReader) Contains(id uint64, tm util.TimeRange) bool {
-    if r.trailer.minId > id || r.trailer.maxId < id {
-        return false
-    }
-    if r.trailer.minTime > tm.Max || r.trailer.maxTime < tm.Min {
-        return false
-    }
-    r.initMetaData()
-    return r.ContainsId(id)
+	if !r.trailer.ContainsId(id) || !r.trailer.ContainsTime(tm) {
+		return false
+	}
+
+	if err := r.lazyInit(); err != nil {
+		errInfo := errno.NewError(errno.LoadFilesFailed)
+		log.Error("Contains", zap.Error(errInfo))
+		return false
+	}
+
+	bytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(bytes, id)
+
+	return r.bloom.Contains(bytes)
 }
 
-// location.go
+// engine/immutable/location.go:177
 func (l *Location) Contains(sid uint64, tr util.TimeRange, ctx *ChunkMetaContext) (bool, error) {
-    if !l.r.Contains(sid, tr) {
-        return false, nil
-    }
-    return l.readChunkMeta(sid, tr, ctx)
+	// use bloom filter and file time range to filter generally
+	contains, err := l.r.ContainsValue(sid, tr)
+	if err != nil {
+		return false, err
+	}
+	if !contains {
+		return false, nil
+	}
+
+	// read file meta to judge whether file has data, chunk meta will also init
+	err = l.readChunkMeta(sid, tr, ctx)
+	if err != nil {
+		return false, err
+	}
+
+	if l.meta == nil {
+		return false, nil
+	}
+
+	if l.ctx.Ascending {
+		return l.segPos < int(l.fragRgs[len(l.fragRgs)-1].End), nil
+	}
+	return l.segPos >= int(l.fragRgs[0].Start), nil
 }
 ```
 
 **通俗解释**：
-Bloom Filter 就像一个"快速黑名单"。它能 100% 确定"这个人不在名单上"，但有 8% 的概率误判"这个人在名单上"。查询链路分两层：`tsspFileReader.Contains(id, tm)` 先用 trailer 的 series/time 范围和元数据/Bloom 信息判断文件是否可能命中；`Location.Contains(sid, tr, ctx)` 再读取 ChunkMeta，把可能命中的 series 映射到后续数据读取位置。
+Bloom Filter 就像一个"快速黑名单"。它能 100% 确定"这个人不在名单上"，但有 8% 的概率误判"这个人在名单上"。查询链路分两层：`tsspFileReader.Contains(id, tm)` 先用 trailer 的 series/time 范围过滤，再懒加载并查 Bloom Filter 判断文件是否可能命中；`Location.Contains(sid, tr, ctx)` 先用 `ContainsValue` 做同样的粗筛，再读取 ChunkMeta 并由 `segPos`/`fragRgs` 判断是否真正命中。
 
 ---
 
@@ -635,15 +659,39 @@ sequenceDiagram
 ### 10.2 延迟初始化（Lazy Init）
 
 ```go
-func (r *tsspFileReader) LoadComponents() {
-    // 1. 重新打开文件句柄（如果已关闭）
-    r.loadDiskFileReader()
-    // 2. 加载 Bloom Filter
-    r.loadBloomFilter()
-    // 3. 加载 MetaIndex 数组
-    r.loadMetaIndex()
-    // 4. 提取 ChunkMeta 压缩模式
-    r.chunkMetaCompressMode = r.trailer.ExtraData.ChunkMetaCompressFlag
+// engine/immutable/tssp_file.go:901
+func (r *tsspFileReader) LoadComponents() error {
+	if r.initialized() {
+		return nil
+	}
+	hitRatioStat.AddFileOpenTotal(1)
+	r.openMu.Lock()
+	defer r.openMu.Unlock()
+
+	if !r.r.IsOpen() {
+		if err := r.loadDiskFileReader(); err != nil {
+			err = errLoadFail(r.FileName(), err)
+			log.Error("load diskFileReader fail", zap.Error(err))
+			return err
+		}
+	}
+
+	if err := r.loadBloomFilter(); err != nil {
+		err = errLoadFail(r.FileName(), err)
+		log.Error("load bloom filter fail", zap.Error(err))
+		return err
+	}
+
+	if err := r.loadMetaIndex(); err != nil {
+		err = errLoadFail(r.FileName(), err)
+		log.Error("load metaindex fail", zap.Error(err))
+		return err
+	}
+
+	r.chunkMetaCompressMode = r.trailer.ExtraData.ChunkMetaCompressFlag
+
+	atomic.StoreInt32(&r.inited, 1)
+	return nil
 }
 ```
 
@@ -713,8 +761,7 @@ sequenceDiagram
     Builder->>File: 写入 Bloom Filter 字节
     Builder->>Seq: 更新 Sequencer 的 IdTime 数据
     Builder->>File: 写入 IdTime 数据
-    Builder->>File: 写入 ExtraData
-    Builder->>File: Marshal 并写入 Trailer
+    Builder->>File: 设置 ExtraData 标志，Marshal 进 Trailer 后写入
     Builder->>File: 写入 Footer（8 字节：trailer 偏移）
     Builder->>File: Close()
 ```
@@ -743,17 +790,23 @@ type tsspFileWriter struct {
 
 ### 12.1 为什么需要 Lease？
 
-**代码位置**：`engine/immutable/tssp_file.go`
+**代码位置**：`engine/immutable/tssp_reader.go`、`engine/immutable/shard_lease_cache.go`、`engine/immutable/node_file_pool.go`
 
 ```go
-var leaseDuration = 30 * time.Second  // 默认 30 秒
+// engine/immutable/tssp_reader.go:42
+var (
+    leaseDuration   = 30 * time.Second
+    leaseDurationMu sync.RWMutex
+)
 ```
 
 TSSP 文件是不可变的，但频繁打开/关闭文件句柄的开销很大。Lease 机制允许：
-1. 文件引用计数降为 0 时，不立即关闭文件句柄
-2. 将文件放入 `ShardLeaseCache`，设置 30 秒过期
-3. 如果 30 秒内再次访问，取消 Lease，复用句柄
-4. 如果 30 秒后过期，关闭文件句柄
+1. reader 引用计数降为 0 时，不立即关闭文件句柄（`UnrefFileReader()` 返回 `true`，调用方据此跳过 `file.Unref()`）
+2. 将文件放入所属 shard 的 `ShardLeaseCache`，按 `leaseDuration`（默认 30 秒）设置过期时间
+3. 如果 30 秒内再次访问，`RefFileReader()` 会取消 Lease，复用句柄
+4. 如果 30 秒后过期，`onExpired` 先把文件放回节点级 `NodeFilePool`，池满时才 `FreeFileHandle()` 关闭句柄
+
+> Lease 缓存由 `engine/shard.go:479` 的 `initLeaseCache()` 创建并 `Start()`，后台每 `duration/2`（默认 15 秒）扫描一次过期项。
 
 ### 12.2 Lease 流程
 
@@ -764,22 +817,22 @@ sequenceDiagram
     participant Cache as ShardLeaseCache
     participant Reader2 as 查询 2
 
-    Reader->>File: RefFileReader() → 引用计数 = 1
+    Reader->>File: RefFileReader() → reader 引用计数 = 1
     Reader->>File: 读取数据
-    Reader->>File: UnrefFileReader() → 引用计数 = 0
+    Reader->>File: UnrefFileReader() → reader 引用计数 = 0，返回 true
     File->>Cache: 加入 Lease 缓存（30 秒过期）
 
     Note over Cache: 10 秒后...
 
     Reader2->>File: RefFileReader()
-    File->>Cache: 取消 Lease，复用句柄
+    File->>Cache: Remove(key) 取消 Lease，复用句柄
     Reader2->>File: 读取数据
     Reader2->>File: UnrefFileReader()
     File->>Cache: 重新加入 Lease 缓存
 
     Note over Cache: 30 秒后...
 
-    Cache->>File: Lease 过期，关闭文件句柄
+    Cache->>File: Lease 过期，onExpired 放回 NodeFilePool；池满才关闭句柄
 ```
 
 ---
@@ -807,22 +860,20 @@ cpu,host=server2 value=77.1 1002
     Segment 0:
       time 列:   [Delta编码: 1000, 1001] → 20 字节
       value 列:  [Gorilla编码: 99.5, 88.3] → 16 字节
-      host 列:   [字典编码: "server1"→0, "server1"→0] → 8 字节
 
   → SID=1002 的 Chunk:
     Segment 0:
       time 列:   [Delta编码: 1002] → 8 字节
       value 列:  [Gorilla编码: 77.1] → 8 字节
-      host 列:   [字典编码: "server2"→1] → 4 字节
 
 步骤 3: 写入 ChunkMeta Blocks
   → ChunkMeta for SID=1001:
-    {sid:1001, offset:16, size:44, columnCount:3, segCount:1, ...}
+    {sid:1001, offset:16, size:36, columnCount:2, segCount:1, ...}
   → ChunkMeta for SID=1002:
-    {sid:1002, offset:60, size:20, columnCount:3, segCount:1, ...}
+    {sid:1002, offset:52, size:16, columnCount:2, segCount:1, ...}
 
 步骤 4: 写入 MetaIndex
-  → MetaIndex: {id:1001, minTime:1000, maxTime:1002, offset:80, count:2, size:200}
+  → MetaIndex: {id:1001, minTime:1000, maxTime:1002, offset:68, count:2, size:200}
 
 步骤 5: 写入 Bloom Filter
   → 插入 SID=1001 和 SID=1002
@@ -832,7 +883,7 @@ cpu,host=server2 value=77.1 1002
   → Block 0: [1001, 1002], [2, 1], [1001, 1002]
 
 步骤 7: 写入 Trailer
-  → dataOffset=16, dataSize=64, indexSize=200, ...
+  → dataOffset=16, dataSize=52, indexSize=200, ...
 
 步骤 8: 写入 Footer
   → trailerOffset = 360
@@ -860,12 +911,12 @@ cpu,host=server2 value=77.1 1002
 
 步骤 3: MetaIndex 查找
   → 二分查找: SID=1001 在 MetaIndex[0] 范围内
-  → MetaIndex[0] = {offset:80, count:2, size:200}
+  → MetaIndex[0] = {offset:68, count:2, size:200}
 
 步骤 4: ChunkMeta 查找
-  → 读取 ChunkMeta 块 (offset=80, size=200)
+  → 读取 ChunkMeta 块 (offset=68, size=200)
   → 二分查找: SID=1001 的 ChunkMeta
-  → ChunkMeta = {sid:1001, offset:16, size:44, colMeta:[...]}
+  → ChunkMeta = {sid:1001, offset:16, size:36, colMeta:[...]}
 
 步骤 5: 读取 value 列数据
   → 找到 value 列的 ColumnMeta
@@ -876,7 +927,8 @@ cpu,host=server2 value=77.1 1002
   → Gorilla 解码 → [99.5, 88.3]
 
 步骤 7: 返回结果
-  → time=[1000,1001], value=[99.5,88.3], host=["server1","server1"]
+  → time=[1000,1001], value=[99.5,88.3]
+  → host=["server1","server1"] 来自索引中的 tag（不在 TSSP 数据块）
 ```
 
 ---

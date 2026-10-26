@@ -1,5 +1,7 @@
 # Module 14: Compaction 合并策略深度审计报告（庖丁解牛版）
 
+> 代码基线：`origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11，main + 19 个提交）。本文所有 `file:line` 均指该基线。
+
 > Compaction 是存储引擎的"垃圾回收器"。它在后台自动合并小文件、消除重复数据、提升查询性能。理解 Compaction 策略，就理解了 openGemini 如何在高频写入下保持查询性能。
 
 ---
@@ -132,7 +134,7 @@ func (c *Compactor) run() {
 }
 ```
 
-> **注意**：`run()` 使用 `for range tm.C` 循环，没有 `select` 或 `stopCh` 通道。Compactor 的生命周期通过 goroutine 管理（`sync.WaitGroup`）而非显式停止信号控制。
+> **注意**：`run()` 使用 `for range tm.C` 循环，没有 `select` 或 `stopCh` 通道，goroutine 本身没有停止信号；`Compactor.wg` 只用于登记已注册的 shard 数量（`RegisterShard` 中 `Add(1)`、`UnregisterShard` 中 `Done()`），不是 goroutine 生命周期管理。
 
 ### 3.2 层级压缩触发条件
 
@@ -254,13 +256,14 @@ LeveLMinGroupFiles = [7]int{8, 4, 4, 4, 4, 4, 2}
 压缩循环就像"轮班表"：
 
 ```
+压缩序列（数值为源层，产物层 = 源层 + 1）：
 第 1 轮：L0 → L1 → L0 → L2 → L0 → L3 → L0 → L1 → L2 → L3 → L0 → L4 → L0 → L5 → L0 → L1 → L2 → L6
          ↑                    ↑                    ↑                    ↑
          最频繁               较频繁               较少                 最少
 ```
 
 - **L0 最频繁**：因为每次 flush 都产生 L0 文件，增长最快
-- **L6 最少**：因为 L6 是最深层级，文件最大、最少变化
+- **L6 最少**：规则中的 6 表示"对 L6 做压缩"，产物为 L7（`genCompactGroup` 使用 `level+1`），因此 L7 才是最终层；L6/L7 文件最大、最少变化
 
 ### 4.3 文件选择算法
 
@@ -300,56 +303,54 @@ sequenceDiagram
 **核心代码**：`engine/immutable/mms_tables.go:1148-1196`（`mmsPlan` 方法）
 
 ```go
-func (m *MmsTables) mmsPlan(name string, files *TSSPFiles, level uint16, minGroupFileN int,
-    plans []*CompactGroup) []*CompactGroup {
+func (m *MmsTables) mmsPlan(name string, files *TSSPFiles, level uint16, minGroupFileN int, plans []*CompactGroup) []*CompactGroup {
+	if m.isClosed() || m.isCompMergeStopped() || atomic.LoadInt64(&files.closing) > 0 {
+		return plans
+	}
 
-    if m.isClosed() || m.isCompMergeStopped() || atomic.LoadInt64(&files.closing) > 0 {
-        return plans
-    }
+	seqMap := seqMapPool.Get().(*dictpool.Dict)
+	seqMap.Reset()
+	defer seqMapPool.Put(seqMap)
 
-    seqMap := seqMapPool.Get().(*dictpool.Dict)  // 从对象池获取，避免频繁分配
-    seqMap.Reset()
-    defer seqMapPool.Put(seqMap)
+	idx := 0
+	for idx < files.Len() {
+		f := files.files[idx]
+		lv, seq := f.LevelAndSequence()
+		if lv != level {
+			// if seqMap.Len() >= minGroupFileN, but the next file is another level, we will create the plan
+			// and reserve the split file check logic
+			plans = m.genCompactPlan(seqMap, minGroupFileN, name, level, files, plans)
+			seqMap.Reset()
+			idx++
+			continue
+		}
 
-    idx := 0
-    for idx < files.Len() {
-        f := files.files[idx]
-        lv, seq := f.LevelAndSequence()
+		seqByte := record.Uint64ToBytesUnsafe(seq)
+		if !seqMap.HasBytes(seqByte) {
+			plans = m.genCompactPlan(seqMap, minGroupFileN, name, level, files, plans)
+			if files.splitByUnloadFile(idx) {
+				seqMap.Reset()
+			}
+			seqMap.SetBytes(seqByte, f)
+			idx++
+		} else {
+			i := idx + 1
+			for i < files.Len() {
+				f = files.files[i]
+				if !levelSequenceEqual(level, seq, f) {
+					break
+				}
+				i++
+			}
+			idx = i
+			seqMap.Reset()
+		}
 
-        if lv != level {
-            // 不同 level：生成计划并重置 seqMap
-            plans = m.genCompactPlan(seqMap, minGroupFileN, name, level, files, plans)
-            seqMap.Reset()
-            idx++
-            continue
-        }
+	}
 
-        seqByte := record.Uint64ToBytesUnsafe(seq)
-        if !seqMap.HasBytes(seqByte) {
-            // 新 seq：检查是否需要生成计划
-            plans = m.genCompactPlan(seqMap, minGroupFileN, name, level, files, plans)
-            if files.splitByUnloadFile(idx) {
-                seqMap.Reset()  // 遇到 unload 文件时分割
-            }
-            seqMap.SetBytes(seqByte, f)
-            idx++
-        } else {
-            // 重复 seq：跳过所有同 seq 文件
-            i := idx + 1
-            for i < files.Len() {
-                f = files.files[i]
-                if !levelSequenceEqual(level, seq, f) {
-                    break
-                }
-                i++
-            }
-            idx = i
-            seqMap.Reset()
-        }
-    }
+	plans = m.genCompactPlan(seqMap, minGroupFileN, name, level, files, plans)
 
-    plans = m.genCompactPlan(seqMap, minGroupFileN, name, level, files, plans)
-    return plans
+	return plans
 }
 ```
 
@@ -465,7 +466,7 @@ func (m *MmsTables) getMstToMerge(limit int, full bool, force bool) []string {
 
 > **关键差异**：
 > - 使用 `limit` 参数限制返回数量，不是 `maxCompactor`
-> - 使用 `m.inMerge.Has(mst)` 检查是否正在合并，不是 `MeasurementInProcess`
+> - 使用 `m.inMerge.Has(mst)` 检查是否正在合并；`inMerge` 的类型是 `*MeasurementInProcess`（`mms_tables.go:147`）
 > - `Nearly()` 函数逻辑：`Nearly(mst, d)` 返回 `true` 表示距上次合并时间 <= d（即"最近刚合并过"）
 > - `!Nearly(mst, MinInterval)` 表示距上次合并时间 > MinInterval（即"足够久没合并了"）
 > - 触发条件是 `!Nearly`（时间间隔足够大），不是 `elapsed >= MinInterval`
@@ -476,7 +477,7 @@ func (m *MmsTables) getMstToMerge(limit int, full bool, force bool) []string {
 graph TD
     A["MergeOutOfOrder()"] --> B{"selfMode?"}
 
-    B -->|"是（同层文件）"| C{"level <= 2?"}
+    B -->|"是（同层文件）"| C{"ToLevel() <= 2<br/>或 ToLevel()==TSSPToParquetLevel()?"}
     C -->|"是"| D["mergeSelfFastMode()<br/>快速模式：ChunkIterators + 堆排序"]
     C -->|"否"| E["mergeSelfStreamMode()<br/>流式模式：MergePerformers"]
 
@@ -509,7 +510,7 @@ func (ctx *MergeContext) MergeSelfFast() bool {
 
 **触发条件**（满足任一即可）：
 1. `ToLevel() == TSSPToParquetLevel()` — 目标层级是 Parquet 转换层级
-2. `ToLevel() <= StreamMergeModeLevel` — 目标层级 <= 流式合并阈值（默认 level <= 2）
+2. `ToLevel() <= StreamMergeModeLevel` — 目标层级 <= 流式合并阈值（默认目标层 <= 2，即源层 <= 1）
 
 ```mermaid
 sequenceDiagram
@@ -536,7 +537,7 @@ sequenceDiagram
 
 **代码位置**：`engine/immutable/merge_tool.go:262`
 
-**适用条件**：`ToLevel() > StreamMergeModeLevel`（默认 level > 2）
+**适用条件**：`ToLevel() > StreamMergeModeLevel`（默认目标层 > 2，即源层 > 1）
 
 ```mermaid
 sequenceDiagram
@@ -761,6 +762,7 @@ type StreamIterators struct {
     tier       uint64              // 数据分层标识
     dstMeta    ChunkMeta           // 目标 chunk 元数据
     schemaMap  map[string]struct{} // schema 去重 map
+    // ...（另有 fileName/fileSize/encChunkMeta/encChunkIndexMeta/encIdTime/crc/version/lastSeg/col/events/chunkMetaCodecCtx 等字段）
 }
 ```
 
@@ -925,7 +927,8 @@ func FilesMergedTire(files []TSSPFile) uint64 {
 
 ```go
 // 全局并发限制
-compLimiter = limiter.NewFixed(cpu.GetCpuNum())      // 压缩并发数 = CPU 核数
+maxCompactor = cpu.GetCpuNum()                         // 初始值，可被 SetMaxCompactor 夹紧到 [2,32]
+compLimiter = limiter.NewFixed(maxCompactor)          // 压缩并发数 = maxCompactor
 maxFullCompactor = cpu.GetCpuNum() / 2                // 初始值，后续会被 SetMaxFullCompactor 夹紧
 
 // 写入限速
@@ -945,16 +948,34 @@ fileLoadLimiter = limiter.NewFixed(cpu * 4)            // 文件读取并发数 
 ```go
 // 防止同一个 measurement 并发合并
 type MeasurementInProcess struct {
-    m sync.Map  // name → bool
+    mu     sync.Mutex
+    tables map[string]struct{}
 }
 
 func (m *MeasurementInProcess) Add(name string) bool {
-    _, loaded := m.m.LoadOrStore(name, true)
-    return !loaded  // 返回 false 表示已经在处理中
+    m.mu.Lock()
+    defer m.mu.Unlock()
+
+    if _, ok := m.tables[name]; ok {
+        return false
+    }
+
+    m.tables[name] = struct{}{}
+    return true
+}
+
+func (m *MeasurementInProcess) Has(name string) bool {
+    m.mu.Lock()
+    _, ok := m.tables[name]
+    m.mu.Unlock()
+    return ok
 }
 
 func (m *MeasurementInProcess) Del(name string) {
-    m.m.Delete(name)
+    m.mu.Lock()
+    defer m.mu.Unlock()
+
+    delete(m.tables, name)
 }
 ```
 

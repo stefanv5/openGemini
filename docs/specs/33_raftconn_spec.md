@@ -1,5 +1,7 @@
 # Module 33: Raft Connection Manager 深度审计报告（庖丁解牛版）
 
+> 代码基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）；本文行号与代码摘录均以 `_spec_verify_20260616/snapshots/spec-md-chinese` 为准。
+
 > 本模块聚焦 `lib/raftconn/` — Raft 节点的连接管理层。它封装了 etcd Raft 节点的生命周期、消息传输、持久化协调和快照管理。**注意**：本模块专注于连接/传输层，共识算法本身（选举、日志复制、成员变更）由 Module 15（Raft Partition Consensus）覆盖。
 
 ---
@@ -133,7 +135,7 @@ graph LR
 ```
 
 **通俗解释**：
-RaftNode 就像一个"中转站"，通过 5 个 channel 连接不同的组件：
+RaftNode 就像一个"中转站"，通过 6 个 channel 字段连接不同的组件（下图画出 5 条主要通路；`RaftFlushC` 属于 `SnapShotter`，不在 `RaftNode` 上）：
 - **proposeC**：数据进来（写入请求 → Raft）
 - **commitC**：数据出去（Raft → 存储引擎）
 - **Messages**：节点间通信（Leader ↔ Follower）
@@ -204,7 +206,9 @@ func StartNode(store *raftlog.RaftDiskStorage, nodeId uint64, database string, i
         Storage:         store,
         MaxSizePerMsg:   maxSizePerMsg,          // 4096
         MaxInflightMsgs: maxInflightMsgs,        // 256
+        Logger:          logger.GetSrLogger(),
     }
+    // ...
 
     n := &RaftNode{
         proposeC:    make(chan []byte, 1),
@@ -230,14 +234,23 @@ func (n *RaftNode) InitAndStartNode() error {
     }
 
     if restart {
-        state, _ := n.Store.HardState()
+        state, err := n.Store.HardState()
+        if err != nil {
+            panic("Unable to get existing hardState")
+        }
         n.appliedIndex = state.Commit
-        sp, _ := n.Store.Snapshot()
+        sp, err := n.Store.Snapshot()
         n.SnapShotter.CommittedIndex = sp.Metadata.Index
+        if err != nil {
+            panic("Unable to get existing snapshot")
+        }
 
         if raftlog.IsValidSnapshot(sp) {
             n.SetConfState(&sp.Metadata.ConfState)
-            n.replay(sp)  // 重放已提交但未应用的日志
+            err := n.replay(sp)  // 重放已提交但未应用的日志
+            if err != nil {
+                n.logger.Error("replay wal error", zap.Error(err))
+            }
         }
         n.node = raft.RestartNode(n.Cfg)
     } else {
@@ -261,6 +274,7 @@ func (n *RaftNode) InitAndStartNode() error {
 ```go
 func (n *RaftNode) Stop() {
     if n.cancelFn != nil {
+        n.logger.Error("cancel fn is executed by stop!!!")
         n.cancelFn()  // 取消 context，通知所有 goroutine
     }
     n.once.Do(func() {
@@ -309,10 +323,12 @@ func (n *RaftNode) serveChannels() {
                 for i := range n.processMessages(rd.Messages) {
                     n.Messages <- &rd.Messages[i]
                 }
+                // ...
             }
 
             // 3. 持久化到磁盘
             n.SaveToStorage(&rd.HardState, rd.Entries, &rd.Snapshot)
+            // ...
 
             // 4. 处理快照
             if raftlog.IsValidSnapshot(rd.Snapshot) {
@@ -323,9 +339,11 @@ func (n *RaftNode) serveChannels() {
             // 5. 同步到磁盘（如果需要）
             for rd.MustSync {
                 if err := n.Store.TrySync(); err != nil {
+                    n.logger.Error("Error while calling Store.Sync", zap.Error(err))
                     time.Sleep(10 * time.Millisecond)
                     continue
                 }
+                // ...
                 break
             }
 
@@ -341,6 +359,7 @@ func (n *RaftNode) serveChannels() {
                 for i := range n.processMessages(rd.Messages) {
                     n.Messages <- &rd.Messages[i]
                 }
+                // ...
             }
 
             // 8. 通知 Raft 推进
@@ -377,10 +396,12 @@ flowchart TB
     L -->|是| M["Store.TrySync()"]
     L -->|否| N[跳过]
 
-    M --> O["PublishEntries(committedEntries)"]
+    M --> O["PublishEntries(entriesToApply(committedEntries))"]
     N --> O
 
-    O --> P{是 Follower?}
+    O --> O2{PublishEntries 返回 false?}
+    O2 -->|是| O3["n.Stop(); return"]
+    O2 -->|否| P{是 Follower?}
     P -->|是| Q["发送 Messages（确保已持久化）"]
     P -->|否| R[跳过]
 
@@ -424,8 +445,8 @@ sequenceDiagram
 
     Commit->>Apply: readCommitFromRaft()
     Apply->>Apply: dealNormalData() → 写入 shard
-    Apply->>Engine: RetCommittedDataC(proposeId, nil)
-    Engine->>Engine: 收到确认，返回成功
+    Apply->>Engine: RetCommittedDataC(dw, committedErr) 先校验 dw.Identity
+    Engine->>Engine: 收到确认返回结果；WaitCommitTimeout 20s 超时则返回错误
 ```
 
 **核心代码**：`lib/raftconn/node.go:393-426`（proposals）
@@ -479,23 +500,38 @@ func (n *RaftNode) AddCommittedDataC(dw *raftlog.DataWrapper) (chan error, error
     return c, nil
 }
 
-// 通知等待者
-func (n *RaftNode) RetCommittedDataC(dw *raftlog.DataWrapper, committedErr error) {
-    n.dataCommittedMu.RLock()
-    c, ok := n.DataCommittedC[dw.ProposeId]
-    n.dataCommittedMu.RUnlock()
-    if !ok {
-        return  // 可能已超时或节点重启
-    }
-    c <- committedErr
-}
-
 // 移除等待 channel
 func (n *RaftNode) RemoveCommittedDataC(dw *raftlog.DataWrapper) {
     n.dataCommittedMu.Lock()
     defer n.dataCommittedMu.Unlock()
+    _, ok := n.DataCommittedC[dw.ProposeId]
+    if !ok {
+        logger.GetLogger().Error("RemoveCommittedDataC proposeId not exist", zap.String("identity", dw.Identity), zap.Uint64("proposeId", dw.ProposeId))
+        return
+    }
     close(n.DataCommittedC[dw.ProposeId])
     delete(n.DataCommittedC, dw.ProposeId)
+}
+
+// 通知等待者
+func (n *RaftNode) RetCommittedDataC(dw *raftlog.DataWrapper, committedErr error) {
+    defer func() {
+        if e := recover(); e != nil {
+            logger.GetLogger().Error("runtime panic", zap.String("RetCommittedDataC raise stack:", string(debug.Stack())),
+                zap.Error(errno.NewError(errno.RecoverPanic, e)),
+                zap.String("db", n.database),
+                zap.Uint32("ptId", n.ptId))
+        }
+    }()
+    n.dataCommittedMu.RLock()
+    c, ok := n.DataCommittedC[dw.ProposeId]
+    n.dataCommittedMu.RUnlock()
+    if !ok {
+        // maybe wait committed return timeout or node restarted
+        logger.GetLogger().Error("PushCommittedDataC proposeId not exist", zap.String("identity", dw.Identity), zap.Uint64("proposeId", dw.ProposeId))
+        return
+    }
+    c <- committedErr
 }
 ```
 
@@ -546,10 +582,15 @@ func (n *RaftNode) PublishEntries(ents []raftpb.Entry) bool {
             var cc raftpb.ConfChange
             err := cc.Unmarshal(ents[i].Data)
             if err != nil {
+                n.logger.Error("unmarshal conf changed failed", zap.Error(err))
                 continue
             }
             n.confState = n.node.ApplyConfChange(cc)
             n.saveConfStateToMeta()  // 持久化配置状态
+            switch cc.Type {
+            case raftpb.ConfChangeAddNode:
+            case raftpb.ConfChangeRemoveNode:
+            }
         }
     }
 
@@ -639,7 +680,7 @@ func (s *RaftConnStore) SendRaftMessages(nodeID uint64, database string, pt uint
 
 func (s *RaftConnStore) raftRequestWithNodeId(nodeID uint64, typ uint8, data codec.BinaryCodec) (interface{}, error) {
     r := msgservice.NewRequester(typ, data, s.mc)
-    r.SetToInsert()                     // 使用写入专用连接池
+    r.SetToInsert()                     // 注：该标志只影响 Request()，对 RaftMsg() 路径不生效
     r.SetTimeout(config.RaftMsgTimeout) // 15 秒超时
     err := r.InitWithNodeID(nodeID)
     if err != nil {
@@ -670,7 +711,7 @@ sequenceDiagram
 
     RFS->>RFS: 构建 RaftMessagesRequest
     RFS->>RFS: 检查 node.Status == serf.StatusAlive
-    RFS->>Req: NewRequester + SetToInsert + SetTimeout(15s)
+    RFS->>Req: NewRequester + SetTimeout(15s)
     Req->>SP: NewRaftMsgTransport → Send → Wait
     SP->>Target: 网络传输
 
@@ -683,7 +724,7 @@ sequenceDiagram
 
 **关键设计**：
 - 节点不可用时静默丢弃（`return nil`），不阻塞 Raft 事件循环
-- 使用写入专用连接池（`SetToInsert`），保证低延迟
+- 实际走写入专用连接池：`NewRaftMsgTransport` 固定从 `NewWriteNodeManager()` 取连接；此处的 `SetToInsert` 对 `RaftMsg()` 路径不生效
 - 超时 15 秒，避免长时间阻塞
 - `SendRaftMessages` 的错误主要包括 transport/request 链路错误、响应类型错误（如 `InvalidType`）和响应中的 `ErrMsg` 非空；目标节点不存在、查不到或状态不是 `serf.StatusAlive` 时直接返回 `nil`
 
@@ -715,9 +756,11 @@ flowchart TD
   raftRequestWithNodeId 返回 NoConnectionAvailable
   -> SendRaftMessages 返回该 error
 
-案例 4：目标节点处理失败
-  RaftMessagesResponse.ErrMsg = "step raft message failed"
+案例 4：目标节点上取不到对应 partition（前置错误）
+  EngineImpl.SendRaftMessage 里 getPartition 返回 error（如 DBPTClosed）
+  -> handler 把该 error 写入 RaftMessagesResponse.ErrMsg
   -> SendRaftMessages 返回 errors.New(ErrMsg)
+  （注意：StepRaftMessage 自身的错误只落日志，不会回传给发送方）
 ```
 
 ---
@@ -744,15 +787,17 @@ func (n *RaftNode) snapshotAfterFlush() {
 
 func (n *RaftNode) snapShot() error {
     index := n.SnapShotter.CommittedIndex
+    // ...
     for {
         err := n.Store.CreateSnapshot(index, n.ConfState(), []byte("snapshot"))
         if err == nil {
             break
         }
         if errors.Is(err, raft.ErrSnapOutOfDate) {
+            // ...
             break  // 快照已过期，忽略
         }
-        // 其他错误，重试
+        // ... 其他错误，重试
     }
     return nil
 }
@@ -816,6 +861,7 @@ func (n *RaftNode) deleteEntryLogPeriodically() {
     for {
         select {
         case <-ticker.C:
+            // ...
             n.deleteEntryLog()       // 通过 Raft 提议清理
             n.deleteEntryLogBySize() // 本地紧急清理
         case <-n.ctx.Done():
@@ -900,7 +946,7 @@ func (n *RaftNode) forceDeleteEntryLog(index uint64) (bool, error) {
 func (n *RaftNode) forceDeleteEntryLogBySize(index uint64) error {
     size := n.Store.EntrySize()
     if uint64(size) > uint64(config.GetStoreConfig().ClearEntryLogTolerateSize) {
-        // 日志总大小超过 20GB，强制本地清理
+        // ... 日志总大小超过 20GB，强制本地清理
         err := n.Store.DeleteBefore(index)
         if err != nil {
             return err
@@ -942,6 +988,11 @@ PT2 的 Raft 节点 ID = 2 + 1 = 3
 func (n *RaftNode) TransferLeadership(newLeader uint64) error {
     // 1. 等待选举出 Leader
     for {
+        select {
+        case <-n.ctx.Done():
+            return nil
+        default:
+        }
         if n.node.Status().Lead == 0 {
             time.Sleep(100 * time.Millisecond)
             continue
@@ -954,17 +1005,20 @@ func (n *RaftNode) TransferLeadership(newLeader uint64) error {
     if oldLeader != newLeader {
         n.node.TransferLeadership(n.ctx, oldLeader, newLeader)
     }
+    // ...
 
     // 3. 等待转移完成（超时 10 秒）
     var timer = time.NewTimer(10 * time.Second)
     for n.node.Status().Lead != newLeader {
         select {
         case <-timer.C:
+            n.logger.Error("try to transfer leadership timeout")
             return fmt.Errorf("try to transfer leadership timeout")
         default:
             time.Sleep(100 * time.Millisecond)
         }
     }
+    n.logger.Info("try to transfer leadership finish")
     return nil
 }
 ```

@@ -1,5 +1,7 @@
 # Module 29: 文件操作抽象层深度解析（lib/fileops）
 
+> 基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11，main + 19 commits）。
+
 > `lib/fileops/` 是 openGemini 的文件操作抽象层，它将本地文件系统、OBS 对象存储、StreamFS 分布式文件系统统一在同一套接口之下。上层存储引擎（TSSP、WAL、Index）只需调用 `fileops.Open()`、`fileops.Create()` 等包级函数，无需关心底层存储是本地磁盘还是云端对象存储。
 
 ---
@@ -84,7 +86,7 @@ type File interface {
 | `Truncate(size)` | 自定义 | 截断文件到指定大小 |
 | `Sync()` | 自定义 | 将缓冲区数据刷写到持久存储 |
 | `Stat()` | 自定义 | 获取文件元信息（大小、修改时间等） |
-| `SyncUpdateLength()` | 自定义 | 同步并更新文件长度（OBS 特化） |
+| `SyncUpdateLength()` | 自定义 | 强制同步：StreamFS 走 `fsyncV2(trueSync=true)`；OBS 为空操作（等同 `Sync()`）；本地等同 `Sync()` |
 | `Fd()` | 自定义 | 返回底层文件描述符（mmap 使用） |
 | `Size()` | 自定义 | 获取文件大小 |
 | `StreamReadBatch(...)` | 自定义 | 流式批量读取（OBS HTTP Range 合并） |
@@ -214,6 +216,8 @@ pri := fileops.FilePriorityOption(fileops.IO_PRIORITY_HIGH)
 fd, err := fileops.Open("/data/cpu_0001/00000001-0000-00000001.tssp", lock, pri)
 ```
 
+注意：本地 `vfs` 会忽略 `FSOption`（`lib/fileops/os_fs.go:152` 起参数为 `_ ...FSOption`），因此对本地路径传 `lock`/`pri` 没有效果；只有 StreamFS 通过 `lockAndPriorityOpt` 消费这两个选项（`lib/fileops/fs_streamfs.go:1239-1250`）。前台/后台的 IO 权重实际通过 `ReadAt(..., ioPriority)` 参数控制。
+
 ---
 
 ## 4. 存储后端路由
@@ -229,25 +233,30 @@ const (
     Unknown FsType = 0
     Local   FsType = 1
     Obs     FsType = 2
-    Hdfs    FsType = 3   // 未实现
+    Hdfs    FsType = 3
 )
 
+...
+
 func GetFsType(path string) FsType {
-    switch path[0] {
-    case 'o':
-        if strings.HasPrefix(path, "obs:/") {
-            return Obs
-        }
-    case 'h':
-        if strings.HasPrefix(path, "hdfs://") {
-            return Hdfs
-        }
-    }
-    return Local
+	if len(path) == 0 {
+		return Unknown
+	}
+	switch path[0] {
+	case 'o':
+		if strings.HasPrefix(path, ObsPrefix) {
+			return Obs
+		}
+	case 'h':
+		if strings.HasPrefix(path, HdfsPrefix) {
+			return Hdfs
+		}
+	}
+	return Local
 }
 ```
 
-上面代码片段展示的是当前源码中 `ObsPrefix` 对应的前缀判断形式。不同产品类型可能把 `ObsPrefix` 编译/配置为 `obs:/` 或 `obs://`，但运行时仍只按一个全局前缀识别 OBS。
+上面代码片段摘自当前源码（中间省略部分变量声明），只按全局 `ObsPrefix` 判断 OBS。不同产品类型可能把 `ObsPrefix` 编译/配置为 `obs:/` 或 `obs://`，但运行时仍只按一个全局前缀识别 OBS。
 
 ### 4.2 路由流程
 
@@ -300,7 +309,7 @@ sequenceDiagram
 各字段含义：
   endpoint  = obs.cn-north-4.myhuaweicloud.com  （OBS 服务端点）
   ak        = ACCESS_KEY                         （访问密钥 ID）
-  sk        = SECRET_KEY                         （访问密钥，加密存储）
+  sk        = SECRET_KEY                         （访问密钥；路径中为 DecryptObsSk 解密后的值）
   bucket    = my-bucket                          （存储桶名称）
   basePath  = data/db0/0/cpu_0001/00000001.tssp  （对象键）
 ```
@@ -467,14 +476,14 @@ sequenceDiagram
 - **随机访问友好**：配合 `MADV_RANDOM` 提示，避免无效预读
 
 **mmap 读取的劣势**：
-- **仅限 Linux**：Windows 和 macOS 不支持
+- **仅限 Linux/FreeBSD**：Windows 和 macOS 不支持
 - **TLB 压力**：大量 mmap 映射会增加 TLB miss
-- **不适合写入**：openGemini 中 mmap 仅用于只读场景（`PROT_READ`）
+- **TSSP 只读、logstore 可写**：TSSP 查询路径只用只读 `Mmap`（`PROT_READ`）；`lib/logstore` 另用 `MmapRW`（`PROT_READ|PROT_WRITE`）做可写映射
 
 ### 6.4 Fadvise — 预读策略控制
 
 ```go
-// FADV_RANDOM: 随机访问模式，关闭预读（mmap 默认使用）
+// FADV_RANDOM: 随机访问模式，关闭预读（Mmap 实际传的是 syscall.MADV_RANDOM）
 // FADV_SEQUENTIAL: 顺序访问模式，增加预读
 // FADV_WILLNEED: 提示内核即将访问的区域
 // FADV_DONTNEED: 提示内核不再需要的区域，释放页面缓存
@@ -589,7 +598,8 @@ type obsFile struct {
 
 ```go
 func (o *obsFile) Write(src []byte) (int, error) {
-    for i := 0; i < ObsWriteRetryTimes; i++ {  // 最多重试 3 次
+    // ...
+    for i := 0; i < ObsWriteRetryTimes; i++ {
         modifyObjectInput := &obs.ModifyObjectInput{
             Bucket:        o.conf.bucket,
             Key:           o.key,
@@ -843,7 +853,7 @@ func (r *fileReader) FreeFileHandle() error {
     if err := r.close(); err != nil {
         return err
     }
-    r.fd = nil  // 句柄释放，但 name/fileSize 等元数据保留
+    r.fd = nil
     return nil
 }
 ```
@@ -861,6 +871,8 @@ func (r *fileReader) Close() error {
     return r.close()
 }
 ```
+
+注：`lib/fileops` 只负责句柄的打开/关闭。engine 层还有三层句柄管理器：`QueryfileCache`（代码注释已标 DEPRECATED）、每 shard 的 `ShardLeaseCache`（Lease 复用窗口）、节点级 `NodeFilePool`（LRU 上限）；`TSSPFile.UnrefFileReader()` 返回 bool，ref 归零后文件可能先进入 Lease 而非立即 `FreeFileHandle`（`engine/immutable/shard_lease_cache.go:38-51`、`node_file_pool.go:41-51`、`tssp_reader.go:505-523`）。
 
 ---
 
@@ -908,18 +920,50 @@ type fileWriter struct {
 
 ```go
 func (w *fileWriter) CopyTo(to io.Writer) (int, error) {
-    // 1. 刷新缓冲区
-    w.w.Flush()
-    // 2. 关闭当前文件
-    w.lw.Close()
-    // 3. 以只读方式重新打开
-    fd, _ := Open(name, lock)
-    // 4. 复制到目标 writer
-    wn, _ := io.CopyBuffer(to, fd, buf)
-    // 5. 关闭并删除临时文件
-    fd.Close()
-    Remove(fn, FileLockOption(*w.lock))
-    return int(wn), nil
+	if err := w.w.Flush(); err != nil {
+		log.Error("flush fail", zap.String("name", w.lw.Name()), zap.Error(err))
+		return 0, err
+	}
+
+	name := w.lw.Name()
+	if err := w.lw.Close(); err != nil {
+		log.Error("close file fail", zap.String("file", name), zap.Error(err))
+		return 0, err
+	}
+
+	lock := FileLockOption("")
+	fd, err := Open(name, lock)
+	if err != nil {
+		log.Error("open file fail", zap.String("file", name), zap.Error(err))
+		return 0, err
+	}
+
+	defer func(fn string) {
+		if err = fd.Close(); err != nil {
+			log.Error("close file fail", zap.String("file", fn), zap.Error(err))
+		}
+		if err = Remove(fn, FileLockOption(*w.lock)); err != nil {
+			log.Error("remove file fail", zap.String("file", fn), zap.Error(err))
+		}
+	}(name)
+
+	buf := bufferpool.Get()
+	defer bufferpool.Put(buf)
+	buf = bufferpool.Resize(buf, DefaultBufferSize)
+
+	var wn int64
+	wn, err = io.CopyBuffer(to, fd, buf)
+	if err != nil {
+		log.Error("copy file fail", zap.String("file", name), zap.Error(err))
+		return 0, err
+	}
+
+	if wn != int64(w.n) {
+		err = fmt.Errorf("copy file(%v) fail, file size:%v, copy size: %v", name, w.n, wn)
+		return 0, err
+	}
+
+	return int(wn), err
 }
 ```
 
@@ -1009,19 +1053,40 @@ type Limiter interface {
 
 ```go
 type LimitWriter struct {
-    w       NameReadWriterCloser
-    limiter Limiter
+	w       NameReadWriterCloser
+	limiter Limiter
+	ctx     context.Context
 }
 
+...
+
 func (w *LimitWriter) Write(p []byte) (int, error) {
-    buf := p
-    for len(buf) > 0 {
-        writeN := min(len(buf), w.limiter.Burst())
-        wn, err := w.w.Write(buf[:writeN])
-        w.limiter.WaitN(w.ctx, wn)  // 等待令牌桶补充
-        buf = buf[wn:]
-    }
-    return n, nil
+	if w.limiter == nil {
+		return w.w.Write(p)
+	}
+
+	buf := p
+	var n int
+	for len(buf) > 0 {
+		writeN := len(buf)
+		if writeN > w.limiter.Burst() {
+			writeN = w.limiter.Burst()
+		}
+
+		wn, err := w.w.Write(buf[:writeN])
+		if err != nil {
+			return n, err
+		}
+
+		n += wn
+		buf = buf[wn:]
+
+		if err = w.limiter.WaitN(w.ctx, wn); err != nil {
+			return n, err
+		}
+	}
+
+	return n, nil
 }
 ```
 
@@ -1054,21 +1119,29 @@ func (r *fileReader) ReadAt(off int64, size uint32, dstPtr *[]byte, ioPriority i
 OBS 是扁平的对象存储，没有真正的"目录"概念。`obsFs` 通过以下方式模拟目录：
 
 ```go
-// 创建目录 = 创建一个以 "/" 结尾的空对象
 func (o *obsFs) MkdirAll(path string, perm os.FileMode, opt ...FSOption) error {
-    input := &obs.PutObjectInput{
-        Body: bytes.NewReader([]byte{}),
-    }
-    input.Key = o.NormalizeDirPath(key)  // 确保以 "/" 结尾
-    _, err = client.PutObject(input)
-    return err
+	conf, key, client, err := o.prepare(path)
+	if err != nil {
+		return err
+	}
+	input := &obs.PutObjectInput{
+		Body: bytes.NewReader([]byte{}),
+	}
+	input.Bucket = conf.bucket
+	input.Key = o.NormalizeDirPath(key)
+	_, err = client.PutObject(input)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
-// 路径标准化
 func (o *obsFs) NormalizeDirPath(path string) string {
-    i := 0
-    for path[i] == '/' { i++ }
-    return filepath.Clean(path[i:]) + "/"
+	i := 0
+	for path[i] == '/' {
+		i++
+	}
+	return filepath.Clean(path[i:]) + "/"
 }
 ```
 
@@ -1153,28 +1226,29 @@ var ReadMetaCacheEn = false // 元数据缓存开关
 var ReadDataCacheEn = false // 数据缓存开关
 ```
 
+变量初值均为 false；按默认配置加载后，`enable-meta-cache` 默认为 1，`ReadMetaCacheEn` 会被置 true（Meta 缓存默认开启）；`enable-data-cache` 样例默认为 0，Data 缓存关闭。
+
 ### 15.2 缓存层级
 
 ```mermaid
 graph TB
-    subgraph "读取请求"
-        REQ["ReadAt(off, size)"]
-    end
-
-    subgraph "缓存层"
+    subgraph "TSSP 读取层（engine/immutable）"
+        REQ["tssp_file.go / page_cache_reader"]
         META["元数据缓存<br/>（ReadMetaCache）"]
         DATA["数据缓存<br/>（ReadDataCache）"]
     end
 
-    subgraph "底层 IO"
+    subgraph "fileops 读取层"
+        READ["fileReader.ReadAt(off, size)"]
         MMAP["mmap 读取"]
         DISK["磁盘读取"]
     end
 
     REQ --> META
-    META -->|"缓存未命中"| DATA
-    DATA -->|"缓存未命中"| MMAP
-    MMAP -->|"mmap 未启用"| DISK
+    META -->|"未命中"| DATA
+    DATA -->|"未命中"| READ
+    READ -->|"mmapData != nil"| MMAP
+    READ -->|"否则"| DISK
 ```
 
 ---
@@ -1228,9 +1302,10 @@ sequenceDiagram
         Reader->>File: ReadAt(dst, 1048576)
         File->>Disk: pread(fd, dst, 8192, 1048576)
     else OBS
-        Reader->>File: StreamReadBatch(offs, sizes)
-        File->>Disk: HTTP GET + Range: bytes=1048576-1056767
+        Reader->>File: ReadAt(dst, 1048576)
+        File->>Disk: GetObject(Range: bytes=1048576-1056767)
     end
+    Note over Reader,File: 批量读取时由上层另行调用 StreamReadBatch
 
     Disk-->>Reader: 数据
     Reader-->>Query: 数据
@@ -1246,7 +1321,7 @@ sequenceDiagram
 | 路径前缀路由 | 根据路径自动选择存储后端 | 透明的多存储支持 |
 | FSOption 可选参数 | IO 优先级和文件锁 | 前台查询优先，后台任务限速 |
 | IO 统计埋点 | 所有读写操作自动采集指标 | 实时监控 IO 性能 |
-| mmap 支持 | 零拷贝随机读取 | Linux 上 TSSP 查询性能提升 |
+| mmap 支持 | 零拷贝随机读取 | Linux/FreeBSD 上 TSSP 查询性能提升 |
 | OBS Range 合并 | 将多个小读取合并为少量大请求 | 减少 OBS HTTP 请求次数 |
 | ObsClient 缓存 | 复用 OBS 连接 | 避免重复创建连接的开销 |
 | IO 限速器 | 控制后台读取带宽 | 避免后台 Compaction 影响前台查询 |

@@ -1,5 +1,7 @@
 # Module 8: PromQL 兼容层深度审计报告（庖丁解牛版 v3）
 
+> 代码基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）。
+
 > 时序图 + 核心代码逐行解释。先画图，再对照代码，一步一步拆解。
 
 ---
@@ -162,7 +164,7 @@ const (
 
 ### 2.4 FunctionType 与常量定义
 
-**代码位置**：`lib/util/lifted/promql2influxql/constant.go`
+**代码位置**：`lib/util/lifted/promql2influxql/constant.go:16-29`
 
 ```go
 type FunctionType int
@@ -182,10 +184,12 @@ const (
     DefaultDatabaseName        string = "prom"
     DefaultRetentionPolicyName string = "autogen"
     TimeField                  string = "time"
+    LastCall                   string = "last"
     PromSuffix                 string = "_prom"       // 后缀，用于区分 openGemini 原生函数与 Prom 函数
 )
 
 const DefaultLookBackDelta = 5 * time.Minute  // 默认回溯窗口
+const FieldCountForKeepMetric = 2             // keepMetric 模式下的字段数
 ```
 
 **通俗解释**：
@@ -239,13 +243,14 @@ graph TD
     B -->|"*promql.AggregateExpr"| C["transpileAggregateExpr()"]
     B -->|"*promql.Call"| D["transpileCall()"]
     B -->|"*promql.BinaryExpr"| E["transpileBinaryExpr()"]
-    B -->|"*promql.ParenExpr"| F["解包 ParenExpr, 递归调用 transpileExpr"]
+    B -->|"*promql.ParenExpr"| F["transpileParenExpr()"]
+    B -->|"*promql.UnaryExpr"| M["transpileUnaryExpr()"]
     B -->|"*promql.VectorSelector"| G["transpileInstantVectorSelector()"]
     B -->|"*promql.MatrixSelector"| H["transpileRangeVectorSelector()"]
-    B -->|"*promql.NumberLiteral"| I["transpileNumberLiteral()"]
-    B -->|"*promql.StringLiteral"| J["transpileStringLiteral()"]
+    B -->|"*promql.NumberLiteral"| I["内联构造 influxql.NumberLiteral"]
+    B -->|"*promql.StringLiteral"| J["内联构造 influxql.StringLiteral"]
     B -->|"*promql.SubqueryExpr"| K["transpileSubqueryExpr()"]
-    B -->|"*promql.StepInvariantExpr"| L["递归处理内部 Expr"]
+    B -->|"*promql.StepInvariantExpr"| L["transpileStepInvariantExpr()"]
     B -->|"其他"| N["返回错误: 未知表达式类型"]
 ```
 
@@ -450,43 +455,54 @@ func (t *Transpiler) transpileInstantVectorSelector(v *parser.VectorSelector) (i
 
 ```go
 func GetTagCondition(v *parser.VectorSelector, haveMetricStore bool) (influxql.Expr, error) {
-    var tagCond influxql.Expr
-    for _, item := range v.LabelMatchers {
-        // 跳过保留标签 __name__（除非使用 MetricStore）
-        if _, ok := reservedTags[item.Name]; ok && !haveMetricStore {
-            continue
-        }
-        if len(item.Value) == 0 {
-            continue
-        }
-        var cond *influxql.BinaryExpr
-        switch item.Type {
-        case labels.MatchEqual:      // method = "GET"
-            cond = &influxql.BinaryExpr{
-                Op:  influxql.EQ,
-                LHS: &influxql.VarRef{Val: item.Name},
-                RHS: &influxql.StringLiteral{Val: escapeSingleQuotes(item.Value)},
-            }
-        case labels.MatchNotEqual:   // method != "GET"
-            cond = &influxql.BinaryExpr{
-                Op:  influxql.NEQ,
-                LHS: &influxql.VarRef{Val: item.Name},
-                RHS: &influxql.StringLiteral{Val: escapeSingleQuotes(item.Value)},
-            }
-        case labels.MatchRegexp:     // method =~ "GET|POST"
-            re, err := regexp.Compile(escapeSlashes(item.Value))
-            // ...
-            cond = &influxql.BinaryExpr{
-                Op:  influxql.EQREGEX,
-                LHS: &influxql.VarRef{Val: item.Name},
-                RHS: &influxql.RegexLiteral{Val: re},
-            }
-        case labels.MatchNotRegexp:  // method !~ "DELETE"
-            // ...类似，使用 NEQREGEX
-        }
-        tagCond = CombineConditionAnd(tagCond, cond)
-    }
-    return tagCond, nil
+	var tagCond influxql.Expr
+	for _, item := range v.LabelMatchers {
+		if _, ok := reservedTags[item.Name]; ok && !haveMetricStore {
+			continue
+		}
+		if len(item.Value) == 0 {
+			continue
+		}
+		var cond *influxql.BinaryExpr
+		switch item.Type {
+		case labels.MatchEqual, labels.MatchNotEqual:
+			cond = &influxql.BinaryExpr{
+				Op: influxql.EQ,
+				LHS: &influxql.VarRef{
+					Val: item.Name,
+				},
+				RHS: &influxql.StringLiteral{
+					Val: escapeSingleQuotes(item.Value),
+				},
+			}
+			if item.Type == labels.MatchNotEqual {
+				cond.Op = influxql.NEQ
+			}
+		case labels.MatchRegexp, labels.MatchNotRegexp:
+			// TODO: to support the FastRegexMatcher
+			promRegexStr := escapeSlashes(item.Value)
+			re, err := regexp.Compile(promRegexStr)
+			if err != nil {
+				return nil, errno.NewError(errno.ErrRegularExpSyntax, err.Error())
+			}
+			cond = &influxql.BinaryExpr{
+				Op: influxql.EQREGEX,
+				LHS: &influxql.VarRef{
+					Val: item.Name,
+				},
+				RHS: &influxql.RegexLiteral{
+					Val: re,
+				},
+			}
+			if item.Type == labels.MatchNotRegexp {
+				cond.Op = influxql.NEQREGEX
+			}
+		default:
+			return nil, errno.NewError(errno.UnsupportedMatchType, item.Type.String())
+		}
+		tagCond = CombineConditionAnd(tagCond, cond)
+	}
+	return tagCond, nil
 }
 ```
 
@@ -558,7 +574,7 @@ func GetTimeCondition(start, end *time.Time) influxql.Expr {
 
 PromQL 兼容层定义了 6 个函数映射表，覆盖了 PromQL 标准库中的绝大多数函数：
 
-#### 5.1.1 rangeVectorFunctions（范围向量函数，20 个）
+#### 5.1.1 rangeVectorFunctions（范围向量函数，22 个）
 
 **代码位置**：`lib/util/lifted/promql2influxql/call.go:18-110`
 
@@ -699,20 +715,20 @@ var vectorSortFunctions = map[string]aggregateFn{
 ```mermaid
 graph TD
     A["transpileCall(call)"] --> B["递归转译所有参数 args"]
-    B --> C{"查找函数映射表"}
-    C --> D["mathFuncs 数学函数<br/>abs, ceil, floor, round..."]
-    C --> E["vectorMathFuncs 向量数学<br/>vector, scalar, sgn..."]
-    C --> F["vectorLabelFuncs 标签操作<br/>label_replace, label_join"]
-    C --> G["vectorTimeFuncs 时间函数<br/>time, minute, hour..."]
-    C --> H["vectorSortFuncs 排序函数<br/>sort, sort_desc..."]
-    C --> I["aggregateFuncs 聚合函数<br/>sum, avg, min, max..."]
+    B --> C{"按顺序查找函数映射表"}
+    C --> D["rangeVectorFunctions<br/>rate, irate, *_over_time..."]
+    C --> E["instantVectorFunctions<br/>histogram_quantile, scalar, absent"]
+    C --> F["vectorMathFunctions<br/>abs, ceil, floor, sqrt..."]
+    C --> G["vectorLabelFunctions<br/>label_replace, label_join"]
+    C --> H["vectorTimeFunctions<br/>year, time, timestamp, vector..."]
+    C --> I["vectorSortFunctions<br/>sort, sort_desc, sort_by_label..."]
     D --> J["生成 InfluxQL Call 表达式"]
     E --> J
     F --> J
     G --> J
     H --> J
     I --> J
-    C -->|"未找到"| K["返回错误: 未知函数"]
+    C -->|"未找到"| K["返回 errno.UnsupportedPromExpr"]
 ```
 
 **代码位置**：`lib/util/lifted/promql2influxql/call.go:579-627`
@@ -786,50 +802,57 @@ func (t *Transpiler) transpileCall(a *parser.Call) (influxql.Node, error) {
 
 ```go
 func (t *Transpiler) transpilePromFunc(aggFn aggregateFn, inArgs []influxql.Node, setFieldsFunc SetFieldsFunc) (influxql.Node, error) {
-    // 步骤1：分离表参数和函数参数
-    table, parameter := t.transpileParameter(aggFn.vectorPosition, inArgs)
+	table, parameter := t.transpileParameter(aggFn.vectorPosition, inArgs)
 
-    node, ok := table.(influxql.Statement)
-    if !ok {
-        // 如果不是 Statement（而是纯表达式），直接构造 Call 表达式
-        return t.transpilePromFuncWithExprArgs(aggFn, table)
-    }
-
-    switch statement := node.(type) {
-    case *influxql.SelectStatement:
-        field, _ := getSelectFieldIdx(statement)
-        switch field.Expr.(type) {
-        case *influxql.Call, *influxql.BinaryExpr:
-            // 如果字段已经是函数调用或二元表达式，需要包装为子查询
-            selectStatement := &influxql.SelectStatement{
-                Sources: []influxql.Source{
-                    &influxql.SubQuery{Statement: statement},
-                },
-                Step:        t.Step,
-                IsPromQuery: true,
-            }
-            wrappedField := &influxql.Field{
-                Expr:  &influxql.VarRef{Val: field.Name(), Alias: DefaultFieldKey},
-                Alias: DefaultFieldKey,
-            }
-            setFieldsFunc(selectStatement, wrappedField, parameter, aggFn)
-            t.setTimeCondition(selectStatement, false)
-            if t.Step > 0 && !aggFn.KeepFill {
-                t.setTimeInterval(selectStatement)
-                selectStatement.Fill = influxql.NoFill
-            }
-            return selectStatement, nil
-
-        default:
-            // 如果字段是简单的 VarRef，直接在现有语句上设置聚合字段
-            setFieldsFunc(statement, field, parameter, aggFn)
-            if t.Step > 0 && !aggFn.KeepFill {
-                t.setTimeInterval(statement)
-                statement.Fill = influxql.NoFill
-            }
-        }
-    }
-    return table, nil
+	node, ok := table.(influxql.Statement)
+	if !ok {
+		return t.transpilePromFuncWithExprArgs(aggFn, table)
+	}
+	switch statement := node.(type) {
+	case *influxql.SelectStatement:
+		field, _ := getSelectFieldIdx(statement)
+		switch field.Expr.(type) {
+		case *influxql.Call, *influxql.BinaryExpr:
+			selectStatement := &influxql.SelectStatement{
+				Sources: []influxql.Source{
+					&influxql.SubQuery{
+						Statement: statement,
+					}},
+				Step:        t.Step,
+				IsPromQuery: true,
+			}
+			wrappedField := &influxql.Field{
+				Expr: &influxql.VarRef{
+					Val: field.Name(),
+				},
+				Alias: DefaultFieldKey,
+			}
+			setFieldsFunc(selectStatement, wrappedField, parameter, aggFn)
+			t.setTimeCondition(selectStatement, false)
+			if t.Step > 0 && !aggFn.KeepFill {
+				t.setTimeInterval(selectStatement)
+				selectStatement.Fill = influxql.NoFill
+			}
+			if aggFn.name == "histogram_quantile" {
+				selectStatement.Dimensions = statement.Dimensions
+			}
+			return selectStatement, nil
+		default:
+			setFieldsFunc(statement, field, parameter, aggFn)
+			if t.Step > 0 && !aggFn.KeepFill {
+				t.setTimeInterval(statement)
+				statement.Fill = influxql.NoFill
+			}
+			if aggFn.name == "absent_over_time_prom" {
+				field, _ := getSelectFieldIdx(statement)
+				absentFunc := instantVectorFunctions["absent"]
+				t.setAggregateFields(statement, field, parameter, absentFunc)
+			}
+		}
+	default:
+		return nil, errno.NewError(errno.UnsupportedPromExpr)
+	}
+	return table, nil
 }
 ```
 
@@ -901,77 +924,90 @@ PromQL 聚合操作符与 InfluxQL 函数的映射关系：
 **代码位置**：`lib/util/lifted/promql2influxql/aggregate_expr.go:163-261`
 
 ```go
-// transpileAggregateExpr 将 PromQL AggregateExpr 转译为 InfluxQL SelectStatement
+// transpileAggregateExpr transpiles PromQL AggregateExpr to InfluxQL SelectStatement
 func (t *Transpiler) transpileAggregateExpr(a *parser.AggregateExpr) (influxql.Node, error) {
-    // 步骤1：递归转译子表达式
-    t.dropMetric = true
-    expr, err := t.transpileExpr(a.Expr)
-    if err != nil {
-        return nil, errno.NewError(errno.TranspileAggFail, err.Error())
-    }
+	// Recursively transpile sub expression
+	t.dropMetric = true
+	expr, err := t.transpileExpr(a.Expr)
+	if err != nil {
+		return nil, errno.NewError(errno.TranspileAggFail, err.Error())
+	}
 
-    // 步骤2：处理 dropMetric 标志
-    if a.Without {
-        t.dropMetric = true
-    } else {
-        // 检查 grouping 中是否包含 __name__
-        for _, field := range a.Grouping {
-            if field == DefaultMetricKeyLabel {
-                t.dropMetric = false
-                break
-            }
-        }
-    }
+	// If the aggregate expression contains the "without" and it is true, reset the dropMetric flag to true
+	// Otherwise, if the "__name__" field is found in grouping fields, set the dropMetric flag to false
+	if a.Without {
+		t.dropMetric = true
+	} else {
+		for _, field := range a.Grouping {
+			if field == DefaultMetricKeyLabel {
+				t.dropMetric = false
+				break
+			}
+		}
+	}
 
-    // 步骤3：处理聚合参数（如 quantile 的百分位数参数）
-    var parameter []influxql.Expr
-    if a.Param != nil {
-        unwrapParenExpr(&a.Param)
-        a.Param = unwrapStepInvariantExpr(a.Param)
-        param, err := t.transpileExpr(a.Param)
-        if err != nil {
-            return nil, errno.NewError(errno.TranspileAggFail, err.Error())
-        }
-        parameter = []influxql.Expr{param.(influxql.Expr)}
-    }
+	// Get Aggregate function parameter
+	var parameter []influxql.Expr
+	if a.Param != nil {
+		unwrapParenExpr(&a.Param)
+		a.Param = unwrapStepInvariantExpr(a.Param)
+		if !yieldsFloat(a.Param) && !yieldsString(a.Param) {
+			return nil, errno.NewError(errno.ErrFloatParamAggExpr)
+		}
+		param, err := t.transpileExpr(a.Param)
+		if err != nil {
+			return nil, errno.NewError(errno.TranspileAggFail, err.Error())
+		}
+		parameter = []influxql.Expr{param.(influxql.Expr)}
+	}
+	aggFn, ok := aggregateFns[a.Op]
+	if !ok {
+		return nil, errno.NewError(errno.UnsupportedAggType, a.Op.String())
+	}
 
-    // 步骤4：查找聚合函数
-    aggFn, ok := aggregateFns[a.Op]
-    if !ok {
-        return nil, errno.NewError(errno.UnsupportedAggType, a.Op.String())
-    }
+	node, ok := expr.(influxql.Statement)
+	if !ok {
+		return nil, errno.NewError(errno.UnsupportedPromExpr)
+	}
 
-    // 步骤5：根据子表达式类型分别处理
-    switch statement := node.(type) {
-    case *influxql.SelectStatement:
-        field, _ := getSelectFieldIdx(statement)
-        switch field.Expr.(type) {
-        case *influxql.Call, *influxql.BinaryExpr, *influxql.ParenExpr:
-            // 优化：尝试下推聚合到函数表达式
-            if t.canPushDownAggWithFunction(a, statement, field, parameter, aggFn) {
-                return statement, nil
-            }
-            // 包装为子查询
-            selectStatement := &influxql.SelectStatement{
-                Sources: []influxql.Source{&influxql.SubQuery{Statement: statement}},
-                Step:    t.Step,
-                IsPromQuery: true,
-            }
-            // ... 设置字段、条件、维度
-            return selectStatement, nil
+	switch statement := node.(type) {
+	case *influxql.SelectStatement:
+		field, _ := getSelectFieldIdx(statement)
+		switch field.Expr.(type) {
+		case *influxql.Call, *influxql.BinaryExpr, *influxql.ParenExpr:
+			if t.canPushDownAggWithFunction(a, statement, field, parameter, aggFn) {
+				return statement, nil
+			}
+			// If the field is a Call expression, we need to wrap the sub expression as InfluxQL SubQuery
+			selectStatement := &influxql.SelectStatement{
+				Sources: []influxql.Source{
+					&influxql.SubQuery{
+						Statement: statement,
+					}},
+				Step:        t.Step,
+				IsPromQuery: true,
+			}
+			// ...
+			return selectStatement, nil
+		case *influxql.VarRef:
+			t.setAggregateFields(statement, field, parameter, aggFn)
+			statement.Dimensions = statement.Dimensions[:0]
+			t.setAggregateDimension(statement, a.Without, a.Grouping...)
+			if t.Step > 0 {
+				t.setTimeInterval(statement)
+				statement.Fill = influxql.NoFill
+			}
 
-        case *influxql.VarRef:
-            // 直接在当前语句上设置聚合
-            t.setAggregateFields(statement, field, parameter, aggFn)
-            statement.Dimensions = statement.Dimensions[:0]
-            t.setAggregateDimension(statement, a.Without, a.Grouping...)
-            if t.Step > 0 {
-                t.setTimeInterval(statement)
-                statement.Fill = influxql.NoFill
-            }
-            return statement, nil
-        }
-    }
+			if aggFn.name == "count_values_prom" {
+				return t.transpileCountValues(statement, a, aggFn, field, parameter), nil
+			}
+			return statement, nil
+		default:
+			return nil, errno.NewError(errno.UnsupportedPromExpr)
+		}
+	default:
+		return expr, nil
+	}
 }
 ```
 
@@ -983,17 +1019,17 @@ func (t *Transpiler) transpileAggregateExpr(a *parser.AggregateExpr) (influxql.N
 2. **处理 grouping**：`by (method)` 设置分组维度；如果 grouping 包含 `__name__`，则保留指标名
 3. **查找聚合函数**：`SUM` -> `name: "sum"`
 4. **子表达式是函数调用**（`rate_prom`）：
-   - 尝试优化下推：`canPushDownAggWithFunction` 检查是否可以将聚合直接添加到现有语句
-   - 如果不行，包装为子查询
+   - 尝试优化下推：`canPushDownAggWithFunction` 用 `getOriCallName("rate_prom")` 得到 `rate`，命中 `rangeVectorFunctions`，且 `statement.Range=5m>0`，因此返回 true
+   - 命中时直接把 `sum(rate_prom(value))` 设到原语句上，不创建子查询；只有下推条件不满足时才包装为子查询
 
 最终 InfluxQL：
 ```sql
-SELECT sum(rate_prom(value)) FROM (
-    SELECT rate_prom(value) FROM http_requests_total
-    WHERE time >= ... AND time <= ...
-    GROUP BY *, time(step) fill(none)
-) GROUP BY method
+SELECT sum(rate_prom(value)) FROM http_requests_total
+WHERE time >= ... AND time <= ... AND method = 'GET'
+GROUP BY method
 ```
+
+> 若为 range query 且 `Step>0`，GROUP BY 还会追加 `time(step)` 并设置 `fill(none)`。
 
 ### 6.3 by/without 维度处理
 
@@ -1074,16 +1110,19 @@ var compBinOps = map[parser.ItemType]influxql.Token{
 graph TD
     A["transpileBinaryExpr(BinaryExpr)"] --> B["分别转译左右子表达式 LHS / RHS"]
     B --> C{"判断操作数类型"}
-    C -->|"Scalar + Scalar"| D["直接标量算术运算<br/>生成 InfluxQL BinaryExpr"]
-    C -->|"Vector + Scalar"| E["transpileBinOpOfScalarVector()<br/>向量每个元素与标量运算"]
-    C -->|"Vector + Vector"| F["transpileBinOpOfBothVector()<br/>向量间按标签匹配运算"]
+    C -->|"Scalar + Scalar"| D["NewBinaryExpr()<br/>直接构造 InfluxQL BinaryExpr"]
+    C -->|"Vector + Scalar"| E["transpileArithBinOps()/transpileCompBinOps()<br/>向量与标量运算"]
+    C -->|"Vector + Vector"| F{"两侧都是 SelectStatement?"}
+    F -->|"是"| F1["transpileBinOpOfBothVector()<br/>向量间按标签匹配"]
+    F -->|"否"| F2["transpileBinOpOfOneVector()<br/>一侧为表达式"]
     E --> G["处理 VectorMatching<br/>on / ignoring / group_left / group_right"]
-    F --> G
+    F1 --> G
+    F2 --> G
     D --> H["返回 InfluxQL 表达式"]
     G --> H
 ```
 
-**代码位置**：`lib/util/lifted/promql2influxql/binary_expr.go:222-288`
+**代码位置**：`lib/util/lifted/promql2influxql/binary_expr.go:223-288`
 
 ```go
 // transpileBinaryExpr 转译 PromQL BinaryExpr
@@ -1185,7 +1224,7 @@ func (t *Transpiler) transpileBinOpOfBothVector(b *parser.BinaryExpr, op influxq
 
 ```go
 func init() {
-    // 注册 21 个 PromQL 函数到引擎层
+    // 注册 22 个 PromQL 函数到引擎层
     RegistryPromFunction("rate_prom",              &rateOp{})
     RegistryPromFunction("irate_prom",             &irateOp{})
     RegistryPromFunction("avg_over_time",          &avgOp{})
@@ -1224,6 +1263,12 @@ type PromFuncParam struct {
 // 全局函数注册表
 var factoryInstance = make(map[string]PromFunction)
 
+func GetPromFunction(name string) PromFunction {
+    return factoryInstance[name]
+}
+
+type PromFunctionFactory map[string]PromFunction
+
 func RegistryPromFunction(name string, aggOp PromFunction) {
     _, ok := factoryInstance[name]
     if ok { return }
@@ -1234,9 +1279,9 @@ func RegistryPromFunction(name string, aggOp PromFunction) {
 **通俗解释**：
 
 引擎层的函数注册机制：
-1. **init() 注册**：在程序启动时，将 21 个 PromQL 函数注册到全局工厂
+1. **init() 注册**：在程序启动时，将 22 个 PromQL 函数注册到全局工厂
 2. **PromFunction 接口**：每个函数实现 `CreateRoutine()` 方法，返回一个 `Routine`（计算例程）
-3. **Routine 接口**：定义了 `Reduce` 和 `Merge` 两个阶段的计算逻辑
+3. **Routine/Reducer 接口**：`Routine` 只有 `WorkOnRecord`；具体的 Reduce/Merge 由持有的 `Reducer` 在 `Aggregate` 中通过 `fr`/`fm` 完成
 
 ### 8.2 rate 函数实现——外推算法
 
@@ -1250,7 +1295,7 @@ graph TD
     E --> G["计算 sampledInterval = lastTime - firstTime"]
     F --> G
     G --> H["计算 averageDurationBetweenSamples"]
-    H --> I{"isCounter && firstValue >= 0?"}
+    H --> I{"isCounter && reduceResult > 0 && pointCount > 0 && firstValue >= 0?"}
     I -->|"是"| J["durationToZero = sampledInterval * (firstValue / reduceResult)<br/>缩短 durationToStart"]
     I -->|"否"| K["extrapolationThreshold = avgDuration * 1.1"]
     J --> K
@@ -1357,23 +1402,23 @@ rate 的外推算法是 PromQL 最核心也最微妙的计算逻辑之一：
 
 #### 数值示例：rate 外推算法逐步推演
 
-假设查询 `rate(http_requests_total[5m])`，窗口为 `[100s, 500s]`，采样到以下数据点：
+假设查询 `rate(http_requests_total[5m])`，评估时间 `ts=500s`，窗口为 `[200s, 500s]`，采样到以下数据点（100s 的点在窗口外，不参与本次计算）：
 
 | 时间 (s) | 值 | 说明 |
 |----------|-----|------|
-| 100 | 100 | 第一个样本 |
-| 200 | 200 | |
+| 100 | 100 | 窗口外（不参与） |
+| 200 | 200 | 第一个样本（= rangeStart） |
 | 300 | 150 | counter reset（值减小） |
 | 400 | 250 | |
-| 500 | 350 | 最后一个样本 |
+| 500 | 350 | 最后一个样本（= rangeEnd） |
 
 **第一步：计算增量（考虑 counter reset）**
 
 ```
 CalcReduceResult 处理 counter reset：
-  - 遇到 150 < 200 时，检测到 counter reset
-  - reduceResult = (200 - 100) + (250 - 150) + (350 - 250) = 100 + 100 + 100 = 300
-  - firstValue = 100, firstTime = 100s, lastTime = 500s
+  - reduceResult = lastValue - firstValue = 350 - 200 = 150
+  - 扫描窗口内样本：300s 处 150 < 200，检测到 reset，reduceResult += prev(200) → 350
+  - firstValue = 200, firstTime = 200s, lastValue = 350, lastTime = 500s
 ```
 
 **第二步：计算时间距离**
@@ -1382,24 +1427,23 @@ CalcReduceResult 处理 counter reset：
 rangeStart = 500 - 300 = 200s（窗口起点，ts=500, rangeDuration=300s）
 rangeEnd = 500s（窗口终点）
 
-durationToStart = (100s - 200s) / 1e9 → 注意：firstTime < rangeStart
-  → 由于 firstTime < rangeStart，durationToStart 为负数
-  → 在代码中会取 max(0, durationToStart)，所以 durationToStart = 0
-
+durationToStart = (200s - 200s) / 1e9 = 0s
 durationToEnd = (500s - 500s) / 1e9 = 0s
-sampledInterval = (500s - 100s) / 1e9 = 400s
-pointCount = 5
-averageDurationBetweenSamples = 400 / (5-1) = 100s
+sampledInterval = (500s - 200s) / 1e9 = 300s
+pointCount = 4
+averageDurationBetweenSamples = 300 / (4-1) = 100s
 ```
+
+> 注意：代码直接计算 `firstTime - rangeStart`，不会对负值做 `max(0, ...)` 截断；本例首点正好落在窗口起点，因此 `durationToStart = 0`。
 
 **第三步：Counter 从 0 开始的特殊处理**
 
 ```
-isCounter = true, reduceResult = 300 > 0, firstValue = 100 >= 0
+isCounter = true, reduceResult = 350 > 0, firstValue = 200 >= 0
 durationToZero = sampledInterval * (firstValue / reduceResult)
-  = 400 * (100 / 300) = 133.33s
+  = 300 * (200 / 350) = 171.43s
 
-durationToZero (133.33s) < durationToStart (0s)? → 否
+durationToZero (171.43s) < durationToStart (0s)? → 否
 所以 durationToStart 保持为 0
 ```
 
@@ -1407,25 +1451,25 @@ durationToZero (133.33s) < durationToStart (0s)? → 否
 
 ```
 extrapolationThreshold = averageDurationBetweenSamples * 1.1 = 100 * 1.1 = 110s
-extrapolateToInterval = sampledInterval = 400s
+extrapolateToInterval = sampledInterval = 300s
 
-durationToStart (0s) >= 110s? → 否，extrapolateToInterval += 0 → 400s
-durationToEnd (0s) >= 110s? → 否，extrapolateToInterval += 0 → 400s
+durationToStart (0s) >= 110s? → 否，extrapolateToInterval += 0 → 300s
+durationToEnd (0s) >= 110s? → 否，extrapolateToInterval += 0 → 300s
 ```
 
 **第五步：最终计算**
 
 ```
 resultValue = reduceResult * (extrapolateToInterval / sampledInterval)
-  = 300 * (400 / 400) = 300
+  = 350 * (300 / 300) = 350
 
 由于 isRate = true：
-resultValue = resultValue / rangeDuration(s) = 300 / 300 = 1.0
+resultValue = resultValue / rangeDuration(s) = 350 / 300 ≈ 1.1667
 
-最终 rate = 1.0（每秒增长 1 个请求）
+最终 rate ≈ 1.1667（每秒增长约 1.17 个请求）
 ```
 
-> **关键洞察**：当数据点恰好覆盖整个窗口且没有 counter reset 时，外推比例为 1:1，rate 简单等于 `delta / duration`。外推算法主要在数据点稀疏或窗口边缘缺少数据时发挥作用。
+> **关键洞察**：当数据点恰好覆盖整个窗口且首尾都在边界时，外推比例为 1:1，rate 等于 `reduceResult / rangeDuration`。外推算法主要在数据点稀疏或窗口边缘缺少数据时发挥作用。
 
 ### 8.3 avg_over_time 函数实现——Kahan 求和
 
@@ -1550,8 +1594,8 @@ func NewInstantVectorCursor(input comm.KeyCursor, schema *executor.QuerySchema,
 `InstantVectorCursor` 是 PromQL 查询的核心采样器。它实现了 Prometheus 的"即时向量选择器"语义：
 
 - **采样逻辑**：对于每个时间步 `t`，在 `[t - lookUpDelta, t]` 范围内查找最近的样本值
-- **步长计算**：`startSample = start + lookUpDelta`，`endSample = start + lookUpDelta + floor((end - start - lookUpDelta) / step) * step`
-- **示例**：`start=1, end=6, step=2, lookUpDelta=3`，则 `startSample=1, endSample=5`，采样点为 `1, 3, 5`
+- **步长计算**：`startSample = c.start + lookUpDelta`，`endSample = c.start + lookUpDelta + floor((c.end - (c.start + lookUpDelta)) / step) * step`；其中 `c.start/c.end` 来自 `schema.Options().GetStartTime()/GetEndTime()`，是**存储扫描起点/终点**（转译层已按 lookback/range 调整），不是 HTTP 请求里的查询起点
+- **示例**：`c.start=1, c.end=6, step=2, lookUpDelta=3`，则 `startSample=4, endSample=6`。若以查询起点 `queryStart=1`、lookback=3 为例，则扫描起点 `c.start=-2`，得到 `startSample=1, endSample=5`，采样点为 `1, 3, 5`
 
 ### 9.2 双指针采样算法
 
@@ -1561,32 +1605,29 @@ sequenceDiagram
     participant I as i 指针（数据索引）
     participant J as j 指针（步长索引）
 
-    Note over Data: 数据: [t1,v1] [t3,v2] [t5,v3] [t8,v4] [t10,v5]
+    Note over Data: 数据: [t1=1,v1] [t3=3,v2] [t5=5,v3] [t8=8,v4] [t10=10,v5]
     Note over J: 查询: step=2, lookBackDelta=3
 
     J->>J: j = step1 (t=2)
     I->>I: i=0, data[0].time=t1
 
     rect rgb(230, 245, 255)
-        Note over I,J: 步长 t=2: data[0]=t1 <= t2, i++ → data[1]=t3 > t2
-        Note over I,J: 向前回溯: data[0]=t1, t2-t1=1 < lookBackDelta=3 → 使用 v1
+        Note over I,J: 步长 t=2: 窗口 [-1,2]，i 停在 t1(i=0)，j 找到首个 >2 的 t3(j=1) → 区间 [0,1)，取 v1
     end
 
     J->>J: j = step2 (t=4)
     rect rgb(230, 245, 255)
-        Note over I,J: 步长 t=4: data[1]=t3 <= t4, i++ → data[2]=t5 > t4
-        Note over I,J: 向前回溯: data[1]=t3, t4-t3=1 < lookBackDelta=3 → 使用 v2
+        Note over I,J: 步长 t=4: 窗口 [1,4]，i 仍为 0（t1=1 >= start=1），j 移到 t5(j=2) → 区间 [0,2)，取 v2
     end
 
     J->>J: j = step3 (t=6)
     rect rgb(230, 245, 255)
-        Note over I,J: 步长 t=6: data[2]=t5 <= t6, i++ → data[3]=t8 > t6
-        Note over I,J: 向前回溯: data[2]=t5, t6-t5=1 < lookBackDelta=3 → 使用 v3
+        Note over I,J: 步长 t=6: 窗口 [3,6]，i 移到 t3(i=1)，j 移到 t8(j=3) → 区间 [1,3)，取 v3
     end
 
     J->>J: j = step4 (t=8)
     rect rgb(255, 245, 230)
-        Note over I,J: 步长 t=8: data[3]=t8 == t8 → 精确匹配, 使用 v4
+        Note over I,J: 步长 t=8: 窗口 [5,8]，i 移到 t5(i=2)，j 移到 t10(j=4) → 区间 [2,4)，取 v4
     end
 ```
 
@@ -1645,22 +1686,15 @@ func (c *InstantVectorCursor) computeIntervalIndex(record *record.Record) {
 
 ```mermaid
 graph TD
-    A["floatSampler.Aggregate()"] --> B{"数据是否耗尽?"}
-    B -->|"是"| C["返回（无更多数据）"]
-    B -->|"否"| D["遍历当前 record 的步长"]
-    D --> E{"data[i].time == stepTime?"}
-    E -->|"精确匹配"| F["使用 data[i] 的值"]
-    E -->|"不匹配"| G{"data[i].time > stepTime - lookBackDelta?"}
-    G -->|"在 lookback 窗口内"| H["使用 data[i] 的值（lookback 填充）"]
-    G -->|"超出 lookback 窗口"| I{"data[i] 是否为 stale NaN?"}
-    I -->|"是"| J["跳过该步长（stale NaN 不参与采样）"]
-    I -->|"否"| K{"prevBuf 是否有值?"}
-    K -->|"有"| L["使用 prevBuf 的值（跨 record 填充）"]
-    K -->|"无"| M["使用上一个有效值（末 record 填充）"]
-    F --> N["追加值到输出 record"]
-    H --> N
+    A["floatSampler.Aggregate()"] --> D["遍历当前 record 的每个步长窗口"]
+    D --> E{"窗口内取到值?<br/>(isNil == false)"}
+    E -->|"是"| F{"IsStaleNaN(value)?"}
+    F -->|"是"| J["continue 跳过该步长"]
+    F -->|"否"| N["追加 value 到输出 record"]
+    E -->|"否"| G{"prevBuf 可用?<br/>prevBuf.time ∈ [ts-lookBackDelta, ts]<br/>且 prevBuf.value 非 stale NaN"}
+    G -->|"是"| L["追加 prevBuf.value（跨 record 填充）"]
+    G -->|"否"| J
     L --> N
-    M --> N
 ```
 
 **代码位置**：`engine/prom_instant_vector_cursor.go:312-435`
@@ -1733,18 +1767,24 @@ func (r *floatSampler) Aggregate(p *ReducerEndpoint, param *ReducerParams) {
         }
     }
 
-    // 保存当前 record 的最后一个值，供下一个 record 使用
+    // get the last row of each record as the latest point and assign the value to prev.
     idx, value, isNil := r.fn(&inRecord.ColVals[inOrdinal], values, 0, inRecord.RowNums())
     if !isNil {
         r.prevBuf.set(int(param.firstStep+int64(numStep-1)*param.step), inRecord.Time(idx), value)
     }
-
-    // 最后一个 record 后填充
     if param.step > 0 && param.lastRec && !r.prevBuf.isNil {
+        if len(param.intervalIndex) == 0 {
+            return
+        }
+        // pad after the last rec.
         nextStep := ts + param.step
         if nextStep <= param.lastStep {
             r.PopulateByPrevious(outRecord, param, nextStep, param.lastStep, outOrdinal, timeIdx)
         }
+    }
+    if param.lastRec {
+        // reset after processing the last rec.
+        r.reset()
     }
 }
 ```
@@ -1951,31 +1991,59 @@ func FilterRangeNANPoint(rec *record.Record) *record.Record {
 
 ### 11.1 路由注册
 
-**代码位置**：`lib/util/lifted/influx/httpd/handler.go:333-430`
+**代码位置**：`lib/util/lifted/influx/httpd/handler.go:331-454`
 
 ```go
-// 注册所有 Prometheus 兼容的 HTTP 端点
-Route{"prometheus-write", "POST", "/api/v1/write", false, true, h.servePromWrite},
-Route{"prometheus-read", "POST", "/api/v1/read", true, true, h.servePromRead},
-Route{"prometheus-read", "GET", "/api/v1/read", true, true, h.servePromRead},
-Route{"prometheus-query", "GET", "/api/v1/query", true, true, h.servePromQuery},
-Route{"prometheus-query", "POST", "/api/v1/query", true, true, h.servePromQuery},
-Route{"prometheus-query-range", "GET", "/api/v1/query_range", true, true, h.servePromQueryRange},
-Route{"prometheus-query-range", "POST", "/api/v1/query_range", true, true, h.servePromQueryRange},
-Route{"prometheus-labels", "GET", "/api/v1/labels", true, true, h.servePromQueryLabels},
-Route{"prometheus-labels", "POST", "/api/v1/labels", true, true, h.servePromQueryLabels},
-Route{"prometheus-label-values", "GET", "/api/v1/label/{name}/values", true, true, h.servePromQueryLabelValues},
-Route{"prometheus-label-values", "POST", "/api/v1/label/{name}/values", true, true, h.servePromQueryLabelValues},
-Route{"prometheus-series", "GET", "/api/v1/series", true, true, h.servePromQuerySeries},
-Route{"prometheus-series", "POST", "/api/v1/series", true, true, h.servePromQuerySeries},
-Route{"prometheus-metadata", "GET", "/api/v1/metadata", true, true, h.servePromQueryMetaData},
-Route{"prometheus-metadata", "POST", "/api/v1/metadata", true, true, h.servePromQueryMetaData},
-
-// MetricStore 模式端点
-Route{"prometheus-write-metric-store", "POST", "/prometheus/{metric_store}/api/v1/write", false, true, h.servePromWriteWithMetricStore},
-Route{"prometheus-query-metric-store", "GET", "/prometheus/{metric_store}/api/v1/query", true, true, h.servePromQueryWithMetricStore},
-Route{"prometheus-query-range-metric-store", "POST", "/prometheus/{metric_store}/api/v1/query_range", true, true, h.servePromQueryRangeWithMetricStore},
-// ...更多端点
+		{
+			"prometheus-write", // Prometheus remote write
+			"POST", "/api/v1/write", false, true, h.servePromWrite,
+		},
+		{
+			"prometheus-read", // Prometheus remote read
+			"POST", "/api/v1/read", true, true, h.servePromRead,
+		},
+		{
+			"prometheus-read", // Prometheus remote read
+			"GET", "/api/v1/read", true, true, h.servePromRead,
+		},
+		{
+			"prometheus-instant-query", // Prometheus instant query
+			"GET", "/api/v1/query", true, true, h.servePromQuery,
+		},
+		{
+			"prometheus-instant-query", // Prometheus instant query
+			"POST", "/api/v1/query", true, true, h.servePromQuery,
+		},
+		...
+		{
+			"prometheus-range-query", // Prometheus range query
+			"GET", "/api/v1/query_range", true, true, h.servePromQueryRange,
+		},
+		{
+			"prometheus-range-query", // Prometheus range query
+			"POST", "/api/v1/query_range", true, true, h.servePromQueryRange,
+		},
+		...
+		{
+			"prometheus-labels-query", // Prometheus labels query
+			"GET", "/api/v1/labels", true, true, h.servePromQueryLabels,
+		},
+		...
+		{
+			"prometheus-write-metric-store", // Prometheus remote write
+			"POST", "/prometheus/{metric_store}/api/v1/write", false, true, h.servePromWriteWithMetricStore,
+		},
+		...
+		{
+			"prometheus-instant-query-metric-store", // Prometheus instant query
+			"GET", "/prometheus/{metric_store}/api/v1/query", true, true, h.servePromQueryWithMetricStore,
+		},
+		...
+		{
+			"prometheus-range-query-metric-store", // Prometheus range query
+			"POST", "/prometheus/{metric_store}/api/v1/query_range", true, true, h.servePromQueryRangeWithMetricStore,
+		},
+		...
 ```
 
 **通俗解释**：
@@ -2006,8 +2074,7 @@ sequenceDiagram
     Handler->>Meta: getDbRpByProm() 解析数据库名
     Meta-->>Handler: db, rp
     Handler->>Handler: 创建超时 Context
-    Handler->>Cache: 检查查询结果缓存
-    Cache-->>Handler: 缓存未命中
+    Note over Handler,Cache: instant query（Evaluation != nil）跳过结果缓存；仅 range query 进入缓存分支
     Handler->>Exec: execQuery()
 
     rect rgb(230, 245, 255)
@@ -2016,14 +2083,13 @@ sequenceDiagram
         Parser-->>Exec: PromQL AST
         Exec->>Trans: Transpiler.Transpile(expr)
         Trans-->>Exec: InfluxQL SelectStatement
-        Exec->>Engine: ExecuteQuery(statement)
+        Exec->>Engine: ExecuteQuery(q, opts, closing, qDuration)
         Engine-->>Exec: query.Result
-        Exec->>Recv: InfluxResultToPromQLValue()
+        Exec->>Recv: getPromResult() → InfluxResultToPromQLValue()
         Recv-->>Exec: PromData
     end
 
     Exec-->>Handler: PromQueryResponse
-    Handler->>Cache: 写入结果缓存
     Handler-->>Client: JSON 响应 {status: "success", data: ...}
 ```
 
@@ -2045,13 +2111,21 @@ func (h *Handler) servePromBaseQuery(w http.ResponseWriter, r *http.Request, use
     // 步骤2：超时控制
     ctx := r.Context()
     if to := r.FormValue("timeout"); to != "" {
+        var cancel context.CancelFunc
         timeout, err := parseDuration(to)
+        if err != nil {
+            invalidParamError(w, err, "timeout")
+            return
+        }
         ctx, cancel = context.WithTimeout(ctx, timeout)
         defer cancel()
     }
 
     // 步骤3：解析查询参数为 PromCommand
     promCommand, ok := p.getQueryCmd(r, w, p.mst)
+    if !ok {
+        return
+    }
     promCommand.Database, promCommand.RetentionPolicy, promCommand.Measurement = db, rp, p.mst
 
     // 步骤4：结果缓存（仅 range query）
@@ -2088,95 +2162,110 @@ graph TD
     C --> D["transpiler.Transpile(expr)<br/>递归转译 AST"]
     D --> E{"转译结果类型?"}
     E -->|"*influxql.SelectStatement"| F["QueryExecutor.ExecuteQuery()<br/>执行 InfluxQL 查询"]
-    E -->|"特殊 Call 处理"| G["处理 count、vector 等特殊函数"]
-    E -->|"BinaryExpr 处理"| H["处理标量运算等"]
-    F --> I["Receiver.InfluxResultToPromQLValue()<br/>转换结果为 PromQL 格式"]
-    G --> I
-    H --> I
-    I --> J["构建 PromQueryResponse"]
+    E -->|"Call/BinaryExpr/字面量"| G["promExprQuery()<br/>纯表达式求值"]
+    E -->|"default"| H["返回 errorBadData"]
+    F --> I["getPromResult()<br/>Receiver.InfluxResultToPromQLValue()"]
+    G --> J["构建 PromQueryResponse"]
+    H --> J
+    I --> J
     J --> K["返回 JSON 响应"]
 ```
 
-**代码位置**：`lib/util/lifted/influx/httpd/handler_prom.go:769-870`
+**代码位置**：`lib/util/lifted/influx/httpd/handler_prom.go:769-929`
 
 ```go
-func (h *Handler) execQuery(w ResponseWriter, r *http.Request, user meta2.User,
-    start time.Time, promCommand promql2influxql.PromCommand, async, isExplain bool) (
-    resp *promql2influxql.PromQueryResponse, apiErr *apiError, isRespond bool) {
+func (h *Handler) execQuery(w ResponseWriter, r *http.Request, user meta2.User, start time.Time, promCommand promql2influxql.PromCommand, async, isExplain bool) (resp *promql2influxql.PromQueryResponse, apiErr *apiError, isRespond bool) {
+	// Retrieve the node id the query should be executed on.
+	nodeID, _ := strconv.ParseUint(r.FormValue("node_id"), 10, 64)
 
-    // 步骤1：使用 Prometheus 原生解析器解析 PromQL
-    expr, err := parser.ParseExpr(r.FormValue("query"))
-    if err != nil {
-        apiErr = &apiError{errorBadData, fmt.Errorf("invalid parameter %q: %w", "query", err)}
-        return
-    }
+	// Get the query parameters db and epoch from the query request.
+	db, rp := getDbRpByProm(h, r)
 
-    // 步骤2：创建 Transpiler 并转译
-    transpiler := &promql2influxql.Transpiler{
-        PromCommand: promCommand,
-    }
-    nodes, err := transpiler.Transpile(expr)
-    if err != nil {
-        if IsErrWithEmptyResp(err) {
-            resp = CreatePromEmptyResp(expr, &promCommand)
-            return
-        }
-        apiErr = &apiError{errorBadData, err}
-        return
-    }
+	// Use the native parser of Prometheus to parse and generate AST.
+	expr, err := parser.ParseExpr(r.FormValue("query"))
+	if err != nil {
+		apiErr = &apiError{
+			errorBadData, fmt.Errorf("invalid parameter %q: %w", "query", err),
+		}
+		return
+	}
 
-    // 步骤3：根据转译结果类型分发
-    var q *influxql.Query
-    switch statement := nodes.(type) {
-    case *influxql.SelectStatement:
-        // 常规查询：包装为 InfluxQL Query
-        if !isExplain {
-            q = &influxql.Query{Statements: []influxql.Statement{statement}}
-        } else {
-            q = &influxql.Query{Statements: []influxql.Statement{
-                &influxql.ExplainStatement{Statement: statement, Analyze: true},
-            }}
-        }
-    case *influxql.Call, *influxql.BinaryExpr, *influxql.IntegerLiteral, *influxql.NumberLiteral, *influxql.StringLiteral, *influxql.ParenExpr:
-        // 纯表达式查询（如数字字面量、标量运算）
-        resp, apiErr = h.promExprQuery(&promCommand, statement, expr.Type())
-        return
-    default:
-        apiErr = &apiError{errorBadData, fmt.Errorf("invalid the select statement for promql")}
-        return
-    }
+	// Transpiler as the key converter for promql2influxql
+	transpiler := &promql2influxql.Transpiler{
+		PromCommand: promCommand,
+	}
+	nodes, err := transpiler.Transpile(expr)
+	if err != nil {
+		if IsErrWithEmptyResp(err) {
+			resp = CreatePromEmptyResp(expr, &promCommand)
+			return
+		}
+		apiErr = &apiError{errorBadData, err}
+		return
+	}
 
-    // 步骤4：设置执行选项
-    opts := query.ExecutionOptions{
-        Database:        db,
-        RetentionPolicy: rp,
-        ChunkSize:       chunkSize,
-        Chunked:         chunked,
-        ReadOnly:        r.Method == "GET",
-        NodeID:          nodeID,
-        InnerChunkSize:  innerChunkSize,
-        ParallelQuery:   atomic.LoadInt32(&syscontrol.ParallelQueryInBatch) == 1,
-        Quiet:           true,
-        Authorizer:      h.getAuthorizer(user),
-        IsPromQuery:     true,  // 标记为 PromQL 查询
-    }
+	var q *influxql.Query
+	switch statement := nodes.(type) {
+	case *influxql.SelectStatement:
+		if !isExplain {
+			q = &influxql.Query{Statements: []influxql.Statement{statement}}
+		} else {
+			q = &influxql.Query{Statements: []influxql.Statement{&influxql.ExplainStatement{Statement: statement, Analyze: true}}}
+		}
+	case *influxql.Call, *influxql.BinaryExpr, *influxql.IntegerLiteral, *influxql.NumberLiteral, *influxql.StringLiteral, *influxql.ParenExpr:
+		resp, apiErr = h.promExprQuery(&promCommand, statement, expr.Type())
+		return
+	default:
+		apiErr = &apiError{errorBadData, fmt.Errorf("invalid the select statement for promql")}
+		return
+	}
 
-    // 步骤5：执行查询
-    results := h.QueryExecutor.ExecuteQuery(q, opts, closing, qDuration)
+	// ...
+	chunked, chunkSize, innerChunkSize, err := h.parseChunkSize(r)
+	if err != nil {
+		apiErr = &apiError{errorBadData, err}
+		return
+	}
 
-    // 步骤6：收集结果并转换
-    for r := range results {
-        receiver := &promql2influxql.Receiver{
-            PromCommand:     promCommand,
-            DropMetric:      transpiler.DropMetric(),
-            DuplicateResult: transpiler.DuplicateResult(),
-        }
-        promData, err := receiver.InfluxResultToPromQLValue(r, expr, promCommand)
-        // ...构建响应
-    }
+	opts := query.ExecutionOptions{
+		Database:        db,
+		RetentionPolicy: rp,
+		ChunkSize:       chunkSize,
+		Chunked:         chunked,
+		ReadOnly:        r.Method == "GET",
+		NodeID:          nodeID,
+		InnerChunkSize:  innerChunkSize,
+		ParallelQuery:   atomic.LoadInt32(&syscontrol.ParallelQueryInBatch) == 1,
+		Quiet:           true,
+		Authorizer:      h.getAuthorizer(user),
+		IsPromQuery:     true,
+	}
 
-    // 步骤7：返回 JSON 响应
-    return resp, nil, false
+	// ...
+	resultCh := h.QueryExecutor.ExecuteQuery(q, opts, closing, qDuration)
+
+	if async {
+		go h.async(q, resultCh)
+		h.writeHeader(w, http.StatusNoContent)
+		isRespond = true
+		return
+	}
+
+	// ...
+	stmtID2Result := make(map[int]*query.Result)
+	for result := range resultCh {
+		// Ignore nil results.
+		if result == nil {
+			continue
+		}
+		if !h.updateStmtId2Result(result, stmtID2Result) {
+			continue
+		}
+	}
+
+	resp, apiErr = h.getPromResult(stmtID2Result, expr, promCommand, transpiler.DropMetric(), transpiler.DuplicateResult())
+
+	return
 }
 ```
 
@@ -2195,47 +2284,61 @@ func (h *Handler) execQuery(w ResponseWriter, r *http.Request, user meta2.User,
 **代码位置**：`lib/util/lifted/influx/httpd/handler_prom.go:116-215`
 
 ```go
-func (h *Handler) servePromWriteBase(w http.ResponseWriter, r *http.Request,
-    user meta2.User, mst string, tansFunc timeSeries2RowsFunc) {
-    // 步骤1：验证
-    if syscontrol.DisableWrites {
-        h.httpError(w, `disable write!`, http.StatusForbidden)
-        return
-    }
-    db, rp := getDbRpByProm(h, r)
-    // 鉴权...
+func (h *Handler) servePromWriteBase(w http.ResponseWriter, r *http.Request, user meta2.User, mst string, tansFunc timeSeries2RowsFunc) {
+	// ...
+	if syscontrol.DisableWrites {
+		h.httpError(w, `disable write!`, http.StatusForbidden)
+		h.Logger.Error("write is forbidden!", zap.Bool("DisableWrites", syscontrol.DisableWrites))
+		return
+	}
 
-    // 步骤2：读取并解压请求体
-    body := r.Body
-    // ...
+	db, rp := getDbRpByProm(h, r)
+	// ...
 
-    // 步骤3：检查是否为元数据请求
-    if isMetaDataReq(r) {
-        h.servePromWriteMetaData(w, body, db, rp, mst)
-        return
-    }
+	err := Parser.Parse(body, false, func(tss []prompb2.TimeSeries) error {
+		var maxPoints int
+		var err error
+		inValidTs, partialErr := h.FilterInvalidTimeSeries(mst, tss)
+		for i, ts := range tss {
+			if inValidTs[i] {
+				continue
+			}
+			maxPoints += len(ts.Samples)
+		}
+		if maxPoints == 0 {
+			if partialErr != nil {
+				return partialErr
+			}
+			return ErrNoSamples
+		}
+		rs := pool.GetRows(maxPoints)
+		*rs = (*rs)[:maxPoints]
+		defer pool.PutRows(rs)
+		*rs, err = tansFunc(mst, *rs, tss, inValidTs)
+		if err != nil {
+			h.httpError(w, err.Error(), http.StatusBadRequest)
+			return err
+		}
 
-    // 步骤4：使用 VictoriaMetrics 的流式解析器解析 Protobuf
-    err := Parser.Parse(body, false, func(tss []prompb2.TimeSeries) error {
-        // 步骤5：验证时间序列
-        inValidTs, partialErr := h.FilterInvalidTimeSeries(mst, tss)
+		if err = h.PointsWriter.RetryWritePointRows(db, rp, *rs); influxdb.IsClientError(err) {
+			h.httpError(w, err.Error(), http.StatusBadRequest)
+		} else if influxdb.IsAuthorizationError(err) {
+			h.httpError(w, err.Error(), http.StatusForbidden)
+		} else if err != nil {
+			h.httpError(w, err.Error(), http.StatusInternalServerError)
+		} else if partialErr != nil {
+			h.Logger.Error("servePromWriteBase partial error:", zap.Error(partialErr))
+			h.httpError(w, partialErr.Error(), http.StatusBadRequest)
+		}
+		return err
+	})
 
-        // 步骤6：转换为 InfluxDB 行格式
-        rs := pool.GetRows(maxPoints)
-        *rs, err = tansFunc(mst, *rs, tss, inValidTs)
-        if err != nil {
-            h.httpError(w, err.Error(), http.StatusBadRequest)
-            return err
-        }
-
-        // 步骤7：写入存储
-        if err = h.PointsWriter.RetryWritePointRows(db, rp, *rs); err != nil {
-            // 错误处理...
-        }
-        return err
-    })
-    // 步骤8：返回 204 No Content
-    h.writeHeader(w, http.StatusNoContent)
+	if err != nil {
+		h.httpError(w, err.Error(), http.StatusBadRequest)
+		h.Logger.Error("servePromWriteBase error", zap.Error(err))
+		return
+	}
+	h.writeHeader(w, http.StatusNoContent)
 }
 ```
 
@@ -2249,64 +2352,117 @@ func (h *Handler) servePromWriteBase(w http.ResponseWriter, r *http.Request,
 
 ### 11.5 结果缓存与一致性哈希
 
-**代码位置**：`lib/util/lifted/influx/httpd/results_cache.go`
+**代码位置**：`lib/util/lifted/influx/httpd/results_cache.go:43-103`
 
 ```go
 type ResultsCache struct {
-    SplitQueriesByInterval time.Duration  // 查询分割间隔
-    MaxCacheFreshness      time.Duration  // 最大缓存新鲜度
-    minCacheExtent         int64          // 最小缓存范围（5 分钟）
-    Logger                 *logger.Logger
-    cache                  resultcache.ResultCache  // 底层缓存实现
+	SplitQueriesByInterval time.Duration
+	MaxCacheFreshness      time.Duration
+	minCacheExtent         int64
+	Logger                 *logger.Logger
+	cache                  resultcache.ResultCache
 }
 
-// config.ResultCacheConfig.CacheType 是枚举：
-//   MEM_CACHE  = 0
-//   FILE_CACHE = 1
-// 当前 resultcache.NewResultCache 只为 MEM_CACHE 创建 MemCacheAdapter；
-// FILE_CACHE 枚举已定义，但 factory 分支尚未落地。
-func NewResultCache(cacheConfig config.ResultCacheConfig) resultcache.ResultCache {
-    if cacheConfig.CacheType == config.MEM_CACHE {
-        return &MemCacheAdapter{memCache: cache.NewCache(cacheSize, expiration)}
-    }
-    return nil
+func NewResultCache(logger *logger.Logger, conf config.ResultCacheConfig) *ResultsCache {
+	c := resultcache.NewResultCache(conf)
+	return &ResultsCache{
+		Logger:                 logger,
+		SplitQueriesByInterval: time.Duration(conf.SplitQueriesByInterval),
+		MaxCacheFreshness:      time.Duration(conf.MaxCacheFreshness),
+		minCacheExtent:         (5 * time.Minute).Milliseconds(),
+		cache:                  c,
+	}
 }
 
-func (rc *ResultsCache) Do(reqInfo *RequestInfo, command *promql2influxql.PromCommand,
-    key string) (*promql2influxql.PromQueryResponse, bool, error) {
-    // 检查是否应该缓存
-    if !shouldCache(r) { return nil, false, nil }
+func (rc *ResultsCache) Do(reqInfo *RequestInfo, command *promql2influxql.PromCommand, key string) (*promql2influxql.PromQueryResponse, bool, error) {
+	rc.Logger.Debug("result cache key", zap.String("key", key))
+	r := reqInfo.r
+	if !shouldCache(r) {
+		rc.Logger.Info("not enable cache", zap.String(cacheControlHeader, noStoreValue))
+		return nil, false, nil
+	}
 
-    maxCacheTime := model.Now().Add(-rc.MaxCacheFreshness).UnixNano()
-    if command.Start.UnixNano() > maxCacheTime {
-        return nil, false, nil  // 太新的数据不缓存
-    }
+	response := &promql2influxql.PromQueryResponse{}
+	var extents []promql2influxql.Extent
+	var err error
 
-    // 查缓存
-    cached, ok := rc.get(key)
-    if ok {
-        response, extents, err = rc.handleHit(reqInfo, command, cached, maxCacheTime, &fullHit)
-    } else {
-        response, extents, err = rc.handleMiss(reqInfo, command, maxCacheTime)
-    }
+	maxCacheFreshness := rc.MaxCacheFreshness
+	maxCacheTime := model.Now().Add(-maxCacheFreshness).UnixNano()
+	if command.Start.UnixNano() > maxCacheTime {
+		rc.Logger.Debug("cache miss", zap.Int64("start time", command.Start.UnixNano()))
+		return nil, false, nil
+	}
 
-    if fullHit { return response, true, nil }
+	fullHit := false
+	cached, ok := rc.get(key)
+	if ok {
+		rc.Logger.Debug("hit result cache", zap.String("key", key))
+		response, extents, err = rc.handleHit(reqInfo, command, cached, maxCacheTime, &fullHit)
+	} else {
+		rc.Logger.Debug("miss result cache", zap.String("key", key))
+		response, extents, err = rc.handleMiss(reqInfo, command, maxCacheTime)
+	}
+	if err != nil {
+		return nil, true, err
+	}
+	if fullHit {
+		return response, true, nil
+	}
 
-    // 缓存未命中的部分，存储结果
-    extents = rc.filterRecentExtents(extents, command.Step.Nanoseconds(), maxCacheFreshness)
-    if len(extents) > 0 { rc.put(key, extents) }
+	extents = rc.filterRecentExtents(extents, command.Step.Nanoseconds(), maxCacheFreshness)
+	if len(extents) > 0 {
+		rc.put(key, extents)
+	}
+
+	return response, true, nil
 }
 ```
+
+**代码位置**：`lib/resultcache/cache_factory.go:30-38`
+
+```go
+func NewResultCache(cacheConfig config.ResultCacheConfig) ResultCache {
+	if cacheConfig.CacheType == config.MEM_CACHE {
+		expiration := time.Duration(cacheConfig.MemCacheExpiration)
+		cacheSize := int64(cacheConfig.MemCacheSize)
+		statistics.NewResultCache().TotalCacheSize.Store(cacheSize)
+		return &MemCacheAdapter{memCache: cache.NewCache(cacheSize, expiration)}
+	}
+
+	return nil
+}
+```
+
+> `config.CacheType` 枚举包含 `MEM_CACHE`（0）与 `FILE_CACHE`（1）；当前 factory 只为 `MEM_CACHE` 创建 `MemCacheAdapter`，`FILE_CACHE` 分支落到 `return nil`，尚不可用。
 
 **缓存转发机制**：
 
 ```go
 func doForward(h *Handler, r *http.Request, key string, rw ResponseWriter, body []byte) bool {
-    // 使用一致性哈希确定目标节点
-    nodes, ring, err := buildRing(h)
-    targetNode := ring.Get(key)
-    // 如果目标不是当前节点，转发请求
-    // ...
+	// only mem cache do forwarding
+	if h.Config.ResultCache.CacheType != 0 {
+		return false
+	}
+	if isForward(r) {
+		return false
+	}
+
+	nodes, ring, err := buildRing(h)
+	if err != nil {
+		h.Logger.Error("Failed to build ring", zap.Error(err))
+		return false
+	}
+	// If the key is handled by self
+	if isSelf(ring, key) {
+		return false
+	}
+
+	id := ring.Get(key)
+	nodeInfo := getNodeInfo(nodes, id)
+	if nodeInfo != nil && nodeInfo.Status == serf.StatusAlive {
+		// ...
+	}
+	return false
 }
 ```
 
@@ -2343,19 +2499,20 @@ graph TD
     A["InfluxResultToPromQLValue(result, expr, cmd)"] --> B["遍历 result.Series"]
     B --> C{"分组策略?"}
     C -->|"有标签列"| D["populatePromSeriesByTag()<br/>按标签值分组"]
-    C -->|"无标签列"| E["populatePromSeriesByHash()<br/>按 metric hash 分组"]
-    D --> F{"表达式类型?"}
+    C -->|"无标签列"| E["PopulatePromSeriesByHash()<br/>按完整 label set 的 hash 分组"]
+    D --> F{"expr.Type()?"}
     E --> F
-    F -->|"MatrixSelector"| G["构建 matrix 响应<br/>每个 series 含完整时间序列"]
-    F -->|"VectorSelector"| H["构建 vector 响应<br/>每个 series 仅含最新值"]
-    F -->|"其他"| I["构建 scalar 响应"]
-    G --> J{"DataType?"}
-    H --> J
-    I --> J
-    J -->|"GRAPH"| K["时间序列格式<br/>[{metric, values: [[ts,v]...]}]"]
-    J -->|"TABLE"| L["表格格式<br/>[{metric, value: [ts,v]}]"]
-    K --> M["PromData 返回"]
-    L --> M
+    F -->|"ValueTypeMatrix"| G["HandleValueTypeMatrix()<br/>构建 matrix"]
+    F -->|"ValueTypeVector"| H{"cmd.DataType == GRAPH_DATA?"}
+    F -->|"ValueTypeScalar"| I{"cmd.DataType == GRAPH_DATA?"}
+    F -->|"default"| X["返回 errno.UnsupportedValueType"]
+    H -->|"是"| G
+    H -->|"否"| H1["handleValueTypeVector()"]
+    I -->|"是"| G
+    I -->|"否"| I1["handleValueTypeScalar()"]
+    G --> M["NewPromData 返回"]
+    H1 --> M
+    I1 --> M
 ```
 
 **代码位置**：`lib/util/lifted/promql2influxql/receiver.go:236-285`
@@ -2437,72 +2594,105 @@ graph LR
         T2 --> T3["{host=s1, method=GET}: [points...]"]
         T2 --> T4["{host=s1, method=POST}: [points...]"]
         T2 --> T5["{host=s2, method=GET}: [points...]"]
-        T3 --> T6["保留 __name__ 标签<br/>生成完整 metric 标识"]
+        T3 --> T6["按 DropMetric 决定是否保留 __name__<br/>生成完整 metric 标识"]
         T4 --> T6
         T5 --> T6
     end
 
-    subgraph "Hash 分组（populatePromSeriesByHash）"
-        H1["InfluxQL 查询结果<br/>无标签列"] --> H2["计算 metric name hash"]
-        H2 --> H3["hash(http_requests_total): [points...]"]
-        H3 --> H4["丢弃 __name__ 标签<br/>仅保留 hash 作为 series 标识"]
+    subgraph "Hash 分组（PopulatePromSeriesByHash）"
+        H1["InfluxQL 查询结果<br/>无标签列"] --> H2["计算完整 label set 的 metric.Hash()"]
+        H2 --> H3["hash(label set): [points...]"]
+        H3 --> H4["按 DropMetric 决定是否丢弃 __name__<br/>series 仍保存 Metric labels"]
     end
 ```
 
 **代码位置**：`lib/util/lifted/promql2influxql/receiver.go:69-153`
 
 ```go
-// populatePromSeriesByTag 按标签分组（当查询返回了标签列时）
 func (r *Receiver) populatePromSeriesByTag(pPreMetric *labels.Labels, promSeries *[]*promql.Series, table *models.Row) error {
-    var metric labels.Labels
-    if !r.DropMetric {
-        metric = labels.FromMap(table.Tags)  // 保留 __name__
-    } else {
-        metric = FromMapWithoutMetric(table.Tags)  // 丢弃 __name__
-    }
+	var metric labels.Labels
+	if !r.DropMetric {
+		metric = labels.FromMap(table.Tags)
+	} else {
+		metric = FromMapWithoutMetric(table.Tags)
+	}
+	if *pPreMetric != nil && labels.Equal(metric, *pPreMetric) {
+		logger.GetLogger().Error(fmt.Sprintf("vector cannot contain metrics with the same labelset: metric=%v", metric.String()))
+		return fmt.Errorf("vector cannot contain metrics with the same labelset")
+	}
+	*pPreMetric = metric
 
-    if len(table.Columns) <= SampleColNum {
-        // 简单情况：只有 time 和 value 两列
-        for _, row := range table.Values {
-            point, err := Row2Point(row)
-            // ...
-            points = append(points, point)
-        }
-        *promSeries = append(*promSeries, &promql.Series{Metric: metric, Floats: points})
-    } else {
-        // 复杂情况：有多列标签
-        seriesMap := make(map[uint64]*promql.Series)
-        for _, row := range table.Values {
-            m := metric
-            for i := SampleColNum; i < len(table.Columns); i++ {
-                if row[i] == nil { continue }
-                // 将额外的列作为标签
-                m = append(m, labels.Label{Name: table.Columns[i], Value: row[i].(string)})
-            }
-            sort.Sort(m)
-            if series, exists := seriesMap[m.Hash()]; exists {
-                series.Floats = append(series.Floats, point)
-            } else {
-                seriesMap[m.Hash()] = &promql.Series{Metric: m, Floats: []promql.FPoint{point}}
-            }
-        }
-        for _, series := range seriesMap {
-            *promSeries = append(*promSeries, series)
-        }
-    }
-
-    // 处理 DuplicateResult：为 StepInvariant 表达式复制结果
-    if r.DuplicateResult && r.PromCommand.Step > 0 && len((*promSeries)[len(*promSeries)-1].Floats) == 1 {
-        start, end, interval := r.Start.UnixMilli(), r.End.UnixMilli(), r.Step.Milliseconds()
-        series := (*promSeries)[len(*promSeries)-1]
-        idx := len(series.Floats)
-        ReservePoints(series, int((end-start-interval)/interval)+1)
-        for ts := start + interval; ts <= end; ts += interval {
-            series.Floats[idx] = promql.FPoint{T: ts, F: series.Floats[0].F}
-            idx++
-        }
-    }
-    return nil
+	if len(table.Columns) <= SampleColNum {
+		var points []promql.FPoint
+		preT := int64(math.MinInt64)
+		for _, row := range table.Values {
+			point, err := Row2Point(row)
+			if err != nil {
+				return err
+			}
+			if preT >= point.T {
+				logger.GetLogger().Error(fmt.Sprintf("vector cannot contain metrics with the same labelset: metric=%v point=%v preT=%v", metric.String(), point.String(), preT))
+				return fmt.Errorf("vector cannot contain metrics with the same labelset")
+			}
+			preT = point.T
+			points = append(points, point)
+		}
+		*promSeries = append(*promSeries, &promql.Series{
+			Metric: metric,
+			Floats: points,
+		})
+	} else {
+		seriesMap := make(map[uint64]*promql.Series)
+		metricContainsMap := metricContainsCol(table.Columns, metric)
+		for _, row := range table.Values {
+			m := metric
+			for i := SampleColNum; i < len(table.Columns); i++ {
+				if row[i] == nil || (r.DropMetric && DefaultMetricKeyLabel == table.Columns[i]) {
+					continue
+				}
+				if !metricContainsMap[table.Columns[i]] {
+					m = append(m, labels.Label{Name: table.Columns[i], Value: row[i].(string)})
+				}
+			}
+			point, err := Row2Point(row)
+			if err != nil {
+				return err
+			}
+			sort.Sort(m)
+			if series, exists := seriesMap[m.Hash()]; exists {
+				if series.Floats[len(series.Floats)-1].T == point.T {
+					logger.GetLogger().Error(fmt.Sprintf("vector cannot contain metrics with the same labelset: metric=%v point=%v", metric.String(), point.String()))
+					return fmt.Errorf("vector cannot contain metrics with the same labelset")
+				}
+				series.Floats = append(series.Floats, point)
+			} else {
+				seriesMap[m.Hash()] = &promql.Series{
+					Metric: m,
+					Floats: []promql.FPoint{
+						point,
+					},
+				}
+			}
+		}
+		for _, series := range seriesMap {
+			*promSeries = append(*promSeries, series)
+		}
+	}
+	if !r.DuplicateResult || r.PromCommand.Step == 0 || len((*promSeries)[len(*promSeries)-1].Floats) > 1 {
+		return nil
+	}
+	// For every evaluation while the value remains same, the timestamp for that
+	// value would change for different eval times. Hence we duplicate the result
+	// with changed timestamps.
+	start, end, interval := r.Start.UnixMilli(), r.End.UnixMilli(), r.Step.Milliseconds()
+	series := (*promSeries)[len(*promSeries)-1]
+	idx := len(series.Floats)
+	ReservePoints(series, int((end-start-interval)/interval)+1)
+	for ts := start + interval; ts <= end; ts += interval {
+		series.Floats[idx] = promql.FPoint{T: ts, F: series.Floats[0].F}
+		idx++
+	}
+	return nil
 }
 ```
 
@@ -2551,7 +2741,7 @@ func Row2Point(row []interface{}) (promql.FPoint, error) {
 
 ### 12.5 PromData 序列化
 
-**代码位置**：`lib/util/lifted/promql2influxql/models.go:94-116`
+**代码位置**：`lib/util/lifted/promql2influxql/models.go:99-115`
 
 ```go
 type PromQueryResponse struct {
@@ -2578,9 +2768,9 @@ type PromData struct {
 **风险**：每次查询都需要：
 1. Prometheus 原生解析器解析 PromQL -> AST
 2. Transpiler 将 PromQL AST -> InfluxQL AST
-3. InfluxQL 引擎解析 InfluxQL AST -> 执行计划
+3. InfluxQL 引擎基于 InfluxQL AST 构建执行计划（不再进行 InfluxQL 文本解析）
 
-**影响**：双重解析带来额外的 CPU 和内存开销。对于高频查询场景，这个开销可能不可忽视。
+**影响**：PromQL 解析 + AST 转译 + 计划构建带来额外的 CPU 和内存开销。对于高频查询场景，这个开销可能不可忽视。注意 execQuery 是直接把 Transpiler 生成的 `*influxql.SelectStatement` 包进 `influxql.Query` 交给 ExecuteQuery，并不存在“第二次文本解析”。
 
 **缓解措施**：
 - 结果缓存机制减少了重复查询的转译次数
@@ -2612,7 +2802,7 @@ type PromData struct {
 
 ### 13.5 向量-向量二元运算的不完整性
 
-**代码位置**：`lib/util/lifted/promql2influxql/binary_expr.go:263`
+**代码位置**：`lib/util/lifted/promql2influxql/binary_expr.go:271-275`
 
 ```go
 } else if !lok || !rok {
@@ -2661,7 +2851,7 @@ query=rate(http_requests_total{method="GET"}[5m])&time=1700000000
 promCommand := PromCommand{
     Cmd:         `rate(http_requests_total{method="GET"}[5m])`,
     Database:    "prom",
-    Evaluation:  time.UnixMilli(1700000000),  // instant query
+    Evaluation:  time.Unix(1700000000, 0),      // instant query（time 参数为秒）
     Step:        0,                            // instant query 无步长
     LookBackDelta: 5 * time.Minute,
     DataType:    TABLE_DATA,
@@ -2706,7 +2896,7 @@ transpileExpr(Call{rate, [MatrixSelector]})
         -> t.timeRange = 5m
         -> transpileExpr(VectorSelector{http_requests_total, method="GET"})
           -> transpileInstantVectorSelector(VectorSelector)
-            -> timeCondition: time >= (1700000000000 - 300000 - 300000) AND time <= 1700000000000
+            -> timeCondition: time >= (1700000000000 - 300000) AND time <= 1700000000000
             -> tagCondition: method = 'GET'
             -> SelectStatement{
                 Sources: [http_requests_total],
@@ -2723,7 +2913,7 @@ transpileExpr(Call{rate, [MatrixSelector]})
       -> table = SelectStatement, parameter = []
       -> field.Expr 是 VarRef(value), 直接设置
       -> setAggregateFields: Fields = [rate_prom(value)]
-      -> 设置 GROUP BY time(step) fill(none)
+      -> instant query（step=0）：不设置 GROUP BY time()，也不设置 fill(none)
 ```
 
 #### 阶段 6：生成的 InfluxQL
@@ -2731,16 +2921,16 @@ transpileExpr(Call{rate, [MatrixSelector]})
 ```sql
 SELECT rate_prom(value)
 FROM http_requests_total
-WHERE time >= 1699999100000 AND time <= 1700000000000 AND method = 'GET'
-GROUP BY *, time(0s) fill(none)
+WHERE time >= 1699999700000 AND time <= 1700000000000 AND method = 'GET'
+GROUP BY *
 ```
 
 #### 阶段 7：引擎执行
 
 1. 查询规划器创建执行计划
 2. 从存储层读取原始数据（record 格式）
-3. 创建 `InstantVectorCursor`（因为 step=0，range=0）
-4. 对每个 series，`floatSampler` 在 `[1700000000000 - 5m, 1700000000000]` 窗口内取样本
+3. 创建 `RangeVectorCursor`（range=5m>0；step=0 表示单次评估）
+4. 对每个 series，`floatSliceReducer` 在 `[1700000000000 - 5m, 1700000000000]` 窗口内取样本
 5. `rate_prom` 函数使用外推算法计算速率
 
 #### 阶段 8：结果转换
@@ -2748,7 +2938,7 @@ GROUP BY *, time(0s) fill(none)
 ```go
 receiver := &Receiver{
     PromCommand: promCommand,
-    DropMetric: true,  // rate 是聚合函数，丢弃 __name__
+    DropMetric: true,  // rate 是 range vector 函数，统一 dropMetric 丢弃 __name__
 }
 promData, _ := receiver.InfluxResultToPromQLValue(result, expr, promCommand)
 ```
@@ -2795,15 +2985,12 @@ transpileExpr(AggregateExpr{
       -> (同上，得到 SelectStatement with rate_prom(value))
     -> 查 aggregateFns[SUM]: name="sum"
     -> 子表达式是 Call(rate_prom)，尝试 canPushDownAggWithFunction
-      -> false (不是 range vector function 的直接嵌套)
-    -> 包装为子查询：
+      -> true（getOriCallName("rate_prom")="rate" 命中 rangeVectorFunctions，
+         且 statement.Range=5m>0）
+    -> 聚合下推到同一条 SELECT：
       SELECT sum(rate_prom(value))
-      FROM (
-          SELECT rate_prom(value)
-          FROM http_requests_total
-          WHERE time >= ... AND method = 'GET'
-          GROUP BY *, time(0s) fill(none)
-      )
+      FROM http_requests_total
+      WHERE time >= 1699999700000 AND time <= 1700000000000 AND method = 'GET'
       GROUP BY method
 ```
 
@@ -2811,12 +2998,8 @@ transpileExpr(AggregateExpr{
 
 ```sql
 SELECT sum(rate_prom(value))
-FROM (
-    SELECT rate_prom(value)
-    FROM http_requests_total
-    WHERE time >= 1699999100000 AND time <= 1700000000000 AND method = 'GET'
-    GROUP BY *, time(0s) fill(none)
-)
+FROM http_requests_total
+WHERE time >= 1699999700000 AND time <= 1700000000000 AND method = 'GET'
 GROUP BY method
 ```
 
@@ -2870,7 +3053,7 @@ GET /api/v1/query_range?query=rate(http_requests_total[5m])&start=1700000000&end
   SELECT rate_prom(value)
   FROM http_requests_total
   WHERE time >= 1699999700000 AND time <= 1700000300000
-  GROUP BY *, time(0s) fill(none)
+  GROUP BY *, time(60s, 0s) fill(none)
 ```
 
 #### Step 2: 引擎执行（RangeVectorCursor 滑动窗口）
@@ -2882,41 +3065,41 @@ rangeDuration = 300s (5m), step = 60s
 步长 T=1700000000 (start):
   窗口: [1700000000-300, 1700000000] = [1699999700, 1700000000]
   数据点: (1699999700, 1200), (1699999800, 1250), (1699999900, 1280), (1700000000, 1350)
-  → rate_prom 计算: delta=150, duration=300s → rate = 0.5/s
+  → rate_prom 计算: delta=150, sampled=300s, extrapolate=300s → rate = 0.5/s
 
 步长 T=1700000060:
   窗口: [1699999760, 1700000060]
   数据点: (1699999800, 1250), (1699999900, 1280), (1700000000, 1350), (1700000060, 1400)
-  → rate_prom 计算: delta=150, duration=300s → rate = 0.5/s
+  → rate_prom 计算: delta=150, sampled=260s, extrapolate=300s → rate = 150*(300/260)/300 = 0.5769/s
 
 步长 T=1700000120:
   窗口: [1699999820, 1700000120]
   数据点: (1699999900, 1280), (1700000000, 1350), (1700000060, 1400), (1700000120, 1420)
-  → rate_prom 计算: delta=140, duration=300s → rate = 0.467/s
+  → rate_prom 计算: delta=140, sampled=220s, extrapolate=300s → rate = 140*(300/220)/300 = 0.6364/s
 
 步长 T=1700000180:
   窗口: [1699999880, 1700000180]
   数据点: (1700000000, 1350), (1700000060, 1400), (1700000120, 1420), (1700000180, 1500)
-  → rate_prom 计算: delta=150, duration=300s → rate = 0.5/s
+  → rate_prom 计算: delta=150, sampled=180s, extrapolate=210s → rate = 150*(210/180)/300 = 0.5833/s
 
 步长 T=1700000240:
   窗口: [1699999940, 1700000240]
   数据点: (1700000000, 1350), (1700000060, 1400), (1700000120, 1420), (1700000180, 1500), (1700000240, 1550)
-  → rate_prom 计算: delta=200, duration=300s → rate = 0.667/s
+  → rate_prom 计算: delta=200, sampled=240s, extrapolate=300s → rate = 200*(300/240)/300 = 0.8333/s
 
 步长 T=1700000300:
   窗口: [1700000000, 1700000300]
   数据点: (1700000000, 1350), (1700000060, 1400), (1700000120, 1420), (1700000180, 1500), (1700000240, 1550), (1700000300, 1600)
-  → rate_prom 计算: delta=250, duration=300s → rate = 0.833/s
+  → rate_prom 计算: delta=250, sampled=300s, extrapolate=300s → rate = 250*(300/300)/300 = 0.8333/s
 ```
 
 #### Step 3: Receiver 转换
 
 ```
 InfluxQL 结果 → Receiver.InfluxResultToPromQLValue()
-  → resultType = "matrix"（range query）
-  → 构建时间序列: metric={__name__="http_requests_total"}
-  → values = [[1700000000, "0.5"], [1700000060, "0.5"], [1700000120, "0.467"], ...]
+  → resultType = "matrix"（range query + GRAPH_DATA）
+  → rate 属于 range vector 函数，DropMetric=true，构建时间序列: metric={}（丢弃 __name__）
+  → values = [[1700000000, "0.5"], [1700000060, "0.5769230769230769"], ...]
 ```
 
 #### 最终响应
@@ -2928,13 +3111,13 @@ InfluxQL 结果 → Receiver.InfluxResultToPromQLValue()
         "resultType": "matrix",
         "result": [
             {
-                "metric": {"__name__": "http_requests_total"},
+                "metric": {},
                 "values": [
                     [1700000000, "0.5"],
-                    [1700000060, "0.5"],
-                    [1700000120, "0.4666666666666667"],
-                    [1700000180, "0.5"],
-                    [1700000240, "0.6666666666666666"],
+                    [1700000060, "0.5769230769230769"],
+                    [1700000120, "0.6363636363636364"],
+                    [1700000180, "0.5833333333333334"],
+                    [1700000240, "0.8333333333333334"],
                     [1700000300, "0.8333333333333334"]
                 ]
             }
@@ -2943,11 +3126,13 @@ InfluxQL 结果 → Receiver.InfluxResultToPromQLValue()
 }
 ```
 
-> **观察**：rate 在最后几个步长逐渐上升（0.5 → 0.833），反映了请求速率的加速趋势。每个步长独立计算 5 分钟窗口内的增长率，步长之间的重叠使得趋势变化更加平滑。
+> **观察**：6 个步长的 rate 依次为 0.5、0.577、0.636、0.583、0.833、0.833，前几步受窗口内首点距边界不同的外推影响而波动，最后两步持平。每个步长独立计算 5 分钟窗口内的增长率，步长之间的重叠使得趋势变化更平滑。
 
 ---
 
-## 附录 A：PromQL 函数完整映射表
+## 附录 A：PromQL 常用函数映射表
+
+> 本表只列常用函数；6 张映射表的完整 70 项见附录 K.2。
 
 | PromQL 函数 | 引擎函数名 | 函数类型 | 说明 |
 |-------------|-----------|----------|------|
@@ -2989,11 +3174,11 @@ InfluxQL 结果 → Receiver.InfluxResultToPromQLValue()
 | `lib/util/lifted/promql2influxql/receiver.go` | 结果转换、PromQL 值构建 | ~572 |
 | `lib/util/lifted/promql2influxql/models.go` | PromCommand、PromResponse 数据模型、msgp 序列化 | ~664 |
 | `lib/util/lifted/promql2influxql/constant.go` | 常量定义 | ~39 |
-| `engine/prom_functions.go` | 引擎层函数注册、rate/irate/avg 等实现 | ~500+ |
+| `engine/prom_functions.go` | 引擎层函数注册、rate/irate/avg 等实现 | ~731 |
 | `engine/prom_instant_vector_cursor.go` | 即时向量采样器、双指针算法、lookback | ~436 |
 | `engine/prom_range_vector_cursor.go` | 范围向量滑动窗口、stale NaN 过滤 | ~199 |
-| `lib/util/lifted/influx/httpd/handler_prom.go` | HTTP 路由、查询执行、写入处理、结果缓存 | ~900+ |
-| `lib/util/lifted/influx/httpd/results_cache.go` | 结果缓存、缓存分割、新鲜度控制 | ~200+ |
+| `lib/util/lifted/influx/httpd/handler_prom.go` | HTTP 路由、查询执行、写入处理、结果缓存 | ~1336 |
+| `lib/util/lifted/influx/httpd/results_cache.go` | 结果缓存、缓存分割、新鲜度控制 | ~442 |
 
 ## 附录 C：引擎层 PromQL 函数深入实现
 
@@ -3002,11 +3187,11 @@ InfluxQL 结果 → Receiver.InfluxResultToPromQLValue()
 **代码位置**：`engine/prom_functions.go:165-169`
 
 ```go
-// irate 函数：瞬时增长率，只使用最后两个数据点
+// irate
 type irateOp struct{}
 
 func (o *irateOp) CreateRoutine(p *PromFuncParam) (Routine, error) {
-    return NewRoutineImpl(newFloatRateReducer(floatIRateReduce, floatIRateMerge(true), floatIRateUpdate), p.inOrdinal, p.outOrdinal), nil
+	return NewRoutineImpl(newFloatRateReducer(floatIRateReduce, floatIRateMerge(true), floatIRateUpdate), p.inOrdinal, p.outOrdinal), nil
 }
 ```
 
@@ -3016,7 +3201,8 @@ irate 与 rate 的核心区别：
 - **rate**：使用窗口内所有数据点进行外推计算
 - **irate**：只使用最后两个数据点计算瞬时速率
 
-irate 不需要外推，因此计算更简单：`value = (lastValue - secondLastValue) / (lastTime - secondLastTime)`。
+irate 不做外推，但仍处理 counter reset：设最后两点为 `(prevTime, prevValue)`、`(lastTime, lastValue)`，则
+`resultValue = lastValue - prevValue`；若 `lastValue < prevValue`（发生 reset），`resultValue = lastValue`；最后 `rate = resultValue / ((lastTime-prevTime)/1e9)`。
 
 irate 适合观察快速变化的指标（如请求速率的瞬时波动），但不适合用于告警规则（因为容易被毛刺影响）。
 
@@ -3124,155 +3310,236 @@ func (o *ideltaOp) CreateRoutine(p *PromFuncParam) (Routine, error) {
 ### C.4 changes / resets 函数
 
 ```go
-// changes 函数：计算窗口内值变化的次数
+// changes
 type changesOp struct{}
 
-func (o *changesOp) CreateRoutine(p *PromFuncParam) (Routine, error) {
-    return NewRoutineImpl(newFloatIncReducer(floatChangesReduce, floatChangesMergeFunc), p.inOrdinal, p.outOrdinal), nil
+func (r *changesOp) CreateRoutine(param *PromFuncParam) (Routine, error) {
+	return NewRoutineImpl(newFloatSliceReducer(floatChangesReducer, floatChangesMerger()), param.inOrdinal, param.outOrdinal), nil
 }
 
-func floatChangesReduce(times []int64, values []float64, start, end int) (int64, float64, bool) {
-    if start == end { return 0, 0, true }
-    count := 0
-    for i := start + 1; i < end; i++ {
-        if !math.IsNaN(values[i]) && !math.IsNaN(values[i-1]) && values[i] != values[i-1] {
-            count++
-        }
-    }
-    return times[start], float64(count), false
+func floatChangesReducer(times []int64, values []float64, start int, end int) ([]int64, []float64, bool) {
+	if start >= end {
+		return []int64{}, []float64{}, true
+	}
+	return times[start:end], values[start:end], false
 }
 
-// resets 函数：计算 counter 重置的次数（值变小）
+func floatChangesMerger() FloatSliceMergeFunc {
+	return func(prevT []int64, currT []int64, prevV []float64, curV []float64, ts int64, c int, param *ReducerParams) (float64, bool) {
+		if c < 1 {
+			return math.NaN(), true
+		}
+		return executor.CalcChange(prevV, curV), false
+	}
+}
+
+// resets
 type resetsOp struct{}
 
-func (o *resetsOp) CreateRoutine(p *PromFuncParam) (Routine, error) {
-    return NewRoutineImpl(newFloatIncReducer(floatResetsReduce, floatResetsMergeFunc), p.inOrdinal, p.outOrdinal), nil
+func (r *resetsOp) CreateRoutine(param *PromFuncParam) (Routine, error) {
+	return NewRoutineImpl(newFloatSliceReducer(floatResetsReducer, floatResetsMerger()), param.inOrdinal, param.outOrdinal), nil
 }
 
-func floatResetsReduce(times []int64, values []float64, start, end int) (int64, float64, bool) {
-    if start == end { return 0, 0, true }
-    count := 0
-    for i := start + 1; i < end; i++ {
-        if !math.IsNaN(values[i]) && !math.IsNaN(values[i-1]) && values[i] < values[i-1] {
-            count++
-        }
-    }
-    return times[start], float64(count), false
+func floatResetsReducer(times []int64, values []float64, start int, end int) ([]int64, []float64, bool) {
+	if start >= end {
+		return []int64{}, []float64{}, true
+	}
+	return times[start:end], values[start:end], false
+}
+
+func floatResetsMerger() FloatSliceMergeFunc {
+	return func(prevT []int64, currT []int64, prevV []float64, curV []float64, ts int64, c int, param *ReducerParams) (float64, bool) {
+		return executor.CalcResets(prevV, curV), false
+	}
 }
 ```
 
 **通俗解释**：
 
-- **changes**：遍历窗口内的所有相邻点对，统计值发生变化的次数（忽略 NaN）
-- **resets**：遍历窗口内的所有相邻点对，统计 counter 重置的次数（值变小，忽略 NaN）
+- **changes**：Reduce 只收集窗口内的数据切片，实际计数由 `executor.CalcChange(prevV, curV)` 完成（遍历相邻点对，统计值变化次数，忽略 NaN）
+- **resets**：Reduce 同样只收集切片，实际计数由 `executor.CalcResets(prevV, curV)` 完成（统计 counter 重置次数，值变小，忽略 NaN）
 
 ### C.5 stddev_over_time / stdvar_over_time 函数
 
 ```go
-// stddev_over_time 函数：计算窗口内标准差
-type stdDevOverTime struct{}
+// stdvar_over_time
+type stdVarOverTime struct{}
 
-func (o *stdDevOverTime) CreateRoutine(p *PromFuncParam) (Routine, error) {
-    return NewRoutineImpl(newFloatIncReducer(floatStdDevReduce, floatStdDevMergeFunc), p.inOrdinal, p.outOrdinal), nil
+func (r *stdVarOverTime) CreateRoutine(param *PromFuncParam) (Routine, error) {
+	return NewRoutineImpl(newFloatSliceReducer(floatStdVarOverTimeReducer, floatStdVarOverTimeMerger(false)), param.inOrdinal, param.outOrdinal), nil
 }
 
-func floatStdDevReduce(times []int64, values []float64, start, end int) (int64, float64, bool) {
-    if start == end { return 0, 0, true }
-    var count, mean, c float64
-    var aux float64  // 辅助变量，用于 Welford 在线算法
-    for i := start; i < end; i++ {
-        count++
-        delta := values[i] - mean
-        mean, c = executor.KahanSumInc(delta/count, mean, c)
-        aux += delta * (values[i] - mean)
-    }
-    if count <= 1 { return times[start], 0, false }
-    variance := aux / (count - 1)  // 无偏方差
-    return times[start], math.Sqrt(variance), false  // 标准差 = sqrt(方差)
+func floatStdVarOverTimeReducer(times []int64, values []float64, start int, end int) ([]int64, []float64, bool) {
+	if start >= end {
+		return []int64{}, []float64{}, true
+	}
+	return times[start:end], values[start:end], false
+}
+
+func floatStdVarOverTimeMerger(isStdDev bool) FloatSliceMergeFunc {
+	return func(prevT []int64, currT []int64, prevV []float64, curV []float64, ts int64, c int, param *ReducerParams) (float64, bool) {
+		if c < 1 {
+			return 0, true
+		}
+		var count float64
+		var mean, cMean float64
+		var aux, cAux float64
+
+		if len(prevV) == 0 && len(curV) == 0 {
+			return 0.0, true
+		}
+
+		if len(prevV) != 0 {
+			for _, f := range prevV {
+				count++
+				delta := f - (mean + cMean)
+				mean, cMean = executor.KahanSumInc(delta/count, mean, cMean)
+				aux, cAux = executor.KahanSumInc(delta*(f-(mean+cMean)), aux, cAux)
+			}
+		}
+
+		if len(curV) != 0 {
+			for _, f := range curV {
+				count++
+				delta := f - (mean + cMean)
+				mean, cMean = executor.KahanSumInc(delta/count, mean, cMean)
+				aux, cAux = executor.KahanSumInc(delta*(f-(mean+cMean)), aux, cAux)
+			}
+		}
+		stdVar := (aux + cAux) / count
+		if isStdDev {
+			return math.Sqrt(stdVar), false
+		}
+		return stdVar, false
+	}
+}
+
+// stddev_over_time
+type stdDevOverTime struct{}
+
+func (r *stdDevOverTime) CreateRoutine(param *PromFuncParam) (Routine, error) {
+	return NewRoutineImpl(newFloatSliceReducer(floatStdVarOverTimeReducer, floatStdVarOverTimeMerger(true)), param.inOrdinal, param.outOrdinal), nil
 }
 ```
 
 **通俗解释**：
 
-stddev 使用 Welford 在线算法计算标准差。该算法的优势：
+stddev/stdvar 复用同一个 merger，内部用 Welford 在线算法 + Kahan 补偿求和：
 - **单遍扫描**：不需要先计算均值再扫描第二遍
-- **数值稳定**：通过维护辅助变量 `aux` 避免了大数减小数的精度损失
-- **Kahan 求和**：进一步减少浮点误差
+- **数值稳定**：通过辅助变量 `aux` 避免大数减小数的精度损失
+- **方差分母是 `count`**（总体方差，不是样本方差 `count-1`）；`isStdDev=true` 时再取 `math.Sqrt(stdVar)`
+- **stddev_over_time 没有单独的 Reduce**：与 stdvar 一样使用 `floatStdVarOverTimeReducer`（只收集窗口切片），仅 merger 参数不同
 
 ### C.6 quantile_over_time 函数
 
 ```go
-// quantile_over_time 函数：计算窗口内分位数
+// quantile_over_time
 type quantileOverTime struct{}
 
-func (o *quantileOverTime) CreateRoutine(p *PromFuncParam) (Routine, error) {
-    return NewRoutineImpl(newFloatSliceReducer(floatQuantileReduce, floatQuantileMergeFunc(p.args)), p.inOrdinal, p.outOrdinal), nil
+func (r *quantileOverTime) CreateRoutine(param *PromFuncParam) (Routine, error) {
+	var percentile float64
+	switch arg := param.args[1].(type) {
+	case *influxql.NumberLiteral:
+		percentile = arg.Val
+	case *influxql.IntegerLiteral:
+		percentile = float64(arg.Val)
+	default:
+		return nil, errors.New("the type of input args of quantile_prom iterator is unsupported")
+	}
+	return NewRoutineImpl(newFloatSliceReducer(floatStdVarOverTimeReducer, floatQuantileOverTimeMerger(percentile)), param.inOrdinal, param.outOrdinal), nil
 }
 
-func floatQuantileReduce(times []int64, values []float64, start, end int) ([]int64, []float64, bool) {
-    if start >= end { return []int64{}, []float64{}, true }
-    return times[start:end], values[start:end], false
-}
-
-// Merge 阶段：对窗口内的所有值排序，然后取分位数
-// 注意：这里的实现将所有值收集后排序，适用于小窗口
-func floatQuantileMergeFunc(args []influxql.Expr) FloatSliceMergeFunc {
-    // 从参数中提取分位数值
-    var quantile float64
-    switch arg := args[0].(type) {
-    case *influxql.NumberLiteral: quantile = arg.Val
-    case *influxql.IntegerLiteral: quantile = float64(arg.Val)
-    }
-    return func(t1, t2 []int64, v1, v2 []float64, ts int64, pointCount int, param *ReducerParams) (float64, bool) {
-        // 合并两个数据段
-        values := make([]float64, 0, len(v1)+len(v2))
-        values = append(values, v1...)
-        values = append(values, v2...)
-        if len(values) == 0 { return 0, true }
-        // 排序
-        sort.Float64s(values)
-        // 计算分位数索引
-        rank := quantile * float64(len(values)-1)
-        lower := int(math.Floor(rank))
-        upper := int(math.Ceil(rank))
-        if lower == upper { return values[lower], false }
-        // 线性插值
-        fraction := rank - float64(lower)
-        return values[lower] + fraction*(values[upper]-values[lower]), false
-    }
+func floatQuantileOverTimeMerger(percentile float64) FloatSliceMergeFunc {
+	return func(prevT []int64, currT []int64, prevV []float64, curV []float64, ts int64, c int, param *ReducerParams) (float64, bool) {
+		if c == 0 || len(prevT)+len(currT) == 0 || len(prevV)+len(curV) == 0 {
+			return math.NaN(), true
+		}
+		return executor.CalcQuantile2(percentile, prevV, curV), false
+	}
 }
 ```
+
+**通俗解释**：分位数值从 `param.args[1]` 解析；Reduce 复用 `floatStdVarOverTimeReducer` 收集窗口切片，Merge 直接调用 `executor.CalcQuantile2(percentile, prevV, curV)` 完成排序与插值，文档不再自行实现分位数算法。
 
 ### C.7 holt_winters 函数
 
 ```go
-// holt_winters 函数：Holt-Winters 指数平滑
+// holt_winters
 type holtWintersOp struct{}
 
-func (o *holtWintersOp) CreateRoutine(p *PromFuncParam) (Routine, error) {
-    // 参数：smoothing factor (sf) 和 trend factor (tf)
-    // vectorPosition=0 表示第一个参数是向量数据
-    return NewRoutineImpl(newFloatSliceReducer(floatHoltWintersReduce, floatHoltWintersMergeFunc(p.args)), p.inOrdinal, p.outOrdinal), nil
+func (r *holtWintersOp) CreateRoutine(param *PromFuncParam) (Routine, error) {
+	// The smoothing factor argument.
+	var sf float64
+	// The trend factor argument.
+	switch arg := param.args[1].(type) {
+	case *influxql.NumberLiteral:
+		sf = arg.Val
+	case *influxql.IntegerLiteral:
+		sf = float64(arg.Val)
+	default:
+		return nil, errors.New("the type of input args of holtWinters sf is unsupported")
+	}
+	var tf float64
+	switch arg2 := param.args[2].(type) {
+	case *influxql.NumberLiteral:
+		tf = arg2.Val
+	case *influxql.IntegerLiteral:
+		tf = float64(arg2.Val)
+	default:
+		return nil, errors.New("the type of input args of holtWinters tf is unsupported")
+	}
+
+	return NewRoutineImpl(newFloatSliceReducer(floatHoltWintersReducer, floatHoltWintersMerger(sf, tf)), param.inOrdinal, param.outOrdinal), nil
+}
+
+func floatHoltWintersReducer(times []int64, values []float64, start int, end int) ([]int64, []float64, bool) {
+	if start >= end {
+		return []int64{}, []float64{}, true
+	}
+	return times[start:end], values[start:end], false
+}
+
+func floatHoltWintersMerger(sf float64, tf float64) FloatSliceMergeFunc {
+	return func(prevT []int64, currT []int64, prevV []float64, curV []float64, ts int64, c int, param *ReducerParams) (float64, bool) {
+		if c < 2 {
+			return math.NaN(), true
+		}
+		return executor.CalcHoltWinters(prevV, curV, sf, tf), false
+	}
 }
 ```
 
 **通俗解释**：
 
-Holt-Winters 是一种三参数指数平滑算法，用于时间序列预测：
-- **Level（水平）**：当前值的指数平滑
-- **Trend（趋势）**：变化趋势的指数平滑
-- **Seasonal（季节性）**：周期性模式的指数平滑
-
-openGemini 中的实现只支持双参数版本（level + trend），不支持季节性。两个参数分别是平滑因子 `sf` 和趋势因子 `tf`。
+Prometheus 的 `holt_winters` 本身就是双指数平滑（level + trend），没有季节性参数；openGemini 的实现与之一致：
+- `args[1]` 是平滑因子 `sf`，`args[2]` 是趋势因子 `tf`
+- Reduce 只收集窗口切片，Merge 调用 `executor.CalcHoltWinters(prevV, curV, sf, tf)`
+- 样本数少于 2 时返回 `NaN`
 
 ### C.8 mad_over_time 函数
 
 ```go
-// mad_over_time 函数：计算窗口内的中位数绝对偏差
+// mad_over_time
 type madOverTimeOp struct{}
 
-func (o *madOverTimeOp) CreateRoutine(p *PromFuncParam) (Routine, error) {
-    return NewRoutineImpl(newFloatSliceReducer(floatMADReduce, floatMADMergeFunc), p.inOrdinal, p.outOrdinal), nil
+func (r *madOverTimeOp) CreateRoutine(param *PromFuncParam) (Routine, error) {
+	return NewRoutineImpl(newFloatSliceReducer(floatMadOverTimeReducer, floatMadOverTimeMerger()), param.inOrdinal, param.outOrdinal), nil
+}
+
+func floatMadOverTimeReducer(times []int64, values []float64, start int, end int) ([]int64, []float64, bool) {
+	if start >= end {
+		return []int64{}, []float64{}, true
+	}
+	return times[start:end], values[start:end], false
+}
+
+func floatMadOverTimeMerger() FloatSliceMergeFunc {
+	return func(prevT []int64, currT []int64, prevV []float64, curV []float64, ts int64, c int, param *ReducerParams) (float64, bool) {
+		if c == 0 || len(prevT)+len(currT) == 0 || len(prevV)+len(curV) == 0 {
+			return math.NaN(), true
+		}
+		return executor.CalcMad2(prevV, curV), false
+	}
 }
 ```
 
@@ -3374,10 +3641,10 @@ func (t *Transpiler) setTimeInterval(statement *influxql.SelectStatement) {
 **通俗解释**：
 
 PromQL 的步长对齐与 InfluxQL 不同：
-- Prometheus 的时间步长从 epoch 开始对齐（如 `0, 15, 30, 45` 秒）
+- Prometheus range query 的评估时间点是 `start, start+step, ..., end`，从查询 `start` 起算，并非从 epoch 对齐
 - InfluxQL 的 `GROUP BY time(interval, offset)` 支持自定义偏移量
 
-`setTimeInterval` 计算 `offset = start % step`，确保 InfluxQL 的时间分桶与 Prometheus 的步长对齐。
+`setTimeInterval` 计算 `offset = start % step`，把 InfluxQL 的时间分桶对齐到查询 `start`。
 
 ### D.3 PreprocessExpr() 步长无关预处理
 
@@ -3540,7 +3807,7 @@ func (t *Transpiler) transpileSubqueryExpr(e *parser.SubqueryExpr) (influxql.Nod
 
 ### E.2 getCurrStep / getPrevStep 步长计算
 
-**代码位置**：`engine/prom_instant_vector_cursor.go:206-248`
+**代码位置**：`engine/prom_instant_vector_cursor.go:206-226`
 
 ```go
 // getPrevStep 返回 t 所在的上一个步长时间点
@@ -3686,57 +3953,83 @@ t=10000: prevBuf.time(5000) < 10000-3000(7000) -> 停止填充
 
 ### F.1 Instant Query 与 Range Query 的参数解析
 
-**代码位置**：`lib/util/lifted/influx/httpd/handler_prom.go`
+**代码位置**：`lib/util/lifted/influx/httpd/handler_prom_util.go:458-537`
 
 ```go
-// getInstantQueryCmd 解析即时查询参数
-func getInstantQueryCmd(r *http.Request, w http.ResponseWriter, mst string) (promql2influxql.PromCommand, bool) {
-    promCommand := promql2influxql.PromCommand{
-        DataType:    promql2influxql.TABLE_DATA,
-        ValueFieldKey: "value",
-    }
-    // 解析 time 参数（评估时间点）
-    if v := r.FormValue("time"); v != "" {
-        t, err := parseTime(v)
-        promCommand.Evaluation = &t
-    } else {
-        now := time.Now()
-        promCommand.Evaluation = &now
-    }
-    // 解析 lookback_delta 参数
-    if v := r.FormValue("lookback_delta"); v != "" {
-        promCommand.LookBackDelta, _ = parseDuration(v)
-    } else {
-        promCommand.LookBackDelta = 5 * time.Minute  // 默认 5 分钟
-    }
-    // 解析 timeout 参数
-    // ...
-    return promCommand, true
+func getInstantQueryCmd(r *http.Request, w http.ResponseWriter, mst string) (cmd promql2influxql.PromCommand, ok bool) {
+	// Instant_query Query time. if this parameter is not specified, the current time is used by default.
+	ts, err := parseTimeParam(r, "time", time.Now())
+	if err != nil {
+		invalidParamError(w, err, "time")
+		return
+	}
+	lookBackDelta := promql2influxql.DefaultLookBackDelta
+	if r.FormValue("lookback-delta") != "" {
+		lookBackDelta, err = parseDuration(r.FormValue("lookback-delta"))
+		if err != nil {
+			invalidParamError(w, err, "lookback-delta")
+			return
+		}
+	}
+	promCommand := promql2influxql.PromCommand{
+		Cmd:           r.FormValue("query"),
+		Evaluation:    &ts,
+		LookBackDelta: lookBackDelta,
+	}
+	return promCommand, true
 }
 
-// getRangeQueryCmd 解析范围查询参数
-func getRangeQueryCmd(r *http.Request, w http.ResponseWriter, mst string) (promql2influxql.PromCommand, bool) {
-    promCommand := promql2influxql.PromCommand{
-        DataType:    promql2influxql.GRAPH_DATA,
-        ValueFieldKey: "value",
-    }
-    // 解析 start、end、step 参数
-    if v := r.FormValue("start"); v != "" {
-        t, _ := parseTime(v)
-        promCommand.Start = &t
-    }
-    if v := r.FormValue("end"); v != "" {
-        t, _ := parseTime(v)
-        promCommand.End = &t
-    }
-    if v := r.FormValue("step"); v != "" {
-        promCommand.Step, _ = parseDuration(v)
-    }
-    // 默认回溯窗口
-    promCommand.LookBackDelta = 5 * time.Minute
-    // 验证：start < end, step > 0
-    // ...
-    return promCommand, true
+func getRangeQueryCmd(r *http.Request, w http.ResponseWriter, mst string) (cmd promql2influxql.PromCommand, ok bool) {
+	// Range_query query time. if this parameter is not specified, the current time is used by default.
+	start, err := parseTime(r.FormValue("start"))
+	if err != nil {
+		invalidParamError(w, err, "start")
+		return
+	}
+	end, err := parseTime(r.FormValue("end"))
+	if err != nil {
+		invalidParamError(w, err, "end")
+		return
+	}
+	if end.Before(start) {
+		invalidParamError(w, fmt.Errorf("end timestamp must not be before start time"), "end")
+		return
+	}
+
+	if err := validation.ValidateQueryTimeRange(mst, start, end); err != nil {
+		invalidParamError(w, err, "start_end")
+		return
+	}
+
+	step, err := parseDuration(r.FormValue("step"))
+	if err != nil {
+		invalidParamError(w, err, "step")
+		return
+	}
+
+	if step <= 0 {
+		invalidParamError(w, fmt.Errorf("zero or negative query resolution step widths are not accepted. Try a positive integer"), "step")
+		return
+	}
+
+	// ...
+	lookBackDelta := promql2influxql.DefaultLookBackDelta
+	if r.FormValue("lookback-delta") != "" {
+		lookBackDelta, err = parseDuration(r.FormValue("lookback-delta"))
+		if err != nil {
+			invalidParamError(w, err, "lookback-delta")
+			return
+		}
+	}
+	promCommand := promql2influxql.PromCommand{
+		Cmd:           r.FormValue("query"),
+		Start:         &start,
+		End:           &end,
+		Step:          step,
+		LookBackDelta: lookBackDelta,
+		DataType:      promql2influxql.GRAPH_DATA,
+	}
+	return promCommand, true
 }
 ```
 
@@ -3748,9 +4041,9 @@ func getRangeQueryCmd(r *http.Request, w http.ResponseWriter, mst string) (promq
 | `time` | 可选（默认 now） | 不使用 |
 | `start` | 不使用 | 必需 |
 | `end` | 不使用 | 必需 |
-| `step` | 不使用 | 必需（默认 1m） |
-| `lookback_delta` | 可选（默认 5m） | 可选（默认 5m） |
-| `timeout` | 可选 | 可选 |
+| `step` | 不使用 | 必需（无默认值，必须 > 0） |
+| `lookback-delta` | 可选（默认 5m） | 可选（默认 5m） |
+| `timeout` | 可选（在 `servePromBaseQuery` 中解析） | 可选（在 `servePromBaseQuery` 中解析） |
 
 ### F.2 MetricStore 模式
 
@@ -3782,16 +4075,16 @@ URL 模式：`/prometheus/{metric_store}/api/v1/query`
 // 解析是否为异步命令
 async := r.FormValue("async") == "true"
 
-// 异步执行
+// 异步执行：go h.async 排空结果，HTTP 立即返回 204 No Content
 if async {
-    // 立即返回，查询在后台执行
-    go func() {
-        // ... 执行查询
-    }()
-    h.writeHeader(w, http.StatusAccepted)
-    return
+	go h.async(q, resultCh)
+	h.writeHeader(w, http.StatusNoContent)
+	isRespond = true
+	return
 }
 ```
+
+> 说明：异步分支不会在前台执行查询，`h.async` 只是消费 `resultCh` 并在出错时记录日志；状态码是 `204 No Content`，不是 `202 Accepted`。
 
 ### F.4 Explain 查询分析
 
@@ -3800,20 +4093,25 @@ if async {
 isExplain := false
 explain := r.FormValue("explain")
 if len(explain) > 0 {
-    isExplain, _ = strconv.ParseBool(explain)
+	isExplain, err = strconv.ParseBool(explain)
+	if err != nil {
+		apiErr := &apiError{errorBadData, err}
+		respondError(w, apiErr)
+		return
+	}
 }
 
-// 在 execQuery 中使用 ExplainStatement
+// 在 execQuery 中使用 ExplainStatement（Analyze=true）
 if isExplain {
-    q = &influxql.Query{Statements: []influxql.Statement{
-        &influxql.ExplainStatement{Statement: statement, Analyze: true},
-    }}
+	q = &influxql.Query{Statements: []influxql.Statement{
+		&influxql.ExplainStatement{Statement: statement, Analyze: true},
+	}}
 }
 ```
 
 **通俗解释**：
 
-当请求中包含 `explain=true` 时，查询不会实际执行，而是返回查询计划的分析信息。这对于调试慢查询非常有用——可以查看 Transpiler 生成的 InfluxQL、执行计划的各个阶段、预计的资源消耗等。
+Prom 路径使用的是 `Analyze: true` 的 EXPLAIN ANALYZE：coordinator 会走 `executeExplainAnalyzeStatement`，创建 pipeline executor 并**真实执行查询**、采集各阶段耗时，最后返回带统计信息的执行结果；它不是只返回执行计划。若需要“不执行”的 EXPLAIN，应使用 `Analyze: false`，但 Prom 路径没有使用该分支。
 
 ### F.5 慢查询统计
 
@@ -3826,7 +4124,7 @@ if !isInternalDatabase(db) {
         if d.Nanoseconds() > time.Second.Nanoseconds()*10 {
             // 超过 10 秒的查询记录为慢查询
             qDuration.AddDuration("TotalDuration", d.Nanoseconds())
-            statistics.AppendSqlQueryStatistics(qDuration)
+            statistics.AppendSqlQueryDuration(qDuration)
             h.Logger.Info("slow query",
                 zap.Duration("duration", d),
                 zap.String("db", qDuration.DB),
@@ -3870,19 +4168,23 @@ if !isInternalDatabase(db) {
 
 ### G.3 默认值常量
 
-**代码位置**：`lib/util/lifted/promql2influxql/constant.go`
+**代码位置**：`lib/util/lifted/promql2influxql/constant.go:16-29`
 
 ```go
 const (
+    ArgNameOfTimeFunc          = "prom_time"   // time() 函数的参数名
     DefaultFieldKey            = "value"       // 默认字段名
     DefaultMetricKeyLabel      = "__name__"    // 指标名标签
     DefaultMeasurementName     = "prom_metric_not_specified"  // 未指定指标时的默认 measurement
     DefaultDatabaseName        = "prom"        // 默认数据库
     DefaultRetentionPolicyName = "autogen"     // 默认保留策略
-    DefaultLookBackDelta       = 5 * time.Minute  // 默认回溯窗口
-    FieldCountForKeepMetric    = 2             // keepMetric 模式下的字段数
+    TimeField                  = "time"
+    LastCall                   = "last"
     PromSuffix                 = "_prom"       // PromQL 函数后缀
 )
+
+const DefaultLookBackDelta = 5 * time.Minute  // 默认回溯窗口
+const FieldCountForKeepMetric = 2             // keepMetric 模式下的字段数
 ```
 
 ## 附录 H：错误处理与异常场景
@@ -3979,81 +4281,112 @@ if err != nil {
 
 ```mermaid
 classDiagram
+    class Reducer {
+        <<interface>>
+        +Aggregate(p, param)
+    }
+
     class Routine {
         <<interface>>
-        +Reduce(inRecord, params)
-        +Merge(prev, curr)
-        +WorkOnRecord(inRecord, outRecord, params)
+        +WorkOnRecord(in, out, params)
     }
 
-    class FloatIncRoutine {
-        -reduceFn FloatIncReduceFunc
-        -mergeFn FloatIncMergeFunc
-        +Reduce(inRecord, params) 增量归约
-        +Merge(prev, curr) 合并增量结果
+    class RoutineImpl {
+        -reducer Reducer
+        -inOrdinal int
+        -outOrdinal int
+        -endPoint *ReducerEndpoint
+        +WorkOnRecord(in, out, params)
     }
 
-    class FloatSliceRoutine {
-        -reduceFn FloatSliceReduceFunc
-        -mergeFn FloatSliceMergeFunc
-        +Reduce(inRecord, params) 收集数据切片
-        +Merge(prev, curr) 合并切片计算
+    class floatIncAggReducer {
+        -fr FloatIncAggReduceFunc
+        -fm FloatIncAggMergeFunc
+        +Aggregate(p, param) 增量聚合
     }
 
-    class FloatRateRoutine {
-        -reduceFn FloatRateReduceFunc
-        -mergeFn FloatRateMergeFunc
-        +Reduce(inRecord, params) 提取窗口数据
-        +Merge(prev, curr) 外推计算 rate
+    class floatSliceReducer {
+        -fr FloatSliceReduceFunc
+        -fm FloatSliceMergeFunc
+        +Aggregate(p, param) 收集切片
     }
 
-    Routine <|.. FloatIncRoutine : 实现
-    Routine <|.. FloatSliceRoutine : 实现
-    Routine <|.. FloatRateRoutine : 实现
+    class floatRateReducer {
+        -fr FloatRateReduceFunc
+        -fm FloatRateMergeFunc
+        -fu FloatRateUpdateFunc
+        +Aggregate(p, param) 速率计算
+    }
 
-    note for FloatIncRoutine "sum, count, min, max 等<br/>增量聚合函数"
-    note for FloatSliceRoutine "avg_over_time 等<br/>需要收集全部值的函数"
-    note for FloatRateRoutine "rate, increase, delta 等<br/>需要外推计算的函数"
+    Routine <|.. RoutineImpl : 实现
+    RoutineImpl o-- Reducer : 持有
+    Reducer <|.. floatIncAggReducer : 实现
+    Reducer <|.. floatSliceReducer : 实现
+    Reducer <|.. floatRateReducer : 实现
 ```
 
-引擎层的函数执行基于 Routine 接口模式：
+引擎层的函数执行基于 Routine/Reducer 接口模式：
 
 ```go
-// Routine 是 PromQL 函数计算例程的核心接口
+type Reducer interface {
+	Aggregate(*ReducerEndpoint, *ReducerParams)
+}
+
 type Routine interface {
-    // Reduce 阶段：对单个 record 内的数据进行归约
-    Reduce(inRecord *record.Record, params *ReducerParams)
-    // Merge 阶段：跨 record 合并归约结果
-    Merge(prev, curr *ReducerParams)
-    // WorkOnRecord 协处理入口
-    WorkOnRecord(inRecord, outRecord *record.Record, params *ReducerParams)
+	WorkOnRecord(*record.Record, *record.Record, *ReducerParams)
+}
+
+type RoutineImpl struct {
+	reducer    Reducer
+	inOrdinal  int
+	outOrdinal int
+	endPoint   *ReducerEndpoint
+}
+
+func NewRoutineImpl(reducer Reducer, inOrdinal int, outOrdinal int) *RoutineImpl {
+	return &RoutineImpl{
+		reducer:    reducer,
+		inOrdinal:  inOrdinal,
+		outOrdinal: outOrdinal,
+		endPoint: &ReducerEndpoint{
+			InputPoint:  EndPointPair{},
+			OutputPoint: EndPointPair{},
+		},
+	}
+}
+
+func (r *RoutineImpl) WorkOnRecord(in *record.Record, out *record.Record, params *ReducerParams) {
+	r.endPoint.InputPoint.Record = in
+	r.endPoint.InputPoint.Ordinal = r.inOrdinal
+	r.endPoint.OutputPoint.Record = out
+	r.endPoint.OutputPoint.Ordinal = r.outOrdinal
+	r.reducer.Aggregate(r.endPoint, params)
 }
 ```
 
-每个 PromQL 函数都通过 `CreateRoutine()` 工厂方法创建对应的 Routine 实例。Routine 有三种主要的 Reducer 模式：
+`Routine` 接口只有 `WorkOnRecord`，`Reduce/Merge` 并不是接口方法：具体计算由 `RoutineImpl` 持有的 `Reducer.Aggregate` 完成，各 reducer 内部再调用自己的 `fr`（单窗口归约）与 `fm`（跨 record 合并）。`NewRoutineImpl` 把 reducer、输入/输出列序号组装成 `RoutineImpl`。每个 PromQL 函数都通过 `CreateRoutine()` 工厂方法创建对应的 Routine 实例。Routine 有三种主要的 Reducer 模式：
 
-#### I.1.1 FloatIncReducer（增量 Reducer）
+#### I.1.1 floatIncAggReducer（增量 Reducer）
 
 适用于聚合类函数（avg、sum、min、max、count、last 等）：
 
 ```go
-type FloatIncReducer struct {
-    reduceFunc FloatIncReduceFunc  // 单窗口归约函数
-    mergeFunc  FloatIncMergeFunc   // 跨窗口合并函数
-    result     struct {
-        time  int64
-        value float64
-        count int
-    }
+type floatIncAggReducer struct {
+	fr        FloatIncAggReduceFunc
+	fm        FloatIncAggMergeFunc
+	prevStep  int64
+	offset    int64
+	prevPoint *floatPoint
+	ringBuf   *floatBuffer
 }
 
-type FloatIncReduceFunc func(times []int64, values []float64, start, end int) (int64, float64, bool)
-type FloatIncMergeFunc func(prevValue, currValue float64, prevCount, currCount int) (float64, int)
+type FloatIncAggReduceFunc func(times []int64, values []float64, start, end int) (int64, float64, bool)
+type FloatIncAggMergeFunc func(prevValue float64, currValue float64, prevCount, currCount int) (float64, int)
 ```
 
 **工作流程**：
-1. **Reduce**：在每个时间窗口内，调用 `reduceFunc` 计算一个中间结果（时间戳、值、计数）
-2. **Merge**：跨 record 时，调用 `mergeFunc` 合并两个中间结果
+1. **Reduce（`fr`）**：在每个时间窗口内，计算一个中间结果（时间戳、值、计数）
+2. **Merge（`fm`）**：跨 record 时，合并两个中间结果
 
 **示例**（sum_over_time）：
 ```
@@ -4065,83 +4398,86 @@ Record 2 窗口 [0, 3) 续: values=[4.0]
   Merge: value=6.0+4.0=10.0, count=3+1=4
 ```
 
-#### I.1.2 FloatSliceReducer（切片 Reducer）
+#### I.1.2 floatSliceReducer（切片 Reducer）
 
 适用于需要整个窗口数据的函数（rate、increase、deriv、quantile 等）：
 
 ```go
-type FloatSliceReducer struct {
-    reduceFunc FloatSliceReduceFunc  // 提取数据切片
-    mergeFunc  FloatSliceMergeFunc   // 计算最终结果
+type floatSliceReducer struct {
+	fr       FloatSliceReduceFunc
+	fm       FloatSliceMergeFunc
+	prevStep int64
+	ringBuf  *floatBuffer
 }
 
 type FloatSliceReduceFunc func(times []int64, values []float64, start, end int) ([]int64, []float64, bool)
-type FloatSliceMergeFunc func(prevT, currT []int64, prevV, currV []float64, ts int64, pointCount int, param *ReducerParams) (float64, bool)
+type FloatSliceMergeFunc func(prevT, currT []int64, prevV, currV []float64, ts int64, count int, param *ReducerParams) (float64, bool)
 ```
 
 **工作流程**：
-1. **Reduce**：提取窗口内的原始数据切片（不做计算）
-2. **Merge**：跨 record 合并数据切片，然后在最终的完整数据上计算结果
+1. **Reduce（`fr`）**：提取窗口内的原始数据切片（不做计算）
+2. **Merge（`fm`）**：跨 record 合并数据切片，然后在最终的完整数据上计算结果
 
-**为什么 rate 需要 FloatSliceReducer？** 因为 rate 的外推算法需要知道窗口内所有数据点的分布情况（首尾点的位置、数据点的数量等），无法通过增量方式计算。
+**为什么 rate 需要 floatSliceReducer？** 因为 rate 的外推算法需要知道窗口内所有数据点的分布情况（首尾点的位置、数据点的数量等），无法通过增量方式计算。
 
-#### I.1.3 FloatRateReducer（速率 Reducer）
+#### I.1.3 floatRateReducer（速率 Reducer）
 
-适用于速率类函数（irate）：
+适用于速率类函数（rate/irate/delta/idelta/increase）：
 
 ```go
-type FloatRateReducer struct {
-    reduceFunc FloatRateReduceFunc  // 归约函数
-    mergeFunc  FloatRateMergeFunc   // 合并函数
-    updateFunc FloatRateUpdateFunc  // 更新函数
+type floatRateReducer struct {
+	fr         FloatRateReduceFunc
+	fm         FloatRateMergeFunc
+	fu         FloatRateUpdateFunc
+	prevStep   int64
+	prevPoints [2]*floatPoint
+	ringBuf    *floatBuffer
 }
+
+type FloatRateReduceFunc func(times []int64, values []float64, start, end int) (int64, int64, float64, float64, bool)
+type FloatRateMergeFunc func(prevTime int64, currTime int64, prevValue float64, currValue float64, ts int64, pointCount int, param *ReducerParams) (float64, bool)
+type FloatRateUpdateFunc func(ft1, ft2, lt1, lt2 int64, fv1, fv2, lv1, lv2 float64) (int64, int64, float64, float64)
 ```
 
 **工作流程**：
-1. **Reduce**：提取窗口内的数据
-2. **Merge**：计算速率值
-3. **Update**：更新状态（如记录前一个值用于下一次计算）
+1. **Reduce（`fr`）**：提取窗口内的首尾时间/值
+2. **Merge（`fm`）**：基于首尾点与外推参数计算 rate/delta
+3. **Update（`fu`）**：跨 record 时更新保存的首尾点状态
 
 ### I.2 CoProcessor 协处理器
 
 ```mermaid
 sequenceDiagram
     participant Transform as StreamAggregateTransform
-    participant CP as CoProcessor
-    participant R0 as Routine[0]<br/>(sum)
-    participant R1 as Routine[1]<br/>(count)
-    participant Out as 输出 Record
+    participant CP as CoProcessorImpl
+    participant R0 as RoutineImpl[0]
+    participant D0 as floatIncAggReducer
 
     Transform->>CP: WorkOnRecord(inRecord, outRecord, params)
-    CP->>R0: Reduce(inRecord, params)
-    R0-->>CP: sum 增量结果
-
-    CP->>R1: Reduce(inRecord, params)
-    R1-->>CP: count 增量结果
-
-    Note over CP: 多 record 场景下进行 Merge
-
-    CP->>R0: Merge(prevSum, currSum)
-    R0-->>CP: 合并后的 sum
-
-    CP->>R1: Merge(prevCount, currCount)
-    R1-->>CP: 合并后的 count
-
-    CP->>R0: WorkOnRecord → 写入 outRecord
-    CP->>R1: WorkOnRecord → 写入 outRecord
+    CP->>R0: WorkOnRecord(inRecord, outRecord, params)
+    R0->>D0: Aggregate(endPoint, params)
+    D0-->>R0: 写入 outRecord
+    R0-->>CP: 返回
     CP-->>Transform: 处理完成
 ```
 
 ```go
-// CoProcessor 管理多个 Routine 的协同执行
-type CoProcessor struct {
-    routines []Routine
+type CoProcessor interface {
+	WorkOnRecord(*record.Record, *record.Record, *ReducerParams)
 }
 
-func (cp *CoProcessor) WorkOnRecord(inRecord, outRecord *record.Record, params *ReducerParams) {
-    for _, routine := range cp.routines {
-        routine.WorkOnRecord(inRecord, outRecord, params)
-    }
+type CoProcessorImpl struct {
+	Routines []Routine
+}
+
+func (p *CoProcessorImpl) AppendRoutine(routines ...Routine) {
+	p.Routines = append(p.Routines, routines...)
+}
+
+func (p *CoProcessorImpl) WorkOnRecord(in *record.Record, out *record.Record, params *ReducerParams) {
+	for _, r := range p.Routines {
+		r.WorkOnRecord(in, out, params)
+	}
 }
 ```
 
@@ -4153,15 +4489,16 @@ func (cp *CoProcessor) WorkOnRecord(inRecord, outRecord *record.Record, params *
 
 ```go
 type ReducerParams struct {
-    intervalIndex []uint16     // 区间索引对
-    step          int64        // 步长
-    firstStep     int64        // 当前记录的第一个步长
-    lookBackDelta int64        // 回溯窗口
-    offset        int64        // 时间偏移
-    rangeDuration int64        // 范围时长
-    sameWindow    bool         // 是否与下一个 record 同窗口
-    lastRec       bool         // 是否是最后一个 record
-    lastStep      int64        // 最后一个步长
+	multiCall     bool
+	sameWindow    bool
+	lastRec       bool
+	firstStep     int64
+	lastStep      int64
+	step          int64
+	offset        int64
+	rangeDuration int64
+	lookBackDelta int64
+	intervalIndex []uint16
 }
 ```
 
@@ -4214,29 +4551,46 @@ message Sample {
 ### J.2 timeSeries2Rows 转换
 
 ```go
-func timeSeries2Rows(mst string, rows []models.Row, tss []prompb.TimeSeries, inValidTs map[int]bool) ([]models.Row, error) {
-    for i, ts := range tss {
-        if inValidTs[i] { continue }
-        // 将 labels 转换为 tags
-        tags := make(models.Tags, 0, len(ts.Labels))
-        for _, label := range ts.Labels {
-            tags = append(tags, models.NewTag([]byte(label.Name), []byte(label.Value)))
-        }
-        // 将 samples 转换为 points
-        for _, sample := range ts.Samples {
-            row := &rows[rowIndex]
-            row.Tags = tags
-            row.Name = mst  // 使用 __name__ 或 MetricStore 名称
-            row.Timestamp = sample.Timestamp * int64(time.Millisecond)  // 毫秒转纳秒
-            row.Fields = models.Fields{
-                {NumValue: sample.Value},  // 默认字段名 "value"
-            }
-            rowIndex++
-        }
-    }
-    return rows, nil
+func timeSeries2Rows(mst string, dst []influx.Row, tss []prompb2.TimeSeries, invalidTss map[int]bool) ([]influx.Row, error) {
+	var i int
+	for tsIdx, ts := range tss {
+		if invalidTss[tsIdx] {
+			continue
+		}
+		dst[i].ResizeTags(len(ts.Labels))
+		tags := dst[i].Tags
+		tags, mst = unmarshalPromTags(tags, ts)
+		for j, s := range ts.Samples {
+			// convert and append
+			dst[i].Timestamp = s.Timestamp * int64(time.Millisecond)
+			dst[i].Name = mst
+			if j == 0 {
+				dst[i].Tags = tags
+			} else {
+				dst[i].CloneTags(tags)
+			}
+			if cap(dst[i].Fields) > 0 {
+				dst[i].Fields = dst[i].Fields[:1]
+				dst[i].Fields[0].Type = influx.Field_Type_Float
+				dst[i].Fields[0].Key = promql2influxql.DefaultFieldKey
+				dst[i].Fields[0].NumValue = s.Value
+			} else {
+				dst[i].Fields = []influx.Field{
+					influx.Field{
+						Type:     influx.Field_Type_Float,
+						Key:      promql2influxql.DefaultFieldKey,
+						NumValue: s.Value,
+					},
+				}
+			}
+			i++
+		}
+	}
+	return dst, nil
 }
 ```
+
+> 说明：`unmarshalPromTags`（`handler_prom_util.go:353-364`）在遍历 labels 时把 `__name__` 的值取作 measurement 名；若没有 `__name__`，measurement 使用 `DefaultMeasurementName`。
 
 ### J.3 Remote Read 协议
 
@@ -4277,46 +4631,74 @@ message QueryResult {
 
 ```go
 func ReadRequestToInfluxQuery(req *prompb.ReadRequest, mst string) (string, error) {
-    queries := make([]string, 0, len(req.Queries))
-    for _, q := range req.Queries {
-        var measurement string
-        var conditions []string
-        for _, matcher := range q.Matchers {
-            if matcher.Name == "__name__" {
-                measurement = matcher.Value
-            } else {
-                // 转换标签匹配器为 WHERE 条件
-                switch matcher.Type {
-                case prompb.LabelMatcher_EQ:
-                    conditions = append(conditions, fmt.Sprintf("%s = '%s'", matcher.Name, matcher.Value))
-                case prompb.LabelMatcher_NEQ:
-                    conditions = append(conditions, fmt.Sprintf("%s != '%s'", matcher.Name, matcher.Value))
-                case prompb.LabelMatcher_RE:
-                    conditions = append(conditions, fmt.Sprintf("%s =~ /%s/", matcher.Name, matcher.Value))
-                case prompb.LabelMatcher_NRE:
-                    conditions = append(conditions, fmt.Sprintf("%s !~ /%s/", matcher.Name, matcher.Value))
-                }
-            }
-        }
-        if mst != "" {
-            measurement = mst  // 使用 MetricStore
-        }
-        start := time.UnixMilli(q.StartTimestampMs)
-        end := time.UnixMilli(q.EndTimestampMs)
-        query := fmt.Sprintf("SELECT value FROM %s WHERE time >= '%s' AND time <= '%s'",
-            measurement, start.Format(time.RFC3339), end.Format(time.RFC3339))
-        if len(conditions) > 0 {
-            query += " AND " + strings.Join(conditions, " AND ")
-        }
-        queries = append(queries, query)
-    }
-    return strings.Join(queries, ";"), nil
+	var readRequest string
+	for _, q := range req.Queries {
+		if err := validation.ValidateQueryTimeRange(mst, time.UnixMilli(q.StartTimestampMs), time.UnixMilli(q.EndTimestampMs)); err != nil {
+			return "", err
+		}
+
+		if s, err := buildCommand(q, mst); err != nil {
+			return "", err
+		} else {
+			readRequest += ";" + s
+		}
+	}
+	if len(readRequest) != 0 {
+		return readRequest[1:], nil
+	}
+	return "", nil
+}
+
+func buildCommand(q *prompb.Query, mst string) (string, error) {
+	matchers := make([]string, 0, len(q.Matchers))
+	// If we don't find a metric name matcher, query all metrics
+	// (InfluxDB measurements) by default.
+	from := "FROM /.+/"
+	haveMetricStore := len(mst) > 0
+	if haveMetricStore {
+		from = fmt.Sprintf("FROM %s", mst)
+	}
+	for _, m := range q.Matchers {
+		if !haveMetricStore && m.Name == model.MetricNameLabel {
+			switch m.Type {
+			case prompb.LabelMatcher_EQ:
+				from = fmt.Sprintf("FROM %q", m.Value)
+			case prompb.LabelMatcher_RE:
+				from = fmt.Sprintf("FROM /%s/", escapeSlashes(m.Value))
+			default:
+				// TODO: Figure out how to support these efficiently.
+				return "", errors.New("non-equal or regex-non-equal matchers are not supported on the metric name yet")
+			}
+			continue
+		}
+
+		switch m.Type {
+		case prompb.LabelMatcher_EQ:
+			matchers = append(matchers, fmt.Sprintf("%q = '%s'", m.Name, escapeSingleQuotes(m.Value)))
+		case prompb.LabelMatcher_NEQ:
+			matchers = append(matchers, fmt.Sprintf("%q != '%s'", m.Name, escapeSingleQuotes(m.Value)))
+		case prompb.LabelMatcher_RE:
+			matchers = append(matchers, fmt.Sprintf("%q =~ /%s/", m.Name, escapeSlashes(m.Value)))
+		case prompb.LabelMatcher_NRE:
+			matchers = append(matchers, fmt.Sprintf("%q !~ /%s/", m.Name, escapeSlashes(m.Value)))
+		default:
+			return "", errors.New("unknown match type")
+		}
+	}
+	matchers = append(matchers, fmt.Sprintf("time >= %v", q.StartTimestampMs*1e6))
+	matchers = append(matchers, fmt.Sprintf("time <= %v", q.EndTimestampMs*1e6))
+
+	return fmt.Sprintf("SELECT value %s WHERE %v GROUP BY *", from, strings.Join(matchers, " AND ")), nil
 }
 ```
+
+> 两段代码分别位于 `lib/util/lifted/influx/httpd/handler.go:2415-2432` 与 `handler.go:2365-2405`。时间是 `StartTimestampMs*1e6` 的纳秒整数，不是 RFC3339；`__name__` 匹配器用于生成 `FROM`，不会写成普通标签条件；生成结果固定带 `GROUP BY *`。
 
 ## 附录 K：PromQL 兼容性矩阵
 
 ### K.1 已支持的 PromQL 特性
+
+> 说明：下表中的“完全支持”表示对应代码路径已实现；本次审计未逐项验证其与 Prometheus 的语义等价性。
 
 | 特性 | 支持状态 | 说明 |
 |------|---------|------|
@@ -4452,7 +4834,7 @@ var arithBinOps = map[parser.ItemType]influxql.Token{
 | `parser.Call` | `influxql.SelectStatement` + `influxql.Call` | 函数名映射 + 参数传递 |
 | `parser.SubqueryExpr` | `influxql.SelectStatement` | 递归 + 时间参数调整 |
 | `parser.ParenExpr` | `influxql.ParenExpr` | 直接映射 |
-| `parser.UnaryExpr` | `influxql.BinaryExpr` | 转换为 0 - expr |
+| `parser.UnaryExpr` | `influxql.BinaryExpr` | SUB 取负（字面量取负，或 `-1 * expr`）；ADD 原样返回 |
 | `parser.StepInvariantExpr` | 透传内部表达式 | 设置 duplicateResult |
 
 ### M.2 InfluxQL SelectStatement 字段详解
@@ -4606,11 +4988,26 @@ openGemini 的实现严格遵循这些语义：
 
 PromQL 的 rate/increase 函数需要处理 counter reset（计数器重置为 0）：
 - 当检测到当前值小于前一个值时，认为发生了 counter reset
-- reset 时的增量 = 当前值 + (前一个值的最大值 - 前一个值) = 当前值
+- 计算方式：先令 `reduceResult = lastValue - firstValue`，再扫描窗口内相邻点，每次 `cur < prev` 就把 `prev` 加回 `reduceResult`（把 reset 前的累计量补上）。例如 `100, 200, 150, 250, 350`：`350-100=250`，在 150<200 处再加 200，得到 450
 
 ```go
 // CalcReduceResult 中的 counter reset 处理
-firstTime, lastTime, firstValue, _, reduceResult := executor.CalcReduceResult(prevT, currT, prevV, currV, isCounter)
+reduceResult := lastValue - firstValue
+if isCounter {
+	prev := firstValue
+	for _, cur := range prevV {
+		if cur < prev {
+			reduceResult += prev
+		}
+		prev = cur
+	}
+	for _, cur := range currV {
+		if cur < prev {
+			reduceResult += prev
+		}
+		prev = cur
+	}
+}
 ```
 
 ### O.4 外推语义

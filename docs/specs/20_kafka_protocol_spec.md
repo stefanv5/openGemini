@@ -1,5 +1,7 @@
 # Module 20: Kafka 协议兼容层深度审计报告（庖丁解牛版）
 
+> 代码基线：`origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）。本文所有 `file:line` 均以该提交为准（快照 `snapshots/spec-md-chinese`）。
+
 > openGemini 实现了 **Kafka 协议兼容层**，允许标准 Kafka 客户端像读取 Kafka Topic 一样读取 openGemini 中的数据。注意：这不是"从 Kafka 消费数据"，而是"用 Kafka 协议暴露 openGemini 数据"。
 
 ---
@@ -34,8 +36,8 @@ graph TB
         A["TCP Server<br/>默认端口 9092"]
         B["Reader<br/>读取 Kafka 二进制消息"]
         C["HandlerManager<br/>API 路由"]
-        D["FetchHandler"]
-        E["MetadataHandler"]
+        D["FetchHandleV2"]
+        E["MetaDataV1"]
         F["其他 Handler (stub)"]
     end
 
@@ -52,7 +54,7 @@ graph TB
 
 | API | 版本 | 状态 | 说明 |
 |-----|------|------|------|
-| Fetch | v2 | **完整实现** | 读取数据（核心功能） |
+| Fetch | v2 | 仅最简路径 | 读取数据（单 topic / 单 partition，忽略请求 offset） |
 | Metadata | v1 | **完整实现** | 返回 topic/broker 信息 |
 | ListOffsets | v1 | Stub | 始终返回 offset=0 |
 | OffsetCommit | v2 | Stub | 始终返回成功 |
@@ -65,6 +67,8 @@ graph TB
 > `factory.RegisterV1(handle.HeartBeat, func() handle.Handler { return NewHeartbeatV0() })`。
 > 这里的 `NewHeartbeatV0` 是构造函数命名不一致；协议注册和 `ApiVersions` 暴露的是 Heartbeat v1。
 
+Fetch 实现边界：`FetchHandleV2` 只取 `req.Topics[0]` 和 `req.Partitions[0]`，`RequestFetchV2` 里的 `Offset`、`MinBytes`、`MaxBytes`、`MaxWaitTime` 均未使用；返回的 `FirstOffset` 来自服务端自增的 `h.offset`（`services/consume/fetch.go:68-103`）。
+
 ---
 
 ## 3. Fetch 流程详解
@@ -75,18 +79,19 @@ graph TB
 sequenceDiagram
     participant Client as Kafka Client
     participant Server as TCP Server
-    participant Fetch as FetchHandler
+    participant Fetch as FetchHandleV2
     participant Proc as Processor
+    participant Meta as MetaClient
     participant Engine as Engine
 
     Client->>Server: FetchRequest(topic="SELECT mean(value) FROM cpu GROUP BY time(1m)")
     Server->>Server: 解析 Kafka 二进制协议
-    Server->>Fetch: HandlerManager 路由到 FetchHandler
+    Server->>Fetch: HandlerManager 路由到 FetchHandleV2
 
-    Fetch->>Proc: Init(topic)
+    Fetch->>Proc: Init(topic)（仅当 IteratorSize()==0）
     Proc->>Proc: influxql.ParseQuery(topic.Query)
-    Proc->>Proc: MetaClient.Measurement(db, rp, mst)
-    Proc->>Engine: CreateConsumeIterator(stmt, opt)
+    Proc->>Meta: Measurement(db, rp, mst)
+    Proc->>Engine: CreateConsumeIterator(db, mst, opts)
     Engine-->>Proc: record.Iterator
 
     loop 每次 Fetch 最多返回一个 ConsumeRecord
@@ -98,6 +103,8 @@ sequenceDiagram
 ```
 
 > 代码细节：`services/consume/fetch.go` 中 `MessageCount = 1`，`Process()` 找到第一条可返回记录后就结束本次 Fetch；如果当前 iterator 全部读完，`Processor.IteratorReset()` 会释放并清空 iterator，下一次 Fetch 再重新初始化。
+>
+> offset 语义：`h.offset` 由服务端自增并写入 `FirstOffset`，`HighwaterMarkOffset = h.offset + 1`（`services/consume/fetch.go:93-102`）；请求里的 `fetch_offset` 不参与定位，迭代器重置后数据会从头重复返回，而 offset 不回退。
 
 ### 3.2 核心代码
 
@@ -131,8 +138,10 @@ func (h *FetchHandleV2) Handle(header protocol.RequestHeader, body []byte, onMes
   consume-enabled = false          # 默认关闭
   consume-host = "127.0.0.1"
   consume-port = 9092              # Kafka 默认端口
-  consume-max-read-size = 1048576  # 1MB 最大请求大小
+  consume-max-read-size = "1m"     # 1MB 最大请求大小
 ```
+
+以上为默认值（`lib/config/consume.go:34-41`）；仓库配置 `config/openGemini.conf:334-338` 中 `consume-host` 为 `{{addr}}`、`consume-max-read-size` 为 `"1m"`（该字段类型是 `toml.Size`，按带单位字符串解析）。
 
 **代码位置**：`app/ts-store/run/server.go:273-274` 只有 `s.config.Data.Consume.ConsumeEnable` 为 true 时才启动 `consume.NewService(...)`；`services/consume/service.go:74-77` 从 `config.GetStoreConfig().Consume` 读取 host、port 和最大读取大小。
 
@@ -165,7 +174,7 @@ query_topic = 'SELECT mean(value) FROM cpu WHERE time > now() - 1h GROUP BY time
 
 | 设计 | 目的 | 效果 |
 |------|------|------|
-| Kafka 协议兼容 | 复用 Kafka 生态工具 | 无缝对接 Kafka 客户端 |
+| Kafka 协议兼容 | 复用 Kafka 生态工具 | 可对接低阶 Fetch/Metadata 客户端（不支持 consumer group） |
 | Topic = SQL 查询 | 灵活的数据访问 | 支持任意 InfluxQL 查询 |
 | Stub API | 客户端兼容性 | Kafka 客户端不报错 |
 | 默认关闭 | 安全性 | 不暴露不必要的端口 |

@@ -1,5 +1,7 @@
 # Module 12: Cluster Migration / Rebalance State Machine 深度审计报告（庖丁解牛版 v3）
 
+> 基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）；代码快照：`_spec_verify_20260616/snapshots/spec-md-chinese`。
+
 > 时序图优先，逐步拆解。每个流程都有 Mermaid 时序图 + 核心代码逐行解释。
 
 ---
@@ -157,7 +159,7 @@ type MigrateStateMachine struct {
     wg              sync.WaitGroup           // 等待 retry 和 recover 协程结束
     recoverNotify chan struct{}              // 恢复完成通知 channel
     eventMapMu    sync.RWMutex
-    eventMap      map[string]MigrateEvent    // 事件去重 map，key = eventId (db.ptId)
+    eventMap      map[string]MigrateEvent    // 事件去重 map，key = eventId (db$ptId)
     eventsWg      sync.WaitGroup            // 等待所有事件处理完成
     logger *logger.Logger
 }
@@ -181,8 +183,9 @@ stateDiagram-v2
     [*] --> Stopped: 初始化
     Stopped --> Running: Start()
     Running --> Stopping: Stop()
-    Stopping --> Stopped: 所有事件完成
     Stopping --> Running: Start() (Leader 切换)
+
+    note right of Stopping: Stop() 完成后仍停留在 Stopping<br/>不会自动回到 Stopped
 
     state Running {
         [*] --> Recovering: recoverStateMachine()
@@ -200,16 +203,16 @@ stateDiagram-v2
 type MSMState int
 
 const (
-    Stopped  = iota  // 0: 已停止
+    Stopped  = iota  // 0: 初始值
     Running          // 1: 运行中
     Stopping         // 2: 正在停止
 )
 ```
 
 **通俗解释**：
-- **Stopped**：初始状态，或主动停止后的状态
+- **Stopped**：仅作为初始零值；`Stop()` 只写 `Stopping`，不会回到该状态
 - **Running**：正常运行，可以处理迁移事件
-- **Stopping**：正在停止，等待当前事件完成
+- **Stopping**：正在停止，等待当前事件完成；停止完成后仍停留在该状态，直到再次 `Start()`
 
 ---
 
@@ -586,7 +589,7 @@ type MigrateEvent interface {
     exhaustRetries() bool                 // 是否耗尽重试次数
 
     // 事件标识
-    getEventId() string                   // 事件唯一标识 (db.ptId)
+    getEventId() string                   // 事件唯一标识 (db$ptId)
     getOpId() uint64                      // 操作 ID
     setOpId(opId uint64)
     getEventType() EventType              // AssignType / MoveType
@@ -617,6 +620,8 @@ type MigrateEvent interface {
     String() string
 }
 ```
+
+> 注：以上接口按职责重排展示，方法集合与源码一致；源码顺序见 `app/ts-meta/meta/migrate_event.go:25-59`。
 
 ---
 
@@ -672,7 +677,7 @@ type BaseEvent struct {
     processed   bool              // 是否已被处理过（未处理则不从 store 删除）
     retryNum    int               // 重试计数
 
-    eventId   string              // 事件标识 = db.ptId
+    eventId   string              // 事件标识 = db$ptId
     operateId uint64              // 操作 ID（由 store 分配）
 
     eventType EventType           // AssignType / MoveType
@@ -933,7 +938,7 @@ const (
     MovePreOffload         MoveState = 1   // 预卸载（通知源节点准备）
     MoveRollbackPreOffload MoveState = 2   // 回滚预卸载（预分配失败时回滚源节点）
     MovePreAssign          MoveState = 3   // 预分配（通知目标节点准备）
-    MoveRollbackPreAssign  MoveState = 4   // 回滚预分配（卸载失败时回滚目标节点）
+    MoveRollbackPreAssign  MoveState = 4   // 回滚预分配（preAssign 失败时在 store 侧回滚）
     MoveOffload            MoveState = 5   // 卸载（源节点释放 PT）
     MoveOffloadFailed      MoveState = 6   // 卸载失败
     MoveOffloaded          MoveState = 7   // 已卸载（源节点已释放）
@@ -950,7 +955,7 @@ const (
 | 1 | MovePreOffload | 预卸载（通知源节点准备） | src |
 | 2 | MoveRollbackPreOffload | 回滚预卸载（预分配失败时） | src |
 | 3 | MovePreAssign | 预分配（通知目标节点准备） | dst |
-| 4 | MoveRollbackPreAssign | 回滚预分配（卸载失败时） | dst |
+| 4 | MoveRollbackPreAssign | 回滚预分配（preAssign 失败时；当前 meta 未使用） | dst |
 | 5 | MoveOffload | 卸载（源节点释放 PT） | src |
 | 6 | MoveOffloadFailed | 卸载失败 | 本地 |
 | 7 | MoveOffloaded | 已卸载（源节点已释放） | 本地 |
@@ -984,10 +989,11 @@ stateDiagram-v2
         MoveAssign --> MoveAssignFailed: 失败
     }
 
-    MoveAssigned --> MoveFinal: assignedHandler()
+    MoveAssigned --> [*]: assignedHandler() → ActionFinish
     MoveFinal --> [*]: finalHandler()
     MoveAssignFailed --> [*]: 默认 ActionError；仅 needIsolate=true 时隔离 PT
 
+    note right of MoveFinal: 仅由 MoveRollbackPreOffload 回滚成功进入
     note right of MoveRollbackPreAssign: meta moveHandlerMap 不包含该状态<br/>当前 meta stateTransition 不会进入它
 ```
 
@@ -1216,6 +1222,9 @@ func (e *MoveEvent) stateTransition(err error) {
             break
         }
         nextState = meta.MoveOffloaded          // 回滚失败 → 标记已卸载
+
+    default:
+        logger.GetLogger().Error("Fail to transit the state, state is invalid", zap.String("event", e.String()))
     }
 
     e.rollbackState = e.preState
@@ -1328,6 +1337,7 @@ func (s *Store) balanceDBPts() []*MoveEvent {
     sort.Strings(dbLst)
     for _, db := range dbLst {
         if err := s.data.CheckCanMoveDb(db); err != nil {
+            // ...
             continue  // 跳过不可迁移的数据库
         }
         dbInfo := s.data.GetDBBriefInfo(db)
@@ -1467,6 +1477,7 @@ func (s *Store) balanceOneDBPts(db string, aliveNodes *[]uint64,
     st := time.Now()
     bbd := dbBalanceBasicData{dbName: db, aliveDns: aliveNodes}
     if err := s.genDBBalanceBasicData(&bbd); err != nil {
+        // ...
         return nil
     }
 
@@ -1477,6 +1488,7 @@ func (s *Store) balanceOneDBPts(db string, aliveNodes *[]uint64,
     // 创建 MoveEvent
     moveEvents = s.addMovePtTasks(db, &tasks, moveEvents, dbBriefInfo)
 
+    // ...
     return moveEvents
 }
 ```
@@ -1817,7 +1829,7 @@ func (cm *ClusterManager) resendPreviousEvent(from eventFrom) {
 ```
 
 **逐行解释**：
-- **第 193-195 行**：更新 `memberIds`，记录存活的节点
+- **第 189-192 行**：更新 `memberIds`，记录存活的节点
 - **第 196-197 行**：从 `eventMap` 中查找该节点的最新事件
 - **第 199-206 行**：如果事件已经处理过（状态匹配），跳过
 - **第 209-210 行**：否则重放事件，确保 Leader 切换期间的事件不丢失
@@ -2118,7 +2130,7 @@ const maxRetryNum = 100
 
 ### 10.2 事件去重 key 碰撞风险
 
-**问题**：`eventMap` 的 key 是 `eventId = db.ptId`，但同一个 PT 可能同时有 AssignEvent 和 MoveEvent。
+**问题**：`eventMap` 的 key 是 `eventId = db$ptId`，但同一个 PT 可能同时有 AssignEvent 和 MoveEvent。
 
 **核心代码**：`app/ts-meta/meta/migrate_state_machine.go:398-421`
 
@@ -2137,7 +2149,7 @@ return errno.NewError(errno.ConflictWithEvent)  // 冲突
 - 当前设计是"后者被拒绝"，但可能丢失重要的迁移任务
 
 **建议**：
-- key 中加入事件类型：`eventId = db.ptId.eventType`
+- key 中加入事件类型：`eventId = db$ptId$eventType`
 - 或者实现事件优先级队列
 
 ---
@@ -2155,6 +2167,9 @@ if e == nil || uint64(e.EventTime) < dataNodes[i].LTime {
 }
 if uint64(e.EventTime) == dataNodes[i].LTime {
     if e.Type == serf.EventMemberJoin && dataNodes[i].Status == serf.StatusAlive {
+        continue
+    }
+    if e.Type == serf.EventMemberFailed && dataNodes[i].Status == serf.StatusFailed {
         continue
     }
 }
@@ -2178,11 +2193,16 @@ if uint64(e.EventTime) == dataNodes[i].LTime {
 
 ```go
 bbd.aliveDnNum = len(*bbd.aliveDns)
+bbd.halfPtId = bbd.totalNumOfPt / 2
+bbd.highLvlNum = bbd.totalNumOfPt % bbd.aliveDnNum
+avgPtNum := bbd.totalNumOfPt / bbd.aliveDnNum
 bbd.min = avgPtNum                        // 假设所有节点能力相同
-bbd.max = avgPtNum
 if bbd.highLvlNum > 0 {
     avgPtNum += 1
 }
+bbd.max = avgPtNum
+bbd.ptTHNum = avgPtNum/2 + avgPtNum%2
+bbd.minOfLH = bbd.halfPtId / bbd.aliveDnNum
 ```
 
 **风险**：
@@ -2376,7 +2396,7 @@ sequenceDiagram
     Note over Event: MovePreAssign → MoveRollbackPreOffload
 
     MSM->>Event: getNextAction()
-    Note over Event: MoveRollbackPreOffload → rollbackHandler()
+    Note over Event: MoveRollbackPreOffload → moveRollbackPreOffloadHander()
     MSM->>Src: MigratePt(Node1, RollbackPreOffload)
     
     alt 源节点存活
@@ -2431,7 +2451,7 @@ graph TB
     User -->|MOVE PT| BM
 
     CM -->|processFailedDbPt| MSM
-    BM -->|assignDbPt / moveDbPt| MSM
+    BM -->|assignDbPt / forceMoveDbPt| MSM
 
     MSM -->|executeEvent| AE
     MSM -->|executeEvent| ME
@@ -2489,7 +2509,7 @@ graph TB
 | 1 | MovePreOffload | 预卸载（通知源节点准备） |
 | 2 | MoveRollbackPreOffload | 回滚预卸载（预分配失败时回滚源节点） |
 | 3 | MovePreAssign | 预分配（通知目标节点准备） |
-| 4 | MoveRollbackPreAssign | 回滚预分配（卸载失败时回滚目标节点） |
+| 4 | MoveRollbackPreAssign | 回滚预分配（preAssign 失败时在 store 侧回滚；当前 meta 未使用） |
 | 5 | MoveOffload | 卸载（源节点释放 PT） |
 | 6 | MoveOffloadFailed | 卸载失败 |
 | 7 | MoveOffloaded | 已卸载（源节点已释放） |
@@ -2619,7 +2639,7 @@ if !e.inRecover {
 // 第 99 行：marshalEvent — 将 AssignEvent 序列化为 protobuf
 func (e *AssignEvent) marshalEvent() *mproto.MigrateEventInfo {
     return &mproto.MigrateEventInfo{
-        EventId:       proto.String(e.eventId),          // "db.ptId"
+        EventId:       proto.String(e.eventId),          // "db$ptId"
         EventType:     proto.Int(int(e.eventType)),      // AssignType = 0
         Pti:           e.pt.Marshal(),                   // PT 信息（protobuf）
         CurrState:     proto.Int(e.getCurrState()),      // 当前状态值
@@ -2958,30 +2978,43 @@ WriteAvailableFirst 策略的核心思想是"等待原节点恢复"：
 
 ```go
 // 第 479 行：getTakeOverNodeForSS — SharedStorage 策略的接管节点选择
-func getTakeOverNodeForSS(cm *ClusterManager, oid uint64,
-    nodePtNumMap *map[uint64]uint32, isRetry bool) (uint64, error) {
-
+func getTakeOverNodeForSS(cm *ClusterManager, oid uint64, nodePtNumMap *map[uint64]uint32, isRetry bool) (uint64, error) {
     cm.mu.RLock()
     _, ok := cm.memberIds[oid]
     cm.mu.RUnlock()
     if ok && !isRetry {
-        return oid, nil  // 原节点存活且非重试，使用原节点
+        return oid, nil // if db pt owner node is alive assign to the owner id
     }
-
-    // 选择 PT 数量最少的节点
-    nodeId := cm.chooseNodeByPtNum(nodePtNumMap)
-    cm.mu.RLock()
-    if _, ok = cm.memberIds[nodeId]; ok {
+    nodeIds := make([]int, 0, len(*nodePtNumMap))
+    for id := range *nodePtNumMap {
+        nodeIds = append(nodeIds, int(id))
+    }
+    sort.Ints(nodeIds)
+    for {
+        if cm.isStopped() || cm.isClosed() {
+            break
+        }
+        nodeId := uint64(math.MaxUint64)
+        if len(*nodePtNumMap) > 0 {
+            if !isRetry {
+                nodeId = cm.chooseNodeByPtNum(nodePtNumMap)
+            } else {
+                nodeId = cm.chooseNodeRandom(nodeIds)
+            }
+        }
+        cm.mu.RLock()
+        if _, ok = cm.memberIds[nodeId]; ok {
+            cm.mu.RUnlock()
+            return nodeId, nil
+        }
+        for id := range cm.memberIds {
+            cm.mu.RUnlock()
+            return id, nil
+        }
         cm.mu.RUnlock()
-        return nodeId, nil
+        time.Sleep(time.Second)
+        logger.GetSuppressLogger().Warn("can not get take over node id, because no store alive")
     }
-    // 随机选择一个存活节点
-    for id := range cm.memberIds {
-        cm.mu.RUnlock()
-        return id, nil
-    }
-    cm.mu.RUnlock()
-    time.Sleep(time.Second)
     return 0, errno.NewError(errno.ClusterManagerIsNotRunning)
 }
 ```
@@ -2990,8 +3023,9 @@ func getTakeOverNodeForSS(cm *ClusterManager, oid uint64,
 
 SharedStorage 策略的核心思想是"负载均衡"：
 1. 如果原节点存活且非重试，优先使用原节点
-2. 否则选择 PT 数量最少的节点，实现负载均衡
-3. 如果首选节点不存活，随机选择一个存活节点
+2. 非重试时选择 PT 数量最少的节点（`chooseNodeByPtNum`），实现负载均衡
+3. 重试时从排序后的节点 ID 中随机选择（`chooseNodeRandom`）
+4. 若选中节点不在 `memberIds`，退回到任一存活节点；否则每秒重试，直到状态机停止
 
 ---
 
@@ -3113,7 +3147,7 @@ func (cm *ClusterManager) processReplication(dbPt *meta.DbPtInfo) error {
 **逐行解释**：
 - **第 632 行**：检查故障的 PT 是否是副本组的 Master
 - **第 633 行**：如果是 Master，调用 `electRgMaster` 选举新 Master
-- **第 635 行**：选举成功，更新副本组配置
+- **第 639 行**：选举成功，更新副本组配置
 
 ---
 
@@ -3164,8 +3198,8 @@ statistics.MetaDBPTStepDuration(
 |------|------|----------|
 | `migrate_state_machine.go` | ~460 | 状态机主体：启动/停止、事件调度、重试、恢复 |
 | `migrate_event.go` | ~234 | 接口定义、基类、通用方法 |
-| `assign_event.go` | ~260 | 分配事件：4 个状态、3 个处理器 |
-| `move_event.go` | ~325 | 迁移事件：11 个状态、11 个处理器 |
+| `assign_event.go` | ~260 | 分配事件：5 个状态、4 个处理器 |
+| `move_event.go` | ~325 | 迁移事件：12 个状态、11 个处理器（`MoveRollbackPreAssign` 未注册） |
 | `balance_store.go` | ~818 | 均衡算法：数据生成、PT 提取、任务分配 |
 | `cluster_manager.go` | ~690 | 集群管理：Gossip 事件处理、故障检测 |
 | **总计** | **~2787** | |
@@ -3180,11 +3214,15 @@ statistics.MetaDBPTStepDuration(
 
 ```go
 // 状态 → 处理器 的映射
-var assignHandlerMap = map[AssignState]func(e *AssignEvent) (NextAction, error){
-    Init:         initHandler,
-    StartAssign:  startAssignHandler,
-    AssignFailed: assignFailedHandler,
-    Assigned:     assignedHandler,
+var assignHandlerMap map[AssignState]func(e *AssignEvent) (NextAction, error)
+
+func init() {
+    assignHandlerMap = map[AssignState]func(e *AssignEvent) (NextAction, error){
+        Init:         initHandler,
+        StartAssign:  startAssignHandler,
+        AssignFailed: assignFailedHandler,
+        Assigned:     assignedHandler,
+    }
 }
 ```
 

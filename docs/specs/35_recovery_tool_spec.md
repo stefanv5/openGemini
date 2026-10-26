@@ -1,5 +1,7 @@
 # Module 35: 数据恢复工具（ts-recover）深度审计报告
 
+> 代码基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）；本文行号与代码摘录均以 `_spec_verify_20260616/snapshots/spec-md-chinese` 为准。
+
 > ts-recover 是 openGemini 的离线数据恢复 CLI 工具。当数据库因硬件故障、误操作或备份恢复场景需要从备份文件中还原数据时，ts-recover 负责将全量备份和增量备份的数据文件正确地恢复到 openGemini 数据目录中，并通过 HTTP API 通知 meta 节点同步元数据。
 
 ---
@@ -19,12 +21,12 @@ sequenceDiagram
     Backup-->>CLI: 备份文件列表 + 元数据
 
     CLI->>FS: 清理目标数据目录
-    CLI->>FS: 复制全量备份文件
+    CLI->>FS: 移动全量备份文件（rename）
     CLI->>FS: 应用增量备份（新增/删除）
     CLI->>FS: 恢复索引文件
 
     CLI->>Meta: HTTP POST /recoverMeta
-    Meta-->>CLI: 恢复元数据完成
+    Meta-->>CLI: HTTP 200（空 body）
 
     CLI-->>Admin: recover success !
 ```
@@ -33,13 +35,13 @@ sequenceDiagram
 ts-recover 就像一个"数据搬运工"。当数据库出问题时，它把备份目录中的文件按照正确的顺序搬回数据目录：
 1. **先看清单**：读取备份日志，知道有哪些文件需要恢复
 2. **清空场地**：清理目标数据目录，确保干净
-3. **搬全量**：把全量备份的文件复制过来
+3. **搬全量**：把全量备份的文件移动（rename）过来
 4. **补增量**：把增量备份中新增的文件加上，删除的文件去掉
 5. **通知总部**：告诉 meta 节点"数据恢复好了，请同步元数据"
 
 **核心设计目标**：
 1. **两种恢复模式**：全量恢复、全量 + 增量恢复
-2. **文件级原子性**：通过备份日志追踪每个文件的状态
+2. **基于文件清单的批量搬迁**：备份日志记录 measurement → 文件路径组清单；无事务/原子性保证，中断后状态不确定
 3. **安全保护**：默认拒绝覆盖已有数据，需 `--force` 显式确认
 4. **元数据同步**：通过 HTTP API 通知 meta 节点恢复元数据
 
@@ -49,7 +51,9 @@ ts-recover 就像一个"数据搬运工"。当数据库出问题时，它把备�
 
 ### 2.1 命令行参数
 
-**代码位置**：`app/ts-recover/main.go`
+**代码位置**：`app/ts-recover/recover/recover.go:37-47`（`RecoverConfig` 定义；`main.go:49` 只是引用 `recover.RecoverConfig`）
+
+> 注：以下行内注释为解读所加，源码仅有 `Host` 上方的 `// leader meta address`。
 
 ```go
 type RecoverConfig struct {
@@ -68,7 +72,7 @@ type RecoverConfig struct {
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `-dataDir` | string | "" (必填) | openGemini 数据目录路径 |
+| `-dataDir` | string | "" (必填) | openGemini 数据目录路径；必须与备份时的原始数据目录一致（它只用于拼出备份内检索根 `<backup>/data_backup/<DataDir>/data` 与 `--force` 删除对象，落地路径来自备份中记录的原始绝对路径） |
 | `-recoverMode` | string | "1" | 恢复模式：1=全量+增量，2=仅全量 |
 | `-fullBackupDataPath` | string | "" (必填) | 全量备份文件路径 |
 | `-incBackupDataPath` | string | "" (模式1必填) | 增量备份文件路径；一次只支持一个增量备份路径 |
@@ -129,7 +133,7 @@ func doRun(args ...string) error {
 ```
 
 **逐行解释**：
-- **第 29 行**：`doRun` 接受命令行参数，返回 error
+- **第 29 行**：`main` 调用 `doRun`；`doRun` 的定义在第 35 行（`func doRun(args ...string) error`）
 - **第 36 行**：`ParseFlags` 解析命令行参数；当前只校验 `dataDir`，不会在这里校验备份路径
 - **第 40 行**：`BackupRecover` 是恢复的核心入口
 - **第 43 行**：成功后打印 "recover success !"
@@ -170,21 +174,25 @@ sequenceDiagram
 ```go
 func BackupRecover(opt *RecoverConfig) error {
     if opt.FullBackupDataPath == "" {
-        return fmt.Errorf("missing required parameter: fullBackupDataPath")
+        return fmt.Errorf("`missing required parameter: fullBackupDataPath")
     }
     if opt.RecoverMode == "1" && opt.IncBackupDataPath == "" {
-        return fmt.Errorf("missing required parameter: incBackupDataPath")
+        return fmt.Errorf("`missing required parameter: incBackupDataPath")
     }
     var err error
     switch opt.RecoverMode {
-    case FullAndIncRecoverMode:    // "1"
+    case FullAndIncRecoverMode:
         err = runRecover(opt, true)
-    case FullRecoverMode:          // "2"
+    case FullRecoverMode:
         err = runRecover(opt, false)
     default:
         return fmt.Errorf("invalid recovermode")
     }
-    return err
+    if err != nil {
+        return err
+    }
+
+    return nil
 }
 ```
 
@@ -255,41 +263,55 @@ func runRecover(rc *RecoverConfig, isInc bool) error {
 
 ```go
 func getDatabases(rc *RecoverConfig) ([]string, error) {
-    // 读取全量备份的结果日志
     path := fileops.Join(rc.FullBackupDataPath, backup.BackupLogPath, backup.ResultLog)
+    if _, err := os.Stat(path); err != nil {
+        return nil, err
+    }
     fullRes := &backup.BackupResult{}
     if err := backup.ReadBackupLogFile(path, fullRes); err != nil {
         return nil, err
     }
+    databases := make([]string, 0, len(fullRes.DataBases))
 
     if rc.RecoverMode == FullRecoverMode {
-        // 仅全量模式：直接返回全量备份中的数据库列表
-        databases := make([]string, 0, len(fullRes.DataBases))
         for db := range fullRes.DataBases {
             databases = append(databases, db)
         }
         return databases, nil
     }
 
-    // 全量+增量模式：验证两个备份的数据库列表一致
+    path = fileops.Join(rc.IncBackupDataPath, backup.BackupLogPath, backup.ResultLog)
+    if _, err := os.Stat(path); err != nil {
+        return nil, err
+    }
     incRes := &backup.BackupResult{}
-    // ... 读取增量备份的结果日志 ...
+    if err := backup.ReadBackupLogFile(path, incRes); err != nil {
+        return nil, err
+    }
 
     if fullRes.Time > incRes.Time {
         return nil, errors.New("fullBackup time should earlier than incBackup")
     }
+
     if len(fullRes.DataBases) != len(incRes.DataBases) {
         return nil, errors.New("databases not equal in full Backup and inc Backup")
     }
-    // ... 验证每个数据库都存在 ...
+
+    for db := range fullRes.DataBases {
+        if _, ok := incRes.DataBases[db]; !ok {
+            return nil, errors.New("databases not equal in full Backup and inc Backup")
+        }
+        databases = append(databases, db)
+    }
+
     return databases, nil
 }
 ```
 
 **逐行解释**：
-- 读取备份结果日志获取数据库列表
+- 读取备份结果日志获取数据库列表；两处 `os.Stat(result)` 在文件缺失时直接返回错误
 - 全量模式直接返回
-- 增量模式需要验证：全量时间 < 增量时间，数据库列表一致
+- 增量模式需要验证：全量时间不得晚于增量时间（只有 `fullRes.Time > incRes.Time` 才报错，允许相等），数据库列表一致
 
 ### 4.3 数据文件恢复
 
@@ -312,8 +334,9 @@ sequenceDiagram
                 Check->>Clean: os.RemoveAll(dbPath)
             end
         end
-    else 恢复全部数据库
+    else dbs 为空（整库备份恢复的常态路径）
         Check->>Check: os.Stat(dataPath)
+        Note over Clean: RemoveAll 会删除整个 <DataDir>/data
         alt 数据目录存在且未 --force
             Check-->>RD: error: data file exist
         else --force
@@ -335,8 +358,7 @@ sequenceDiagram
 ```go
 func recoverData(rc *RecoverConfig, dbs []string, isInc bool) error {
     dataPath := filepath.Join(rc.DataDir, config.DataDirectory)
-
-    // 步骤 1: 检查并清理目标数据目录
+    // check clear data path
     if len(dbs) > 0 {
         for _, db := range dbs {
             p := filepath.Join(dataPath, db)
@@ -348,33 +370,51 @@ func recoverData(rc *RecoverConfig, dbs []string, isInc bool) error {
                 return err
             }
         }
+    } else {
+        _, err := os.Stat(dataPath)
+        if !rc.Force && err == nil {
+            return fmt.Errorf("data file exist.if you still recover,please use --force")
+        }
+        if err := os.RemoveAll(filepath.Join(dataPath)); err != nil {
+            return err
+        }
     }
 
-    // 步骤 2: 恢复全量备份
     copyFunc := copyWithFull
     if isInc {
         copyFunc = copyWithFullAndInc
     }
+
+    // recover full_backup
     fullBackupDataPath := filepath.Join(rc.FullBackupDataPath, backup.DataBackupDir, dataPath)
+    if _, err := os.Stat(fullBackupDataPath); err != nil {
+        return errors.New("backupDataPath empty")
+    }
     if err := traversalBackupLogFile(rc, fullBackupDataPath, copyFunc, isInc); err != nil {
         return err
     }
 
-    // 步骤 3: 恢复增量备份
     if !isInc {
         return nil
     }
+
+    // recover inc_backup
     incBackupDataPath := filepath.Join(rc.IncBackupDataPath, backup.DataBackupDir, dataPath)
+    if _, err := os.Stat(incBackupDataPath); err != nil {
+        fmt.Println("incBackupDataPath empty !")
+        return nil
+    }
     if err := traversalIncBackupLogFile(rc, incBackupDataPath); err != nil {
         return err
     }
+
     return nil
 }
 ```
 
 **逐行解释**：
 - **第 89-108 行**：安全检查 — 如果目标目录已存在且未指定 `--force`，拒绝覆盖
-- **第 110-111 行**：根据是否需要增量恢复选择复制函数
+- **第 110-113 行**：根据是否需要增量恢复选择复制函数
 - **第 116-122 行**：遍历全量备份日志，执行文件复制
 - **第 129-136 行**：如果是增量模式，遍历增量备份日志
 
@@ -382,7 +422,7 @@ func recoverData(rc *RecoverConfig, dbs []string, isInc bool) error {
 数据恢复就像"搬家"：
 1. **检查新房**：看看目标目录是否已有数据（安全保护）
 2. **清空新房**：如果指定了 `--force`，先清空目标目录
-3. **搬大家具**：把全量备份的文件复制过来
+3. **搬大家具**：把全量备份的文件移动（rename）过来
 4. **搬小物件**：如果是增量模式，把增量备份的变更也搬过来
 
 ---
@@ -418,29 +458,28 @@ func copyWithFull(rc *RecoverConfig, path string) error {
 **逐行解释**：
 - **第 282 行**：读取备份日志文件，获取文件列表
 - **第 287 行**：`FileListMap` 是 `map[string][][]string`，key 是 measurement 名，value 是文件路径组
-- **第 288-291 行**：`files[0]` 是源路径，其余是目标路径（一个文件可能有多个副本）
-- **第 289 行**：`backup.FileMove` 执行文件复制
+- **第 288-291 行**：`files[0]` 是数据文件的**原始绝对路径**（既用于拼出备份内源路径 `basicPath + files[0]`，也是第一个恢复目标）；`files[1..]` 是同一节点上对端分片目录的目标路径。由于 `FileMove` 是 rename，同一源被依次移动到多个目标时，第二个目标会因源已不存在而失败（潜在缺陷）
+- **第 291 行**：`backup.FileMove` 执行文件移动（内部为 `fileops.RenameFile → os.Rename`，不是复制）
 
 **具体例子**：
 
 ```
-备份日志内容：
+备份日志内容（落盘键名带 order 前缀，对应 Go 字段 FileListMap）：
 {
-  "FileListMap": {
+  "orderFileListMap": {
     "cpu": [
-      ["/backup/data/db0/0/cpu/00000001-0000-00000001.tssp",
-       "/var/lib/openGemini/data/db0/0/cpu/00000001-0000-00000001.tssp"]
+      ["/var/lib/openGemini/data/db0/0/cpu/00000001-0000-00000001.tssp"]
     ],
     "mem": [
-      ["/backup/data/db0/0/mem/00000001-0000-00000001.tssp",
-       "/var/lib/openGemini/data/db0/0/mem/00000001-0000-00000001.tssp"]
+      ["/var/lib/openGemini/data/db0/0/mem/00000001-0000-00000001.tssp"]
     ]
   }
 }
 
 恢复过程：
-  cpu 文件：/backup/.../cpu/00000001.tssp → /var/lib/.../cpu/00000001.tssp
-  mem 文件：/backup/.../mem/00000001.tssp → /var/lib/.../mem/00000001.tssp
+  源路径 = <FullBackupDataPath>/data_backup + files[0]
+  cpu 文件：/backup/full_20240101/data_backup/var/lib/openGemini/data/db0/0/cpu/00000001-0000-00000001.tssp
+         → /var/lib/openGemini/data/db0/0/cpu/00000001-0000-00000001.tssp（rename，备份侧源文件被搬走）
 ```
 
 ---
@@ -453,39 +492,35 @@ func copyWithFull(rc *RecoverConfig, path string) error {
 
 ```go
 func copyWithFullAndInc(rc *RecoverConfig, fullPath string) error {
-    // 构造增量备份日志路径
     p, _ := filepath.Split(strings.Replace(fullPath, rc.FullBackupDataPath, rc.IncBackupDataPath, -1))
     incPath := filepath.Join(p, backup.IncBackupLog)
-
-    // 检查增量备份日志是否存在
+    incBackupLog := &backup.IncBackupLogInfo{}
     _, err := fileops.Stat(incPath)
     if err != nil {
-        // 没有增量日志，退回到纯全量复制
         err = copyWithFull(rc, fullPath)
         return err
     }
-
-    // 读取增量备份日志
-    incBackupLog := &backup.IncBackupLogInfo{}
     if err := backup.ReadBackupLogFile(incPath, incBackupLog); err != nil {
         return err
     }
 
-    // 读取全量备份日志
     backupLog := &backup.BackupLogInfo{}
     if err := backup.ReadBackupLogFile(fullPath, backupLog); err != nil {
         return err
     }
 
-    // 合并文件列表：全量文件 - 增量删除文件
     err = mergeFileList(rc, backupLog.FileListMap, incBackupLog.DelFileListMap)
-    return err
+    if err != nil {
+        return err
+    }
+
+    return nil
 }
 ```
 
 **逐行解释**：
 - **第 302 行**：将全量备份路径替换为增量备份路径，找到对应的增量日志
-- **第 306-309 行**：如果增量日志不存在，退回纯全量复制
+- **第 305-309 行**：如果增量日志不存在（`fileops.Stat` 失败），退回纯全量复制
 - **第 319 行**：`mergeFileList` 合并文件列表，排除增量中标记为删除的文件
 
 ### 6.2 mergeFileList — 文件列表合并
@@ -544,25 +579,28 @@ func mergeFileList(rc *RecoverConfig, listMap, delListMap map[string][][]string)
 **具体例子**：
 
 ```
+落盘 JSON 键名：orderFileListMap / addOrderFileListMap / delOrderFileListMap
+（对应 Go 字段 FileListMap / AddFileListMap / DelFileListMap）
+
 全量备份（1月1日）：
-  FileListMap = {
+  orderFileListMap = {
     "cpu": [
-      ["cpu_001.tssp", "/data/cpu_001.tssp"],
-      ["cpu_002.tssp", "/data/cpu_002.tssp"],
-      ["cpu_003.tssp", "/data/cpu_003.tssp"]
+      ["/var/lib/openGemini/data/db0/0/cpu/00000001-0000-00000001.tssp"],
+      ["/var/lib/openGemini/data/db0/0/cpu/00000002-0000-00000001.tssp"],
+      ["/var/lib/openGemini/data/db0/0/cpu/00000003-0000-00000001.tssp"]
     ]
   }
 
 增量备份（1月2日）：
-  DelFileListMap = {
+  delOrderFileListMap = {
     "cpu": [
-      ["cpu_002.tssp"]    ← 1月2日删除了 cpu_002
+      ["/var/lib/openGemini/data/db0/0/cpu/00000002-0000-00000001.tssp"]    ← 1月2日删除了该文件
     ]
   }
 
 合并结果：
-  恢复文件：cpu_001.tssp, cpu_003.tssp
-  跳过文件：cpu_002.tssp（在增量删除列表中）
+  恢复文件：00000001-0000-00000001.tssp、00000003-0000-00000001.tssp
+  跳过文件：00000002-0000-00000001.tssp（在增量删除列表中）
 ```
 
 ### 6.3 copyWithInc — 增量文件复制
@@ -592,7 +630,7 @@ func copyWithInc(rc *RecoverConfig, incPath string) error {
 ```
 
 **逐行解释**：
-- `AddFileListMap` 记录增量备份中新增的文件
+- `AddFileListMap`（落盘键名 `addOrderFileListMap`）记录增量备份中新增的文件
 - 与 `copyWithFull` 类似，但只复制新增文件
 
 ---
@@ -616,7 +654,7 @@ sequenceDiagram
         Path-->>RD: 使用全量备份路径
     end
 
-    RD->>File: 读取 meta_backup/backup_log/meta_backup_log.json
+    RD->>File: 读取 <backupPath>/meta_backup/meta_info.json
     File-->>RD: metaData (JSON 字符串)
 
     RD->>HTTP: sendRequestToMeta(rc, dbs, metaData)
@@ -655,20 +693,23 @@ func sendRequestToMeta(rc *RecoverConfig, dbs []string, metaData string) error {
     if rc.SSL {
         protocol = "https"
     }
-
     urlValues := url.Values{}
-    urlValues.Add(backup.DataBases, strings.Join(dbs, ",")) // key: "dbs"
-    urlValues.Add(backup.MetaData, metaData)                 // key: "metaData"
+    urlValues.Add(backup.DataBases, strings.Join(dbs, ","))
+    urlValues.Add(backup.MetaData, metaData)
 
-    Url, _ := url.Parse(fmt.Sprintf("%s://%s/recoverMeta", protocol, rc.Host))
+    Url, err := url.Parse(fmt.Sprintf("%s://%s/recoverMeta", protocol, rc.Host))
+    if err != nil {
+        return err
+    }
     Url.RawQuery = urlValues.Encode()
 
     transport := &http.Transport{}
-    client := &http.Client{Transport: transport}
+    client := &http.Client{
+        Transport: transport,
+    }
     if rc.InsecureTLS {
         transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
     }
-
     res, err := client.PostForm(Url.String(), urlValues)
     if err != nil {
         return err
@@ -680,11 +721,11 @@ func sendRequestToMeta(rc *RecoverConfig, dbs []string, metaData string) error {
 
 **逐行解释**：
 - **第 159-161 行**：根据 SSL 配置选择 HTTP/HTTPS 协议
-- **第 163-165 行**：构造请求参数：数据库列表 + 元数据 JSON；实际参数 key 是 `dbs` 和 `metaData`
-- **第 168 行**：`Url.RawQuery = urlValues.Encode()` 会把参数放进 URL query
-- **第 173 行**：`client.PostForm(Url.String(), urlValues)` 又会把同一组参数放进 form body，因此 URL query 和 PostForm 都携带参数
-- **第 173-175 行**：如果配置了 `InsecureTLS`，跳过证书验证
-- **第 178-179 行**：发送 POST 请求到 meta 节点的 `/recoverMeta` 接口
+- **第 162-164 行**：构造请求参数：数据库列表 + 元数据 JSON；实际参数 key 是 `dbs` 和 `metaData`
+- **第 170 行**：`Url.RawQuery = urlValues.Encode()` 会把参数放进 URL query
+- **第 179 行**：`client.PostForm(Url.String(), urlValues)` 又会把同一组参数放进 form body，因此 URL query 和 PostForm 都携带参数；服务端 `recoverMeta` 只解析 `r.URL.Query()`，form body 实际被忽略（这也是参数必须放在 query 的原因）
+- **第 176-178 行**：如果配置了 `InsecureTLS`，跳过证书验证
+- **第 179-182 行**：发送 POST 请求到 meta 节点的 `/recoverMeta` 接口
 
 **具体例子**：
 
@@ -695,7 +736,7 @@ HTTP 请求：
 
   Body:
     dbs=prom,db0,db1
-    metaData={"metaIds":["1","2"],"isNode":true}
+    metaData={"MetaNodes":[...],"DataNodes":[...],"Databases":{...}}   ← meta.Data 的 JSON 快照
 
   URL query:
     ?dbs=prom%2Cdb0%2Cdb1&metaData=...
@@ -718,6 +759,7 @@ sequenceDiagram
     participant Copy as 复制函数
     participant Move as 文件移动
 
+    Trav->>Dir: os.Stat(path)（不存在即失败）
     Trav->>Dir: ReadDir(path)
 
     loop 遍历每个文件/目录
@@ -743,8 +785,13 @@ sequenceDiagram
 
 ```go
 func traversalBackupLogFile(rc *RecoverConfig, path string, fn RecoverFunc, isInc bool) error {
-    fds, err := fileops.ReadDir(path)
-    if err != nil {
+    var err error
+    var fds []fs.FileInfo
+
+    if _, err = os.Stat(path); err != nil {
+        return err
+    }
+    if fds, err = fileops.ReadDir(path); err != nil {
         return err
     }
 
@@ -781,7 +828,7 @@ func traversalBackupLogFile(rc *RecoverConfig, path string, fn RecoverFunc, isIn
 }
 ```
 
-全量+增量恢复时，遍历全量备份日志传入的 `isInc=true`，所以 full backup 里的 `index/` 不会在这一步移动；随后遍历增量备份时才会移动 inc backup 中的 index 相关内容。
+全量+增量恢复时，遍历全量备份日志传入的 `isInc=true`，所以 full backup 里的 `index/` 不会在这一步移动；随后遍历增量备份时才会移动 inc backup 中的 index 相关内容。**后果**：模式 1 下全量备份的索引在整个流程中没有任何一步会搬回——一旦增量备份里没有对应的 index 目录，恢复后就会「数据文件在、索引缺失」，这是该工具最需要提示的风险之一。
 
 ---
 
@@ -796,23 +843,24 @@ func traversalBackupLogFile(rc *RecoverConfig, path string, fn RecoverFunc, isIn
 数据目录：/var/lib/openGemini/
 
 全量备份内容：
-  /backup/full_20240101/data_backup/
-    data/var/lib/openGemini/data/prom/
+  /backup/full_20240101/
+    data_backup/var/lib/openGemini/data/prom/
       0/cpu/00000001-0000-00000001.tssp
       0/cpu/00000002-0000-00000001.tssp
-    data/var/lib/openGemini/data/db0/
+      0/backup_log/full_backup_log.json  ← 该 shard 的文件清单
+      0/<rp>/index/...                   ← 索引目录（随数据一起备份）
+    data_backup/var/lib/openGemini/data/db0/
       0/mem/00000001-0000-00000001.tssp
-    index/  ← 索引目录
-    backup_log/result.json  ← 备份结果
-    backup_log/full_backup_log.json  ← 文件列表
+      0/backup_log/full_backup_log.json
+    backup_log/result  ← 备份结果（BackupLogPath=/backup_log，ResultLog=result，无 .json 后缀）
 
 增量备份内容：
-  /backup/inc_20240102/data_backup/
-    data/var/lib/openGemini/data/prom/
+  /backup/inc_20240102/
+    data_backup/var/lib/openGemini/data/prom/
       0/cpu/00000003-0000-00000001.tssp  ← 新增
-    backup_log/inc_backup_log.json  ← 增量日志
-      AddFileListMap: { "cpu": [["cpu_003.tssp", ...]] }
-      DelFileListMap: { "cpu": [["cpu_002.tssp"]] }  ← 删除 cpu_002
+      0/backup_log/inc_backup_log.json  ← 增量日志
+        addOrderFileListMap: { "cpu": [["/var/lib/openGemini/data/prom/0/cpu/00000003-0000-00000001.tssp"]] }
+        delOrderFileListMap: { "cpu": [["/var/lib/openGemini/data/prom/0/cpu/00000002-0000-00000001.tssp"]] }  ← 删除 cpu_002
 ```
 
 ### 9.2 恢复时序图
@@ -824,7 +872,7 @@ sequenceDiagram
     participant Data as recoverData()
     participant Meta as recoverMeta()
 
-    CLI->>DB: 读取全量+增量 result.json
+    CLI->>DB: 读取全量+增量 backup_log/result
     DB-->>CLI: dbs = ["prom", "db0"]
 
     CLI->>Data: recoverData(rc, dbs, isInc=true)
@@ -837,15 +885,15 @@ sequenceDiagram
     Data->>Data: 遍历 full_backup_log.json
     Data->>Data: copyWithFullAndInc(fullPath)
     Note over Data: 合并全量文件列表与增量删除列表
-    Data->>Data: FileMove: cpu_001.tssp ✓
-    Data->>Data: 跳过: cpu_002.tssp（在删除列表中）
-    Data->>Data: FileMove: mem_001.tssp ✓
+    Data->>Data: FileMove: 00000001-0000-00000001.tssp ✓
+    Data->>Data: 跳过: 00000002-0000-00000001.tssp（在删除列表中）
+    Data->>Data: FileMove: 00000001-0000-00000001.tssp ✓
     Data->>Data: full index/ 不移动（full+inc 模式）
 
     Note over Data: ===== 步骤 3: 恢复增量备份 =====
     Data->>Data: 遍历 inc_backup_log.json
     Data->>Data: copyWithInc(incPath)
-    Data->>Data: FileMove: cpu_003.tssp ✓（新增文件）
+    Data->>Data: FileMove: 00000003-0000-00000001.tssp ✓（新增文件）
     Data->>Data: inc index/ 移动
 
     Note over Data: ===== 步骤 4: 移动日志文件 =====
@@ -870,10 +918,10 @@ sequenceDiagram
     prom/
       0/cpu/00000001-0000-00000001.tssp  ← 全量备份
       0/cpu/00000003-0000-00000001.tssp  ← 增量新增
-      // cpu_002.tssp 被增量删除，未恢复
+      # 00000002-0000-00000001.tssp 被增量删除，未恢复
+      0/<rp>/index/...                   ← 索引（模式 1 下来自增量备份）
     db0/
       0/mem/00000001-0000-00000001.tssp  ← 全量备份
-    index/  ← 索引目录
 ```
 
 ---
@@ -902,6 +950,8 @@ if !rc.Force && err == nil {
 ```
 
 ### 10.2 备份完整性验证
+
+**代码位置**：`app/ts-recover/recover/recover.go:401-407`
 
 ```go
 // 验证全量备份时间早于增量备份
@@ -933,17 +983,18 @@ sequenceDiagram
     participant CLI as ts-recover
     participant FS as 文件系统
 
-    CLI->>FS: 开始复制文件...
-    Note over CLI: 复制了 100 个文件后崩溃
+    CLI->>FS: 开始移动文件（rename）...
+    Note over CLI: 移动了 100 个文件后崩溃
 
     CLI-->>FS: 重启恢复
-    Note over CLI: 必须从头开始<br/>无法从第 101 个文件继续
+    Note over CLI: 备份目录已被搬空<br/>既无断点，也无法简单重跑
 ```
 
 **隐患**：
-- 恢复过程中如果中断，必须从头开始
+- `FileMove` 是 rename：每搬一个文件，备份目录里的源文件就消失了。中断后既没有断点记录，也不能简单「从头重跑」——已搬走的源文件会让重跑报 `no such file`
+- 备份与数据目录不在同一文件系统时，`os.Rename` 会返回 EXDEV，恢复直接失败
 - 对于大型数据库（TB 级），恢复时间可能很长
-- 建议：实现断点续传机制，记录已恢复的文件
+- 建议：改用「复制 + 校验 + 删除」并记录进度，实现断点续传
 
 ### 11.2 增量恢复的删除列表可能不完整
 
@@ -984,7 +1035,7 @@ sequenceDiagram
 | 设计 | 目的 | 效果 |
 |------|------|------|
 | 两种恢复模式 | 灵活的恢复策略 | 支持仅全量和全量+增量 |
-| 备份日志追踪 | 记录每个文件的状态 | 支持增量删除和新增 |
+| 备份日志清单 | 记录 measurement → 文件路径组 | 支持增量删除和新增（无事务/断点保证） |
 | --force 保护 | 防止误覆盖 | 默认拒绝覆盖已有数据 |
 | HTTP 元数据同步 | 恢复 meta 节点数据 | 数据和元数据一致 |
 | 递归目录遍历 | 处理复杂的目录结构 | 支持多数据库、多 shard |

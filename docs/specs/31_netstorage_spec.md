@@ -1,5 +1,7 @@
 # Module 31: Network Storage Layer (netstorage) 深度设计文档
 
+> 基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）。本文所有 `file:line` 与行号均以该快照为准。
+
 > 时序图优先，逐步拆解。每个流程都有 Mermaid 时序图 + 核心代码逐行解释。
 
 ---
@@ -204,6 +206,10 @@ type TagKeys struct {
 
 // 第 37 行：TableTagKeys — 支持排序的 Tag 键切片
 type TableTagKeys []TagKeys
+
+func (a TableTagKeys) Len() int           { return len(a) }
+func (a TableTagKeys) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a TableTagKeys) Less(i, j int) bool { return a[i].Name < a[j].Name }
 ```
 
 **逐行解释**：
@@ -319,13 +325,19 @@ func (s *NetStorage) WriteRows(ctx *WriteContext, nodeID uint64, pt uint32, data
         }
         cb := &msgservice.WriteStreamPointsCallback{}
         err = r.Request(spdy.WriteStreamPointsRequest, msgservice.NewWriteStreamPointsRequest(pBuf, streamVars), cb)
-        return err
+        if err != nil {
+            return err
+        }
+        return nil
     }
 
     // 第 212 行：普通写入路径
     cb := &msgservice.WritePointsCallback{}
     err = r.Request(spdy.WritePointsRequest, msgservice.NewWritePointsRequest(pBuf), cb)
-    return err
+    if err != nil {
+        return err
+    }
+    return nil
 }
 ```
 
@@ -336,6 +348,18 @@ func (s *NetStorage) WriteRows(ctx *WriteContext, nodeID uint64, pt uint32, data
 - **第 192 行**：`InitWithNodeID` 通过 MetaClient 查询节点地址，并注册到 `WriteNodeManager`
 - **第 197-209 行**：如果有关联的 StreamShard，走流式写入路径（`WriteStreamPointsRequest`）
 - **第 212-216 行**：普通写入路径，使用 `WritePointsRequest` 类型
+
+**store 侧接收**：ts-store 用 `RegisterEHF` 按 SPDY mux 类型注册 event handler，再由 `InsertProcessor.Handle` 按 `msgservice.*Request` 类型分派（`app/ts-store/transport/server_insert.go:59-95`）——这是上面时序图「阶段 5」的落点。
+
+```go
+func (s *InsertServer) register(store *storage.Storage, stream stream.Engine) {
+    s.server.RegisterEHF(transport.NewEventHandlerFactory(spdy.WritePointsRequest,
+        NewInsertProcessor(store, stream), &msgservice.WritePointsRequest{}))
+    s.server.RegisterEHF(transport.NewEventHandlerFactory(spdy.WriteStreamPointsRequest,
+        NewInsertProcessor(store, stream), &msgservice.WriteStreamPointsRequest{}))
+    // ... WriteBlobsRequest / RaftMsgRequest 注册
+}
+```
 
 **StreamShards 案例**：
 
@@ -415,10 +439,10 @@ func MarshalRows(ctx *WriteContext, db, rp string, pt uint32) ([]byte, error) {
 
 **逐行解释**：
 - **第 475 行**：`PackageTypeFast`（值为 2）是协议标识，接收端据此判断数据格式
-- **第 477-481 行**：数据库名和 RP 名使用"长度前缀"编码，`uint8(len)` 表示最长 255 字符
+- **第 477-481 行**：数据库名和 RP 名使用"长度前缀"编码，前缀为 `uint8`；代码没有长度校验，超过 255 字节时 `uint8(len(db))` 会静默截断长度，接收端按截断后的长度解析会导致帧错位
 - **第 483-484 行**：PtID（uint32）和 ShardID（uint64）使用固定长度编码，便于快速解析
 - **第 487-488 行**：StreamShard 列表使用变长编码（VarUint64），节省空间
-- **第 491 行**：`FastMarshalMultiRows` 是 VictoriaMetrics 的高性能序列化方法，比 Protobuf 快 3-5 倍
+- **第 491 行**：`FastMarshalMultiRows` 是 VictoriaMetrics 的高性能序列化方法，避免逐行 protobuf 编码（"比 Protobuf 快 3-5 倍"未在本仓库验证）
 - **第 496 行**：将缓冲区引用保存到 `ctx.Buf`，下次写入时复用（`append(ctx.Buf[:0], ...)`）
 
 **通俗解释**：
@@ -544,7 +568,7 @@ func (r *Requester) Request(queryTyp uint8, data transport.Codec, cb transport.C
 
 **逐行解释**：
 - **第 59-66 行**：`InitWithNodeID` 通过 MetaClient 查询节点的网络地址，然后调用 `InitWithNode`
-- **第 68-75 行**：`InitWithNode` 将节点注册到对应的 NodeManager。写入请求使用 `WriteNodeManager`（`node.Host`，端口 8400），查询/DDL 使用 `NodeManager`（`node.TCPHost`，端口 8088）
+- **第 68-75 行**：`InitWithNode` 将节点注册到对应的 NodeManager。写入请求使用 `WriteNodeManager`（`node.Host`，端口 8400），查询/DDL 使用 `NodeManager`（`node.TCPHost`，默认 `select-address` 端口 8401）
 - **第 128-149 行**：`Request` 方法根据 `insert` 标志选择不同的 Transport 工厂方法。写入使用 `NewWriteTransport`（10s 超时），查询/DDL 使用 `NewTransport`（30min 超时）
 - **超时边界**：`Requester.timeout` / `SetTimeout()` 当前没有在 `Request()` 中传给 `NewWriteTransport` 或 `NewTransport`；普通 `Request()` 的有效超时来自 transport 工厂：写入 10s，查询/DDL 30min。`RaftMsg()` 走 `NewRaftMsgTransport`，有效超时是 15s。
 
@@ -694,11 +718,13 @@ const (
     UnknownMessage uint8 = iota  // 0: 未知
     SeriesKeysRequestMessage     // 1: 查询 Series
     SeriesKeysResponseMessage    // 2: Series 响应
-    // ... 更多类型
-    ShowTagKeysRequestMessage    // 22: 查询 Tag Keys
-    ShowTagKeysResponseMessage   // 23: Tag Keys 响应
-    DropSeriesRequestMessage     // 24: 删除 Series
-    DropSeriesResponseMessage    // 25: 删除 Series 响应
+    // ... 更多类型（SeriesExactCardinality 3/4 … GetShardSplitPoints 11/12、Delete 13/14、
+    //     CreateDatabase 15/16、ShowQueries 17/18、KillQuery 19/20）...
+    ShowTagKeysRequestMessage    // 21: 查询 Tag Keys
+    ShowTagKeysResponseMessage   // 22: Tag Keys 响应
+    // ... RaftMessagesRequestMessage 23 / RaftMessagesResponseMessage 24 ...
+    DropSeriesRequestMessage     // 25: 删除 Series
+    DropSeriesResponseMessage    // 26: 删除 Series 响应
 )
 
 // 第 64 行：消息编解码器注册表
@@ -730,9 +756,9 @@ func init() {
 
 **通俗解释**：
 消息类型注册就像"快递公司的分类系统"：
-- 每种消息类型有一个编号（如 `ShowTagKeysRequestMessage = 22`）
+- 每种消息类型有一个编号（如 `ShowTagKeysRequestMessage = 21`）
 - 每种类型都有对应的"拆包工具"（构造函数）
-- 请求和响应有固定的配对关系（如 22 对应 23）
+- 请求和响应有固定的配对关系（如 21 对应 22）
 
 ### 4.3 具体 DDL 操作示例
 
@@ -1105,6 +1131,9 @@ graph TD
         Node1["Node 1<br/>pools[0..N]"]
         Node2["Node 2<br/>pools[0..N]"]
         Node3["Node 3<br/>pools[0..N]"]
+        WNode1["Node 1（写入池独立实例）"]
+        WNode2["Node 2（写入池独立实例）"]
+        WNode3["Node 3（写入池独立实例）"]
     end
 
     subgraph "SPDY SessionPool"
@@ -1117,9 +1146,9 @@ graph TD
     NM --> Node1
     NM --> Node2
     NM --> Node3
-    WNM --> Node1
-    WNM --> Node2
-    WNM --> Node3
+    WNM --> WNode1
+    WNM --> WNode2
+    WNM --> WNode3
 
     Node1 --> Pool1
     Pool1 --> Session1
@@ -1175,6 +1204,7 @@ func (n *Node) GetPool() *spdy.MultiplexedSessionPool {
 
 // 第 60 行：dial — 建立 TCP 连接
 func (n *Node) dial(idx uint64) error {
+    start := fasttime.UnixTimestamp()
     n.mu.Lock()
     defer n.mu.Unlock()
 
@@ -1183,12 +1213,21 @@ func (n *Node) dial(idx uint64) error {
         return nil  // 已有可用连接
     }
 
+    if (fasttime.UnixTimestamp() - start) >= uint64(spdy.TCPDialTimeout().Seconds()) {
+        statistics.NewSpdyStatistics().Add(n.failedJob)
+        return errno.NewError(errno.NoConnectionAvailable, n.nodeID, n.address)
+    }
+
     // 第 75 行：创建新的 SessionPool 并建立 TCP 连接
     mcp := spdy.NewMultiplexedSessionPool(spdy.DefaultConfiguration(), "tcp", n.address)
     if err := mcp.Dial(); err != nil {
+        statistics.NewSpdyStatistics().Add(n.failedJob)
         return err
     }
+    mcp.SetStatisticsJob(n.successJob)
     n.pools[idx] = mcp
+
+    statistics.NewSpdyStatistics().Add(n.successJob)
     return nil
 }
 ```
@@ -1501,42 +1540,49 @@ sequenceDiagram
 
 ```go
 // 第 854 行：writeRowToShard — 写入数据到目标 Shard（带重试）
-func (w *PointsWriter) writeRowToShard(ctx *netstorage.WriteContext,
-    database, retentionPolicy string) error {
+func (w *PointsWriter) writeRowToShard(ctx *netstorage.WriteContext, database, retentionPolicy string) error {
     start := time.Now()
+    var err error
     var ptView meta2.DBPtInfos
 
 RETRY:
     for {
         // 第 862 行：超时检查
         if time.Since(start).Nanoseconds() >= w.timeout.Nanoseconds() {
+            w.logger.Error("[coordinator] write rows timeout", zap.String("db", database), zap.Uint32s("ptIds", ctx.Shard.Owners), zap.Error(err))
             break
         }
-
         // 第 866 行：获取最新的 PtView
         ptView, err = w.MetaClient.DBPtView(database)
         if err != nil {
             break
         }
-
         // 第 870 行：遍历 Shard 的 Owner（Pt）
         for _, ptId := range ctx.Shard.Owners {
-            err = w.TSDBStore.WriteRows(ctx, ptView[ptId].Owner.NodeID,
-                ptId, database, retentionPolicy, w.timeout)
-
+            err = w.TSDBStore.WriteRows(ctx, ptView[ptId].Owner.NodeID, ptId, database, retentionPolicy, w.timeout)
             // 第 872 行：Shard 元数据不存在，跳出
             if err != nil && errno.Equal(err, errno.ShardMetaNotFound) {
+                w.logger.Error("[coordinator] store write failed", zap.String("db", database), zap.Uint32("pt", ptId), zap.Error(err))
                 break RETRY
             }
-
             // 第 876 行：Pt 路由变更，重试
             if err != nil && errno.IsRetryErrorForPtView(err) {
-                time.Sleep(100 * time.Millisecond)  // 等待 100ms
-                goto RETRY  // 重新获取 PtView
+                // maybe dbpt route to new node, retry get the right nodeID
+                w.logger.Error("[coordinator] retry write rows", zap.String("db", database), zap.Uint32("pt", ptId), zap.Error(err))
+
+                // The retry interval is added to avoid excessive error logs
+                time.Sleep(100 * time.Millisecond)
+                goto RETRY
+            }
+            // 第 884 行：其他错误，跳出内层循环
+            if err != nil {
+                w.logger.Error("[coordinator] write rows error", zap.String("db", database), zap.Uint32("pt", ptId), zap.Error(err))
+                break
             }
         }
         break
     }
+
     return err
 }
 ```
@@ -1547,7 +1593,8 @@ RETRY:
 - **第 870 行**：`ctx.Shard.Owners` 包含该 Shard 关联的 PtId 列表（复制场景可能有多个）
 - **第 872 行**：`ShardMetaNotFound` 在该写入调用中会返回错误；是否重置路由、重试或放弃由上层 `PointsWriter` 等调用方决定，不是 netstorage 自身的完整恢复策略
 - **第 876 行**：`IsRetryErrorForPtView` 判断是否为路由变更错误，是则重试
-- **第 880 行**：等待 100ms 避免频繁重试
+- **第 881 行**：等待 100ms 避免频繁重试
+- **第 884-887 行**：其余错误记录日志后 `break` 内层循环，再 `break` 外层并返回 `err`
 
 **通俗解释**：
 写入重试就像"快递员找不到收件人"：
@@ -1616,7 +1663,7 @@ sequenceDiagram
 ```
 用户 HTTP 请求
   → handler.serveWrite()
-    → PointsWriter.WritePoints()
+    → PointsWriter.RetryWritePointRows()
       → PointsWriter.writePointRows()
         → PointsWriter.routeAndMapOriginRows()    // 路由计算
         → PointsWriter.writeShardMap()            // 并行写入

@@ -1,5 +1,7 @@
 # Module 19: 列存查询路径深度审计报告（庖丁解牛版）
 
+> 基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）；代码快照：`_spec_verify_20260616/snapshots/spec-md-chinese`。
+
 > 本文档是 Module 11（列存存储引擎）的补充，聚焦于**查询路径**。Module 11 覆盖了写入路径，本文档覆盖从 `ColumnStoreReader.Work()` 到列解码的完整查询流程。
 
 ---
@@ -58,33 +60,38 @@ sequenceDiagram
 **代码位置**：`engine/immutable/colstore/reader.go`（PrimaryKeyReader）, `engine/immutable/colstore/pk_fetcher.go`（PrimaryKeyFetcher）
 
 ```go
-// PrimaryKeyReader — 读取 COLX 主键文件
+// PrimaryKeyReader — 读取 COLX 主键文件（engine/immutable/colstore/reader.go:34-39）
 type PrimaryKeyReader struct {
-    reader BasicFileReader  // 底层文件读取器
+    inited   int32
+    version  uint32
+    fileSize int64
+    reader   fileops.BasicFileReader
 }
 
-// PrimaryKeyFetcher — 从 PK 数据中定位 fragment
+// PrimaryKeyFetcher — 写入侧从数据记录构造 PK 记录（engine/immutable/colstore/pk_fetcher.go:27-29）
 type PrimaryKeyFetcher struct {
     dec codec.BinaryDecoder  // 二进制解码器
 }
 ```
+
+> **注意**：`PrimaryKeyFetcher.Fetch` 由 `ColumnStoreTSSPWriter` 在写入/压缩时调用（`engine/immutable/colstore_tssp_writer.go:37,83`），用于生成 COLX 内容；查询路径（`ColumnStoreReader`）不调用它，它也不用于"定位 fragment"。
 
 ### 2.2 PK 文件结构
 
 ```
 COLX 文件（Primary Key 文件）:
 +--------------------------------------------------+
-| Fragment 0 边界值                                  |
-|   pk_col1: min_val, max_val                      |
-|   pk_col2: min_val, max_val                      |
+| 排序后的唯一主键记录（每行一个 PK）                 |
+|   row 0: pk_col1, pk_col2, ...                   |
+|   row 1: pk_col1, pk_col2, ...                   |
+|   ...                                            |
 +--------------------------------------------------+
-| Fragment 1 边界值                                  |
-|   pk_col1: min_val, max_val                      |
-|   pk_col2: min_val, max_val                      |
-+--------------------------------------------------+
-| ...                                               |
+| 末列 __fragment__（Int）：fragment 偏移量数组       |
+|   [frag0_end, frag1_end, ...]                    |
 +--------------------------------------------------+
 ```
+
+> **说明**：COLX 不按 pk 列存 `min_val/max_val`。fragment 的键范围是排序后首/末行的隐含值；`__fragment__` 列只记录每个 fragment 的结束偏移（`lib/record/record.go:31`、`engine/immutable/colstore_tssp_writer.go:251-256`、`engine/immutable/mms_loader.go:322-329`）。
 
 ### 2.3 Fetch 流程
 
@@ -97,7 +104,7 @@ func (pke *PrimaryKeyFetcher) Fetch(rec *record.Record, pk []record.Field) (*rec
 ```
 
 **通俗解释**：
-Primary Key 文件就像"电话簿的索引页"。每页记录了一个 fragment 的起始和结束值。查找时先翻索引页，找到目标 fragment，再去读实际数据。
+Primary Key 文件就像按主键排好序的"电话簿"：整本按主键顺序排列，末列 `__fragment__` 记录每个 fragment 在列表中的结束位置。查找时先在 fragment 粒度裁剪，再顺着偏移量读取对应的主键行；fragment 的键范围由首/末行隐含，不需要单独存 min/max。
 
 ---
 
@@ -141,7 +148,7 @@ graph TB
 | 级别 | 裁剪位置 | 裁剪方式 | 代码位置 |
 |------|---------|---------|---------|
 | 入口级 | Store/Shard sparse index scan | PK/SK/MinMax/Bloom 等 sidecar 索引扫描，得到 fragment ranges | column store 查询规划 / sparseindex |
-| 第一级 | `initReadCursor()` 中 `loc.Contains()` | Bloom Filter 检查 series 是否存在 + 文件级时间范围过滤 | `engine/immutable/location.go` → `Contains()` |
+| 第一级 | `initReadCursor()` 中 `loc.Contains()` | Bloom Filter 检查 series 是否存在 + 文件级时间范围过滤（chunk meta 缓存命中时跳过 `Contains`） | `engine/immutable/location.go` → `Contains()` |
 | 第二级 | `Location.readData()` | `tr.Overlaps(meta.MinMaxTime())` 文件级裁剪 + `tr.Overlaps(segMinMax)` Segment 级裁剪 | `engine/immutable/location.go` → `readData()` |
 | 第三级 | `Location.readData()` 尾部 | `FilterByTime()` 按时间范围过滤行 + `FilterByField()` 按字段条件过滤行 | `engine/immutable/location.go` → `readData()` |
 
@@ -179,16 +186,18 @@ sequenceDiagram
     Cursor-->>Query: Record
 ```
 
+> 注：图中方法签名已简化；实际 `LocationCursor.ReadData` 为 4 参、`Location.readData` 为 5 参、`TSSPFile.ReadAt` 另含 `ctx` 与 IO 优先级（`engine/immutable/location_cursor.go:183`、`engine/immutable/location.go:261,288-289`）。
+
 ### 4.2 列编码类型
 
 | 类型 | 编码 | 解码方式 |
 |------|------|---------|
-| Integer | Delta + ZigZag + 变长 | 反向解码 |
+| Integer | Delta + ZigZag → const-delta / simple8b / zstd / uncompressed | 反向解码 |
 | Float | Gorilla (XOR) | 反向解码 |
-| String | 字典 + 变长 | 字典查找 |
-| Tag | 字符串块编码 | 字符串块解码 |
-| Boolean | Bitmap | 位读取 |
-| Timestamp | Delta + 变长 | 反向解码 |
+| String | 长度 + offset 打包，再按配置做 snappy/zstd/lz4 压缩 | 解压后按 offset 切分 |
+| Tag | 与 String 相同的 string block 编解码 | 字符串块解码 |
+| Boolean | Bitmap（bitpack） | 位读取 |
+| Timestamp | Delta → const-delta / simple8b / snappy / uncompressed | 反向解码 |
 
 ---
 
@@ -196,7 +205,7 @@ sequenceDiagram
 
 ### 5.1 什么是 Detached Storage？
 
-当 series 数量非常高（高基数）时，每个 series 的数据量很小，如果每个 series 都在 TSSP 文件中占一个 Chunk，文件碎片化会很严重。Detached Storage 将 PK 数据和实际数据分离存储。
+Detached Storage 的刷盘方式由配置项 `column-store-detached-flush-enabled` 或产品类型 `LogKeeper` 决定（`engine/mutable/cs_table.go:172`、`engine/immutable/config.go:169`、`config/openGemini.conf:226`），不是按基数自动切换。在高基数场景下，每个 series 的数据量很小，如果每个 series 都在 TSSP 文件中占一个 Chunk，文件碎片化会很严重；Detached Storage 将 PK/元数据与实际数据分离存储，用于缓解这一问题。
 
 ```mermaid
 graph TB
@@ -308,7 +317,7 @@ sequenceDiagram
 | 组件 | 作用 | 优化效果 |
 |------|------|---------|
 | PK/SK Sparse Index | Store/Shard 侧定位 fragment | 减少进入 Reader 的 fragment |
-| Sparse Index 裁剪 | 排除不匹配的 fragment | 减少 80%+ IO |
+| Sparse Index 裁剪 | 排除不匹配的 fragment | 减少不必要 IO（无基准量化数据） |
 | Column Reader | 按列解码 | 只读需要的列 |
 | Detached Storage | 高基数优化 | 减少文件碎片化 |
-| 列式编码 | 压缩存储 | 节省 50%+ 空间 |
+| 列式编码 | 压缩存储 | 降低空间占用（无基准量化数据） |

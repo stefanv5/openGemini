@@ -1,5 +1,7 @@
 # Module 25: Pre-aggregation 预聚合深度审计报告（庖丁解牛版）
 
+> 基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11，main + 19 commits）。
+
 > Pre-aggregation 在列的 `ColumnMeta.preAgg` 字节中保存列 chunk 级统计值。它能让部分简单聚合少读或不读数据列，但是否命中取决于查询形态、函数白名单、字段条件、配置开关，以及读取时查询时间范围是否完整覆盖该列 chunk。
 
 ---
@@ -66,7 +68,7 @@ func (qs *QuerySchema) MatchPreAgg() bool {
 
 ### 2.2 读取侧覆盖判断
 
-`MatchPreAgg()` 只说明查询形态允许尝试预聚合。真正读取 `preAgg` 时，`readMinMax` / `readSumCount` 还会检查 `cm.allRowsInRange(ctx.tr)`：只有查询时间范围完整覆盖该 `ColumnMeta` 的时间范围，才能直接使用统计值；否则必须回退读取数据列并逐行/逐段计算。
+`MatchPreAgg()` 只说明查询形态允许尝试预聚合。真正读取 `preAgg` 时，`readMinMax` / `readSumCount` 还会检查 `cm.allRowsInRange(ctx.tr)`：只有查询时间范围完整覆盖该 `ChunkMeta` 的时间范围（`ChunkMeta.allRowsInRange` 使用 `MinMaxTime()`），才能直接使用统计值；否则必须回退读取数据列并逐行/逐段计算。
 
 ### 2.3 函数白名单
 
@@ -85,7 +87,7 @@ mapping.mapCalls["mean"] = struct{}{}
 **注意**：
 - 白名单是 `MatchPreAgg()` 的条件之一，不代表每个函数都能从同一种 preAgg 字节直接读出结果。
 - `mean` 依赖 `sum/count` 语义。
-- `first/last` 会结合时间信息和 reader 逻辑处理，不是额外存储 first/last 值。
+- `first/last` 会结合时间信息和 reader 逻辑处理，不是额外存储 first/last 值（由 `readFirstOrLast`/`FirstLastReader` 借助 preAgg 的 min/max 时间定位，`engine/immutable/first_last_reader.go:30`）。
 
 ---
 
@@ -95,12 +97,12 @@ mapping.mapCalls["mean"] = struct{}{}
 
 ```go
 const (
-    minIndex   = 0
-    maxIndex   = 1
-    minTIndex  = 2
-    maxTIndex  = 3
-    sumIndex   = 4
-    countIndex = 5
+	minIndex = iota
+	maxIndex
+	minTIndex
+	maxTIndex
+	sumIndex
+	countIndex
 )
 ```
 
@@ -129,8 +131,8 @@ sequenceDiagram
     participant PreAgg as PreAggBuilder
     participant Meta as ColumnMeta
 
-    Flush->>Builder: encodeColumn(col, times)
-    Builder->>PreAgg: addValues(col, times)
+    Flush->>Builder: EncodeColumn(ref, col, timeCols, ...)
+    Builder->>PreAgg: encIntegerColumn/encFloatColumn → addValues(segCol, times)
     Note over PreAgg: 单次遍历更新统计值
     Builder->>PreAgg: marshal()
     PreAgg-->>Builder: preAgg bytes
@@ -141,14 +143,28 @@ sequenceDiagram
 
 ```go
 func (m *FloatPreAgg) addValues(col *record.ColVal, times []int64) {
-    values := col.FloatValues()
-    for i := range values {
-        v := values[i]
-        if v < m.minV { m.minV = v; m.minTime = times[i] }
-        if v > m.maxV { m.maxV = v; m.maxTime = times[i] }
-        m.sumV += v
-    }
-    m.countV += int64(len(values))
+	values := col.FloatValues()
+	valLen := len(values)
+	for i, j := 0, 0; i < col.Len; i++ {
+		if col.NilCount > 0 && col.IsNil(i) {
+			continue
+		}
+
+		v := values[j]
+		j++
+		if m.minV > v {
+			m.minV = v
+			m.minTime = times[i]
+		}
+		if m.maxV < v {
+			m.maxV = v
+			m.maxTime = times[i]
+		}
+
+		m.sumV += v
+	}
+
+	m.countV += int64(valLen)
 }
 ```
 
@@ -163,7 +179,7 @@ func PreAggOnlyOneRow(buf []byte) bool {
 }
 ```
 
-当 Integer/Float segment 只有一行时，`marshal()` 只写：
+当 Integer/Float 整列（chunk）只有一行时，`marshal()` 只写：
 
 ```
 value   : 8 bytes
@@ -222,8 +238,9 @@ sequenceDiagram
 **读取侧代码位置**：
 
 ```go
-func readMinMax(...)
-func readSumCount(...)
+func readMinMax(cm *ChunkMeta, ref *record.Field, dst *record.Record, ctx *ReadContext, cr ColumnReader, copied bool, isMin bool, ioPriority int) error
+...
+func readSumCount(cm *ChunkMeta, ref *record.Field, dst *record.Record, ctx *ReadContext, cr ColumnReader, copied, isSum bool, ioPriority int) error
 ```
 
 **说明**：
@@ -239,6 +256,6 @@ func readSumCount(...)
 |------|----------|------|
 | `MatchPreAgg()` | 配置开启、有聚合、无 interval、无字段条件、非 PromQL、函数全在白名单 | 决定是否匹配预聚合路径 |
 | 类型矩阵 | Integer/Float 完整 48B；String 8B；Boolean 26B；Time 4B | 避免把所有类型都当 6 值统计 |
-| 单行优化 | `PreAggOnlyOneRow(buf)` 判断 `len(buf) == 16` | Integer/Float 单行 segment 少存字段 |
+| 单行优化 | `PreAggOnlyOneRow(buf)` 判断 `len(buf) == 16` | Integer/Float 整列（chunk）单行少存字段 |
 | 读取侧预聚合 | `readMinMax` / `readSumCount` | 减少部分简单聚合的数据列读取 |
 | 性能收益 | 取决于 segment 大小、命中条件和 IO/解码成本 | 不给无依据的固定倍数承诺 |

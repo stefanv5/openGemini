@@ -1,5 +1,7 @@
 # Module 16: Shelf WAL 存储引擎深度审计报告（庖丁解牛版）
 
+> 基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）。本文所有 `file:line` 与代码摘录均以此提交为准。
+
 > Shelf WAL 是 openGemini 2025 年新增的第二套存储引擎，与传统 TSSP 并行存在。它的最大特点是：**WAL 本身就是可查询的数据存储**。传统路径中未 flush 的数据也可以通过 active/snapshot MemTable 查询可见，但传统 WAL 只用于崩溃恢复，不作为查询数据源；Shelf WAL 则可以在转 TSSP 之前直接被查询。
 
 ---
@@ -36,8 +38,8 @@ graph LR
 | 内存缓冲 | MemTable（30MB 阈值触发 flush） | 无 MemTable，直接写 WAL 文件 |
 | 查询可见性 | 未 flush 数据通过 active/snapshot MemTable 可见；WAL 本身不可查 | 写入后 WAL 文件即可作为查询数据源 |
 | 热数据支持 | 无 | HotMode：WAL 数据同时缓存在内存 |
-| 写入模式 | 单线程写入 | Blob 分组 + 多 Processor 并行写入 |
-| 可靠性级别 | 固定（fsync） | 3 级可配（Low/Medium/High） |
+| 写入模式 | 按 `writeReq % partitionNum` 分发到多个 LogWriter 轮转写入 | Blob 分组 + 多 Processor 并行写入 |
+| 可靠性级别 | 按 `SyncInterval` 异步 sync（非写路径同步 fsync） | 3 级可配（Low/Medium/High） |
 
 ---
 
@@ -86,18 +88,35 @@ sequenceDiagram
 
 ```go
 func (s *shard) writeRowsShelfMode(rows []influx.Row) error {
-    // 创建 BlobGroup：每个 Processor 一个 Blob
-    group, release := shelf.NewBlobGroup(runner.Size())
-    defer release()
+	s.immTables.LoadSequencer()
+	s.lastWriteTime = fasttime.UnixTimestamp()
+	runner := shelf.NewRunner()
+	group, release := shelf.NewBlobGroup(runner.Size())
+	defer release()
 
-    // 按 measurement hash 分组
-    for i := range rows {
-        rec := rowToRecord(rows[i])
-        group.GroupingRow(mst, seriesKey, rec, 0)
-    }
+	rec := group.GetRecord()
 
-    // 分发到 Processor 队列（ScheduleGroup 内部等待完成）
-    return runner.ScheduleGroup(s.ident.ShardID, group)
+	for i := range rows {
+		row := &rows[i]
+		if row.StreamOnly {
+			continue
+		}
+
+		rec.Reset()
+		err := record.AppendRowToRecord(rec, row)
+		if err != nil {
+			return err
+		}
+
+		// Fault tolerance. Normally, it is orderly
+		if !sort.IsSorted(rec) {
+			sort.Sort(rec)
+		}
+
+		group.GroupingRow(row.Name, row.IndexKey, rec, 0)
+	}
+
+	return runner.ScheduleGroup(s.ident.ShardID, group)
 }
 ```
 
@@ -231,7 +250,7 @@ graph LR
 ```
 
 **为什么按 measurement hash 分组？**
-- 同一个 measurement 的数据总是去同一个 Processor
+- 默认（`SeriesHashFactor <= 1`）同一个 measurement 的数据总是去同一个 Processor
 - 避免多个 Processor 同时写同一个 WAL 文件的锁竞争
 - 如果配置了 `SeriesHashFactor`，还会按 seriesKey 二次 hash，进一步细化分组
 
@@ -268,7 +287,7 @@ sequenceDiagram
     Reader-->>Query: 最终结果
 ```
 
-**代码位置**：`engine/shelf/wal_reader.go`
+**代码位置**：`engine/shelf/processor.go:320-411`（WalReader 编排、`Exclude` 去重与多 WAL 合并）、`engine/shelf/wal_reader.go:61-173`（`ReadRecord`/`ReadBlock` 块读取）
 
 ### 5.2 去重机制
 
@@ -304,23 +323,27 @@ sequenceDiagram
     WAL->>Disk: 同时写入磁盘
 
     Query->>WAL: 查询最近数据
-    WAL->>MemFile: 从内存读取（零拷贝）
+    WAL->>MemFile: 从内存读取（无磁盘 IO）
     MemFile-->>Query: 直接返回
 ```
 
 **代码位置**：`engine/shelf/wal_file.go`
 
 ```go
-// HotMode 配置（lib/config/store.go）
+// HotMode 配置（lib/config/store.go:560-569）
 type HotMode struct {
-    Enabled              bool    // 是否启用
-    ShelfOnly            bool    // 仅在 Shelf 模式下使用（为 true 时 HotModeEnabled() 返回 false）
-    MemoryAllowedPercent uint8   // 内存占比限制（默认 5%）
-    TimeWindow           Duration // 时间窗口（默认 1 分钟）
-    Duration             Duration // 缓存持续时间（默认 1 小时）
-    MaxFileSize          Size     // 单文件最大缓存（默认 2GB）
+	Enabled              bool          `toml:"enabled"`
+	ShelfOnly            bool          `toml:"shelf-only"`
+	MemoryAllowedPercent uint8         `toml:"memory-allowed-percent"`
+	Duration             toml.Duration `toml:"duration"`
+	TimeWindow           toml.Duration `toml:"time-window"`
+	MaxFileSize          toml.Size     `toml:"max-file-size"`
+	PoolObjectCnt        int           `toml:"pool-object-cnt"`
+	MaxCacheSize         toml.Size     `toml:"max-cache-size"`
 }
 ```
+
+**默认值**（`lib/config/store.go:571-581` `defaultHotMode()`）：`MemoryAllowedPercent=5`、`Duration=1h`、`TimeWindow=1m`、`MaxFileSize=2GB`、`PoolObjectCnt=2`、`MaxCacheSize=1GB`。
 
 **注意**：`HotModeEnabled()` 仅在 `HotMode.Enabled == true && HotMode.ShelfOnly == false` 时返回 true。若 `ShelfOnly` 为 true，则 HotMode 不生效（此时应使用 `ShelfHotModeEnabled()` 判断）。
 
@@ -449,7 +472,7 @@ sequenceDiagram
     Note over WAL: 后续查询排除已转换的数据
 ```
 
-**代码位置**：`engine/shelf/shard.go:307-368`
+**代码位置**：`engine/shelf/shard.go:340-368`（`convertWalToTSSP`）；`:307-338`（`ConvertToTSSP`：选 WAL + 限流 + 清理）
 
 ---
 
@@ -458,7 +481,7 @@ sequenceDiagram
 **代码位置**：`engine/shelf/shard.go:283-305`
 
 ```
-空闲检测：freeDuration（可配置，默认 600 秒）无写入 → 释放后台 goroutine
+空闲检测：freeDuration（`NewShard` 入参，当前固定传默认值 600 秒）无写入 → 释放后台 goroutine
 重新激活：下次写入时 → 重启后台 goroutine
 ```
 

@@ -1,5 +1,7 @@
 # Module 27: Castor 异常检测深度审计报告（庖丁解牛版）
 
+> 基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11，main + 19 commits）。
+
 > Castor 是 openGemini 内置的异常检测服务。查询层通过 `castor()` / `castor_ad()` UDAF 把 Chunk 转成 Arrow Record，Castor 服务再调用外部 Python Worker（pyworker）完成预测、检测或自定义异常检测。
 
 ---
@@ -40,10 +42,12 @@ sequenceDiagram
 
 | 类型 | SQL 参数 | 内部值 | 算法示例 |
 |------|----------|--------|----------|
-| **Fit** | `fit` | `_udf_fit` | METROPD |
-| **Predict** | `predict` | `_udf_predict` | METROPD |
-| **Detect** | `detect` | `_udf_detect` | DIFFERENTIATEAD |
-| **FitDetect** | `fit_detect` | `_udf_fit_detect` | DIFFERENTIATEAD |
+| **Fit** | `fit` | `_fit` | METROPD |
+| **Predict** | `predict` | `_predict` | METROPD |
+| **Detect** | `detect` | `_detect` | DIFFERENTIATEAD |
+| **FitDetect** | `fit_detect` | `_fit_detect` | DIFFERENTIATEAD |
+
+注：编译期 `convertToInternalTagVal(s)` 只是返回 `"_" + s`（`lib/util/lifted/influx/query/agg_functions.go:690-692`）；executor 里另有一处按 `_udf_detect` 判断的历史代码（`engine/executor/chunk_arrow_transform.go:115`），与编译产物不一致。
 
 `castor()` 需要 4 个参数，`castor_ad()` 需要 5 个参数：
 
@@ -56,6 +60,8 @@ func (f *CastorFunc) GetRules(name string) []CheckRule {
         &TypeCheckRule{Name: name, Index: 3, Asserts: []func(interface{}) bool{AssertStringLiteral}},
     }
 }
+
+...
 
 func (f *CastorADFunc) GetRules(name string) []CheckRule {
     return []CheckRule{
@@ -86,7 +92,7 @@ graph TB
         M2["_cfg"] --> E
         M3["_processType"] --> E
         M4["_taskID"] --> E
-        M5["_msgType/_queryMode/_outputInfo"] --> E
+        M5["_msgType/_queryMode/_outputInfo/_dataID"] --> E
     end
 
     subgraph "Castor 服务"
@@ -114,15 +120,38 @@ graph TB
 
 ```go
 func buildRecordMetaData(c ChunkTags, castorParams *CastorParams, metric, taskId string) arrow.Metadata {
-    metaKeys = append(metaKeys, string(castor.Algorithm))
-    metaVals = append(metaVals, castorParams.algo)
-    metaKeys = append(metaKeys, string(castor.ConfigFile))
-    metaVals = append(metaVals, castorParams.cfg)
-    metaKeys = append(metaKeys, string(castor.ProcessType))
-    metaVals = append(metaVals, castorParams.typeOfProcess)
-    metaKeys = append(metaKeys, string(castor.TaskID))
-    metaVals = append(metaVals, string(taskId))
-    return arrow.NewMetadata(metaKeys, metaVals)
+	metaKeys := make([]string, 0, c.Size()+8)
+	metaVals := make([]string, 0, c.Size()+8)
+	keys, vals := c.GetChunkTagAndValues()
+	metaKeys = append(metaKeys, keys...)
+	metaVals = append(metaVals, vals...)
+	metaKeys = append(metaKeys, string(castor.Algorithm))
+	metaVals = append(metaVals, castorParams.algo)
+	metaKeys = append(metaKeys, string(castor.ConfigFile))
+	metaVals = append(metaVals, castorParams.cfg)
+	metaKeys = append(metaKeys, string(castor.ProcessType))
+	metaVals = append(metaVals, castorParams.typeOfProcess)
+	if castorParams.algoParamsVal != "" {
+		metaKeys = append(metaKeys, string(castor.AlgoParams))
+		metaVals = append(metaVals, castorParams.algoParamsVal)
+		metaKeys = append(metaKeys, string(castor.Metric))
+		metaVals = append(metaVals, metric)
+	}
+
+	// mark data with uuid and msgType which will be used to get corresponsive return
+	metaKeys = append(metaKeys, string(castor.DataId))
+	metaVals = append(metaVals, uuid.TimeUUID().String())
+	metaKeys = append(metaKeys, string(castor.MessageType))
+	metaVals = append(metaVals, string(castor.DATA))
+	metaKeys = append(metaKeys, string(castor.TaskID))
+	metaVals = append(metaVals, string(taskId))
+	metaKeys = append(metaKeys, string(castor.QueryMode))
+	metaVals = append(metaVals, string(castor.NormalQuery))
+	metaKeys = append(metaKeys, string(castor.OutputInfo))
+	metaVals = append(metaVals, string(castor.AnomalyLevel))
+
+	metaData := arrow.NewMetadata(metaKeys, metaVals)
+	return metaData
 }
 ```
 
@@ -136,12 +165,23 @@ func buildRecordMetaData(c ChunkTags, castorParams *CastorParams, metric, taskId
 
 ```go
 type Service struct {
-    Config          config.Castor
-    clientPool      []*pool
-    dataChan        chan *data
-    dataFailureChan chan *data
-    resultChan      chan arrow.Record
-    responseChanMap sync.Map
+	services.Base
+
+	Config  config.Castor
+	closeMu sync.Mutex
+	ctx     context.Context
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+
+	clientPool      []*pool
+	lastPoolIdx     int
+	dataChanMu      sync.Mutex
+	dataChan        chan *data
+	dataFailureChan chan *data
+	resultChan      chan arrow.Record
+	responseChanMap sync.Map
+
+	alive bool
 }
 ```
 
@@ -183,24 +223,34 @@ sequenceDiagram
 
 ```go
 func (s *Service) getRespChan(rec arrow.Record) (*respChan, *errno.Error) {
-    id, err := GetMetaValueFromRecord(rec, string(TaskID))
-    if err != nil {
-        return nil, err
-    }
-    nodeResultChan, exist := s.responseChanMap.Load(id)
-    if !exist {
-        return nil, errno.NewError(errno.ResponseTimeout)
-    }
-    return nodeResultChan.(*respChan), nil
+	id, err := GetMetaValueFromRecord(rec, string(TaskID))
+	if err != nil {
+		return nil, err
+	}
+
+	nodeResultChan, exist := s.responseChanMap.Load(id)
+	if !exist {
+		return nil, errno.NewError(errno.ResponseTimeout)
+	}
+	ch, ok := nodeResultChan.(*respChan)
+	if !ok {
+		return nil, errno.NewError(errno.TypeAssertFail)
+	}
+	return ch, nil
 }
 
 func (s *Service) dispatchResult(rec arrow.Record) *errno.Error {
-    ch, err := s.getRespChan(rec)
-    if err != nil {
-        return err
-    }
-    ch.C <- rec
-    return nil
+	ch, err := s.getRespChan(rec)
+	if err != nil {
+		return err
+	}
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	if !ch.alive {
+		return errno.NewError(errno.ResponseTimeout)
+	}
+	ch.C <- rec
+	return nil
 }
 ```
 
@@ -234,6 +284,8 @@ func (s *Service) dispatchResult(rec arrow.Record) *errno.Error {
   config_filename = ['detect_base']
 ```
 
+以上为示例，不是默认配置；仓库随附的 `config/openGemini.conf` 中 `enabled = false`、`result-wait-timeout = 10`，且只给出 detect/fit_detect 的算法列表；`METROPD` 未在该样例或代码中出现，需以实际 pyworker 支持为准。
+
 `castor()` 编译阶段会校验算法、配置和处理类型：
 
 ```go
@@ -262,7 +314,7 @@ GROUP BY host
 执行过程：
 
 1. SQL 参数中的 `DIFFERENTIATEAD`、`detect_base`、`detect` 在 executor 中转成 Arrow metadata。
-2. `detect` 会被编译期转换为内部 `_udf_detect`。
+2. `detect` 会被编译期转换为内部 `_detect`。
 3. pyworker 返回的 Arrow Record 由 `CopyArrowRecordToChunk()` 按 `DesiredFieldKeySet` 复制回结果 Chunk。
 
 普通 `castor()` 不是透传任意 pyworker 数值字段；当前 `CastorReduce()` 传入 `DesiredFieldKeySet`，核心期望字段是 `anomalyLevel`。如果返回元数据中的 `_anomalyNum == 0`，转换路径可能跳过输出。
@@ -276,7 +328,7 @@ WHERE host = 'server1' AND time > now() - 1h
 GROUP BY host
 ```
 
-`castor_ad()` 的第 5 个参数必须是字符串，会进入 `_algoParams`，并在 `buildRecordMetaData()` 中随 `_metric` 一起传给 pyworker。返回结果由 `CopyCastorADArrowRecordToChunk()` 处理：它遍历返回 Record 的非时间列，把每行组装成 JSON 字符串写入 string 列，因此输出列应按 string/JSON detail 理解，不是数值异常分数列。
+`castor_ad()` 的第 5 个参数必须是字符串，原意是进入 `_algoParams` 并在 `buildRecordMetaData()` 中随 `_metric` 一起传给 pyworker。但当前实现里，`ChunkToArrowRecords` 只在 `typeOfProcess.Val == "_udf_detect" && len(args) == 4` 时读取它（`engine/executor/chunk_arrow_transform.go:114-120`），而编译期写入的是 `_detect`，条件不会成立，因此 `_algoParams`/`_metric` 实际不会下发（属已知不一致）。返回结果由 `CopyCastorADArrowRecordToChunk()` 处理：它遍历返回 Record 的非时间列，把每行组装成 JSON 字符串写入 string 列，因此输出列应按 string/JSON detail 理解，不是数值异常分数列。
 
 示例结果形态：
 

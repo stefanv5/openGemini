@@ -1,5 +1,7 @@
 # Module 5: 数据生命周期与降采样策略 深度审计报告（庖丁解牛版 v3）
 
+> 代码基线：`origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11，main + 19 个提交）。本文所有 `file:line` 均指该基线。
+
 > 时序图优先，逐步拆解。每个流程都有 Mermaid 时序图 + 核心代码逐行解释。
 
 ---
@@ -65,11 +67,11 @@ func (s *shard) Snapshot() {
 | 1 | `func (s *shard) Snapshot()` | shard 的 Snapshot 定时任务，负责将 MemTable 中的热数据 flush 到 TSSP 文件 |
 | 2 | `timer := time.NewTicker(time.Millisecond * 100)` | 每 100ms 检查一次是否需要 Snapshot |
 | 3-6 | `defer func() { s.wg.Done(); timer.Stop() }()` | 退出时通知 WaitGroup 并停止定时器 |
-| 8 | `case <-s.closed.Signal():` | 收到关闭信号时退出循环 |
-| 9 | `case <-timer.C:` | 定时器触发，检查是否需要 Snapshot |
-| 10-11 | `if !s.shouldSnapshot() { continue }` | 检查 MemTable 是否满了或超时，不需要则跳过 |
-| 12 | `s.storage.writeSnapshot(s)` | 执行 Snapshot：将 MemTable 数据写入 TSSP L0 文件 |
-| 13 | `s.endSnapshot()` | 标记 Snapshot 完成，释放锁 |
+| 9 | `case <-s.closed.Signal():` | 收到关闭信号时退出循环 |
+| 11 | `case <-timer.C:` | 定时器触发，检查是否需要 Snapshot |
+| 12-14 | `if !s.shouldSnapshot() { continue }` | 检查 MemTable 是否满了或超时，不需要则跳过 |
+| 15 | `s.storage.writeSnapshot(s)` | 执行 Snapshot：将 MemTable 数据写入 TSSP L0 文件 |
+| 16 | `s.endSnapshot()` | 标记 Snapshot 完成，释放锁 |
 
 **核心代码** `engine/shard.go` 中的 shouldSnapshot 判断逻辑：
 
@@ -105,9 +107,9 @@ func (s *shard) shouldSnapshot() bool {
 | 2-3 | `s.snapshotLock.RLock()` | 加读锁，防止与写入并发冲突 |
 | 5-7 | `if !s.storage.shouldSnapshot(s)` | 底层存储检查（如是否正在关闭） |
 | 9 | `if s.activeTbl != nil && s.activeTbl.GetMemSize() > 0` | 检查活跃 MemTable 是否有数据 |
-| 10-12 | `s.activeTbl.NeedFlush()` | MemTable 满了（超过阈值），需要立即 flush |
-| 15-17 | `s.storage.timeToSnapshot(s)` | 距离上次 Snapshot 超过一定时间，也需要 flush |
-| 11/16 | `s.prepareSnapshot()` | 准备 Snapshot（增加 WaitGroup 计数） |
+| 10-13 | `s.activeTbl.NeedFlush()` | MemTable 满了（超过阈值），需要立即 flush |
+| 16-19 | `s.storage.timeToSnapshot(s)` | 距离上次 Snapshot 超过一定时间，也需要 flush |
+| 11/17 | `s.prepareSnapshot()` | 准备 Snapshot（增加 WaitGroup 计数） |
 
 **具体例子**：
 
@@ -131,7 +133,7 @@ t=1d: Compaction L1 → L2 → L3
   → 查询：从 TSSP L3 读取（~100μs）
 
 t=1d: Downsample 触发
-  → 降采样数据：每 5 分钟聚合为一个点
+  → 降采样数据：按 TimeInterval（示例 5 分钟）聚合为一个点
   → 查询最近 1 天：只有当 shard 已完成对应 DownSampleLevel，且聚合表达式可被降采样 schema 重写时，才可能使用降采样列；普通查询或不可重写表达式仍读原始数据
 
 t=7d: Retention 过期
@@ -205,20 +207,21 @@ type DownSamplePolicyInfo struct {
     Level 2: SampleInterval=1h, TimeInterval=1d, WaterMark=1h
 
 含义：
-  Level 1：每 5 分钟一个采样点，每小时聚合一次，延迟 10 分钟处理
-  Level 2：每 1 小时一个采样点，每天聚合一次，延迟 1 小时处理
+  Level 1：shard 结束 5 分钟后开始降采样，按 1 小时窗口聚合（每个输出点覆盖 1 小时）
+  Level 2：在 Level 1 之后等待 1 小时，按 1 天窗口聚合
+  WaterMark 仅随策略存储/校验，当前执行路径未使用
 
 执行时：
-  DownSamplePolicyLevel = 1 → 生成 Level 1 降采样数据（5 分钟精度）
-  DownSamplePolicyLevel = 2 → 基于已完成 Level 1 继续生成 Level 2 数据（1 小时精度）
+  DownSamplePolicyLevel = 1 → 生成 Level 1 降采样数据（1 小时精度）
+  DownSamplePolicyLevel = 2 → 基于已完成 Level 1 继续生成 Level 2 数据（1 天精度）
   注意：DownSamplePolicyLevel 是 1-based，代码访问 schema 时使用 level-1
 ```
 
 **通俗解释**：
 降采样策略就像"数据摘要规则"。假设你有一个监控系统，每秒记录一次 CPU 使用率：
 - **原始数据**：1 秒一个点，1 天 = 86400 个点
-- **Level 1 降采样**：5 分钟一个点，1 天 = 288 个点
-- **Level 2 降采样**：1 小时一个点，1 天 = 24 个点
+- **Level 1 降采样**（TimeInterval=1h）：1 小时一个点，1 天 = 24 个点
+- **Level 2 降采样**（TimeInterval=1d）：1 天一个点
 
 查询历史数据时，当前实现不是按时间跨度自动选择最合适精度。查询计划器只基于 shard 已完成的 `DownSampleLevel` 尝试把可支持的聚合表达式改写到降采样列；如果目标级别还没完成，或者表达式不能改写，就继续读取原始数据。
 
@@ -227,16 +230,16 @@ type DownSamplePolicyInfo struct {
 ```go
 // 第 391 行：单级降采样策略
 type DownSamplePolicy struct {
-    SampleInterval time.Duration  // 采样间隔（如 5m）
-    TimeInterval   time.Duration  // 时间窗口（如 1h）
-    WaterMark      time.Duration  // 水位线（如 10m，延迟处理）
+    SampleInterval time.Duration  // 等待时长：shard 结束后多久允许降采样
+    TimeInterval   time.Duration  // 输出聚合窗口（GROUP BY 间隔）
+    WaterMark      time.Duration  // 水位线（当前执行路径未使用）
 }
 ```
 
 **逐行解释**：
-- **第 392 行**：`SampleInterval` 控制降采样的粒度，如 5m 表示每 5 分钟一个采样点
-- **第 393 行**：`TimeInterval` 控制时间窗口大小，如 1h 表示每小时聚合一次
-- **第 394 行**：`WaterMark` 是水位线，延迟处理，确保数据已全部写入
+- **第 392 行**：`SampleInterval` 是等待时长——shard endTime 之后再过 SampleInterval 才允许降采样（`engine/shard.go:2063` 用它做门限），不是输出粒度
+- **第 393 行**：`TimeInterval` 决定输出聚合窗口（`GROUP BY time(TimeInterval)`），降采样数据的粒度由它决定
+- **第 394 行**：`WaterMark` 仅随策略存储/校验，`engine/` 与 `services/` 的生产代码未使用
 
 **核心代码**：`lib/util/lifted/influx/meta/downsample_policy.go:406-409`
 
@@ -434,7 +437,7 @@ handle() 就像一个"巡检员"，每隔一段时间检查一次：
 
 **具体例子**：
 
-假设配置了降采样策略：cpu 表每 5 分钟聚合一次，mem 表每 10 分钟聚合一次。
+假设配置了降采样策略：cpu 表的 TimeInterval=5m，mem 表的 TimeInterval=10m。
 
 ```
 handle() 执行过程：
@@ -517,6 +520,7 @@ func (s *shard) StartDownSample(taskID uint64, level int, sdsp *meta.ShardDownSa
     defer s.mu.RUnlock()
 
     info, schemas, logger := s.shardDownSampleTaskInfo.sdsp, s.shardDownSampleTaskInfo.schema, s.shardDownSampleTaskInfo.log
+    var err error
 
     // 第 1662 行：WaitGroup 用于等待降采样完成
     s.dswg.Add(1)
@@ -536,6 +540,7 @@ func (s *shard) StartDownSample(taskID uint64, level int, sdsp *meta.ShardDownSa
     // 第 1673 行：filesMap 记录原始文件，allDownSampleFiles 记录新文件
     filesMap := make(map[int]*immutable.TSSPFiles, taskNum)
     allDownSampleFiles := make(map[int][]immutable.TSSPFile, taskNum)
+    logger.Info("DownSample Start", zap.Any("shardId", info.ShardId))
 
     // 第 1676 行：分批执行，每批 parallelism 个 schema
     for i := 0; i < taskNum; i += parallelism {
@@ -552,7 +557,12 @@ func (s *shard) StartDownSample(taskID uint64, level int, sdsp *meta.ShardDownSa
         }
     }
 
-    // 第 1692 行：成功时替换文件
+    // 第 1689 行：运行期间降采样被关闭则取消本次任务
+    if !s.downSampleEnabled() {
+        err = fmt.Errorf("downsample cancel")
+    }
+
+    // 第 1693 行：成功时替换文件
     if err == nil {
         mstNames := make([]string, 0)
         originFiles := make([][]immutable.TSSPFile, 0)
@@ -578,6 +588,8 @@ func (s *shard) StartDownSample(taskID uint64, level int, sdsp *meta.ShardDownSa
             s.DeleteDownSampleFiles(allDownSampleFiles)  // 失败时清理
             return e
         }
+        // 第 1714 行：记录降采样成功
+        logger.Info("DownSample Success", zap.Any("shardId", info.ShardId))
     } else {
         // 第 1716 行：失败时释放文件引用并清理
         for _, v := range filesMap {
@@ -648,7 +660,7 @@ Step 5: dswg.Done()
 
 ### 5.0 downSampleQuerySchemaGen — 初始 Schema 生成入口
 
-**核心代码**：`services/downsample/functions.go:29-39`
+**核心代码**：`services/downsample/functions.go:30-40`
 
 ```go
 func downSampleQuerySchemaGen(sinfo *meta.ShardDownSamplePolicyInfo,
@@ -676,7 +688,7 @@ func downSampleQuerySchemaGen(sinfo *meta.ShardDownSamplePolicyInfo,
 - `currLvl == 0`：首次降采样，只需要第一级 Schema
 - `genNextLevelSchemas()`：已有降采样数据时，生成后续级别的 Schema
 
-**核心代码**：`services/downsample/functions.go:41-87` — `initDownSampleSchema`
+**核心代码**：`services/downsample/functions.go:42-88` — `initDownSampleSchema`
 
 ```go
 func initDownSampleSchema(sinfo *meta.ShardDownSamplePolicyInfo,
@@ -736,7 +748,7 @@ func initDownSampleSchema(sinfo *meta.ShardDownSamplePolicyInfo,
 }
 ```
 
-**核心代码**：`services/downsample/functions.go:89-110` — `downSampleExprGen`
+**核心代码**：`services/downsample/functions.go:90-111` — `downSampleExprGen`
 
 ```go
 func downSampleExprGen(calls []string, columns []string, dataType int64) (influxql.Fields, []string) {
@@ -947,7 +959,7 @@ sequenceDiagram
     Note over Disk: 崩溃恢复的关键
 ```
 
-**核心代码**：`engine/downsample_info.go:25-69`
+**核心代码**：`engine/downsample_info.go:25-50`
 
 ```go
 // 第 25 行：降采样文件信息（崩溃恢复日志）
@@ -1052,14 +1064,11 @@ sequenceDiagram
 
     alt CRC32 校验通过
         loop 每个 measurement
-            alt 新文件存在（.tmp）
-                Recover->>FS: 重命名 .tmp → 最终名称
-                Recover->>FS: 删除旧文件
-                Recover->>FS: 更新 DownSampleLevel
-            else 新文件不存在
-                Note over Recover: 降采样未完成，保留旧文件
-            end
+            Recover->>FS: 重命名存在的 .tmp → 最终名称
+            Recover->>FS: 删除旧文件
+            Recover->>FS: 更新 DownSampleLevel
         end
+        Note over Recover: 代码不判断新文件是否存在；<br/>安全性依赖“日志只在替换阶段写入”
     else CRC32 校验失败
         Note over Recover: 日志损坏，保留旧文件
     end
@@ -1173,8 +1182,8 @@ sequenceDiagram
     Planner->>Shard: 检查已完成 DownSampleLevel
 
     alt 已完成降采样（DownSampleLevel > 0）
-        Planner->>Planner: BuildDownSampleSchema()
-        Planner->>Planner: mean(value) → sum/count
+        Planner->>Planner: mean(value) → sum/count（QuerySchema.meanToSumDivCount）
+        Planner->>Planner: BuildDownSampleSchema() 生成 sum_value/count_value 列
         Planner->>Planner: 重写为读取降采样列
 
         Planner->>DS: 读取预聚合列
@@ -1234,12 +1243,12 @@ func (qs *QuerySchema) BuildDownSampleSchema(addPrefix bool) record.Schemas {
 | 1 | `func (qs *QuerySchema) BuildDownSampleSchema(addPrefix bool)` | 构建降采样查询的 Schema，将用户查询映射到预聚合列 |
 | 3 | `for _, f := range qs.origCalls` | 遍历用户查询中的所有聚合函数（如 mean, sum, count） |
 | 4 | `c, ok := f.Args[0].(*influxql.VarRef)` | 提取聚合函数的参数（如 value 字段） |
-| 8-9 | `field = record.Field{Name: f.Name + "_" + c.Val}` | 有前缀时：`mean_value` → 读取降采样文件中的 `mean_value` 列 |
-| 10-11 | `field = record.Field{Name: c.Val}` | 无前缀时：直接使用字段名 |
-| 13-14 | `case "min", "first", "last", "max", "sum":` | 这些聚合函数的预聚合列类型与原始字段类型相同 |
-| 16 | `case "count":` | count 的预聚合列类型固定为 Int |
-| 17-18 | `default: panic("wrong call")` | 不支持的聚合函数，直接 panic |
-| 22-25 | `outSchema = append(outSchema, record.Field{Name: "time"...})` | 最后追加 time 列，降采样数据必须有时间列 |
+| 9-10 | `field = record.Field{Name: f.Name + "_" + c.Val}` | 有前缀时：`mean_value` → 读取降采样文件中的 `mean_value` 列 |
+| 11-12 | `field = record.Field{Name: c.Val}` | 无前缀时：直接使用字段名 |
+| 14-15 | `case "min", "first", "last", "max", "sum":` | 这些聚合函数的预聚合列类型与原始字段类型相同 |
+| 17 | `case "count":` | count 的预聚合列类型固定为 Int |
+| 19-20 | `default: panic("wrong call")` | 不支持的聚合函数，直接 panic |
+| 24-27 | `outSchema = append(outSchema, record.Field{Name: "time"...})` | 最后追加 time 列，降采样数据必须有时间列 |
 
 **核心代码** `engine/shard.go` 中的 isDownsampled 判断（查询计划器用此决定是否重写）：
 
@@ -1443,10 +1452,10 @@ func (data *Data) MarkDatabaseDelete(name string) error {
 |------|------|------|
 | 1 | `func (data *Data) MarkDatabaseDelete(name string) error` | 标记数据库为删除状态 |
 | 2-4 | `dbi := data.Databases[name]; if dbi == nil` | 从内存 map 中查找数据库，不存在则报错 |
-| 5-7 | `data.CheckStreamExistInDatabase(name)` | 检查数据库下是否有流任务，有则不允许删除 |
-| 8-10 | `if dbi.MarkDeleted` | 已经标记删除了，返回"正在删除"错误 |
-| 11-13 | `data.checkMigrateConflict(name)` | 检查是否有数据迁移任务冲突 |
-| 14 | `dbi.MarkDeleted = true` | **核心操作**：只设置标记，不删除任何数据 |
+| 6-8 | `data.CheckStreamExistInDatabase(name)` | 检查数据库下是否有流任务，有则不允许删除 |
+| 9-11 | `if dbi.MarkDeleted` | 已经标记删除了，返回"正在删除"错误 |
+| 12-14 | `data.checkMigrateConflict(name)` | 检查是否有数据迁移任务冲突 |
+| 15 | `dbi.MarkDeleted = true` | **核心操作**：只设置标记，不删除任何数据 |
 
 ```go
 func (data *Data) MarkRetentionPolicyDelete(database, name string) error {
@@ -1471,7 +1480,7 @@ func (data *Data) MarkRetentionPolicyDelete(database, name string) error {
 | 2-4 | `data.RetentionPolicy(database, name)` | 查找 RP，不存在则报错 |
 | 5-7 | `data.CheckStreamExistInRetention(database, name)` | 检查 RP 下是否有流任务 |
 | 8-10 | `data.checkMigrateConflict(database)` | 检查迁移冲突 |
-| 11 | `rp.MarkDeleted = true` | 只设置标记，查询/写入时跳过此 RP |
+| 12 | `rp.MarkDeleted = true` | 只设置标记，查询/写入时跳过此 RP |
 
 ```go
 func (data *Data) MarkMeasurementDelete(database, policy, measurement string) error {
@@ -1495,7 +1504,7 @@ func (data *Data) MarkMeasurementDelete(database, policy, measurement string) er
 | 1 | `func (data *Data) MarkMeasurementDelete(database, policy, measurement string)` | 标记 measurement 为删除状态 |
 | 2-4 | `data.Measurement(database, policy, measurement)` | 查找 measurement |
 | 5-7 | `data.CheckStreamExistInMst(...)` | 检查 measurement 下是否有流任务 |
-| 11 | `mst.MarkDeleted = true` | 只设置标记，后台清理时才从 map 中移除 |
+| 12 | `mst.MarkDeleted = true` | 只设置标记，后台清理时才从 map 中移除 |
 
 **具体例子**：
 
@@ -1584,8 +1593,8 @@ func (s *Shard) GetWalReaders(dst []*Wal, mst string, tr *util.TimeRange) []*Wal
 | 5-10 | `for _, w := range s.waitSwitchWal` | 遍历等待切换的 WAL 文件（已写满但还没转成 TSSP） |
 | 6 | `w.HasMeasurement(mst) && w.Overlaps(tr.Min, tr.Max)` | 检查 WAL 是否包含目标 measurement 且时间范围有重叠 |
 | 7 | `w.Ref()` | 增加引用计数，防止 WAL 被意外释放 |
-| 12-16 | `s.wal.HasMeasurement(mst) && s.wal.Overlaps(...)` | 检查当前正在写入的 WAL 文件 |
-| 17 | `return dst` | 返回所有匹配的 WAL 文件，查询引擎直接从这些文件读取数据 |
+| 12-15 | `s.wal.HasMeasurement(mst) && s.wal.Overlaps(...)` | 检查当前正在写入的 WAL 文件 |
+| 16 | `return dst` | 返回所有匹配的 WAL 文件，查询引擎直接从这些文件读取数据 |
 
 ### 9.2 Shelf WAL 热模式
 
@@ -1614,16 +1623,45 @@ sequenceDiagram
     end
 ```
 
-**核心代码** `engine/shelf_wal.go` 中的 Shelf WAL 实现：
+**核心代码**：`engine/shelf/wal.go:66-102` 中的 Shelf WAL 实现（类型名为 `shelf.Wal`）：
 
 ```go
-type ShelfWal struct {
-    mu          sync.RWMutex
-    logPath     string
-    logWriter   LogWriter
-    hotMode     bool            // 是否启用热模式
-    memFile     *MemFile        // 内存文件缓存
-    walEnabled  bool
+type Wal struct {
+    util.Reference
+
+    mu        sync.RWMutex
+    closeOnce sync.Once
+
+    // for store record and seriesKey
+    file *WalFile
+
+    // record the offset of each series data in the wal file
+    seriesOffsets *SeriesOffsets
+
+    // Index not created or loaded into cache.
+    // Record the series key, which is used by the background thread to asynchronously create indexes.
+    seriesKeyOffsets *SeriesKeyOffsets
+
+    targetMu sync.RWMutex
+    // sequence number of the TSSP file generated by this WAL file
+    targetTSSP map[uint64]struct{}
+
+    seriesMap *SeriesMap
+
+    timeRange util.TimeRange
+    ctx       *WalCtx
+
+    openAt   uint64
+    expireAt uint64
+    lock     *string
+    dir      string
+
+    opened          bool
+    backgroundSync  bool
+    backgroundFlush bool
+    writing         bool
+
+    option *obs.ObsOptions
 }
 ```
 
@@ -1662,11 +1700,11 @@ func (wal *Wal) open() error {
 | 行号 | 代码 | 解释 |
 |------|------|------|
 | 1 | `func (wal *Wal) open() error` | 打开 WAL 文件，准备写入 |
-| 5-7 | `fileops.MkdirAll(wal.dir, 0700)` | 确保 WAL 目录存在 |
-| 9-11 | `file := filepath.Join(wal.dir, fmt.Sprintf("%d.%s", ...))` | 生成 WAL 文件名（序列号.wal） |
+| 6-9 | `fileops.MkdirAll(wal.dir, 0700)` | 确保 WAL 目录存在 |
+| 11 | `file := filepath.Join(wal.dir, fmt.Sprintf("%d.%s", ...))` | 生成 WAL 文件名（序列号.wal） |
 | 12-13 | `wal.file = NewWalFile(file, wal.lock)` | 创建 WAL 文件对象 |
 | 15-17 | `wal.file.Open()` | 打开磁盘文件 |
-| 19-22 | `if config.ShelfHotModeEnabled()` | **热模式核心**：如果配置启用了热模式 |
+| 19-23 | `if config.ShelfHotModeEnabled()` | **热模式核心**：如果配置启用了热模式 |
 | 20 | `wal.file.OpenMemFile()` | 创建内存 MemFile 缓存，大小为 MaxWalFileSize + 256KB |
 | 21 | `wal.openAt = fasttime.UnixTimestamp()` | 记录打开时间，用于过期判断 |
 | 22 | `immutable.NewHotFileManager().Add(wal)` | 注册到 HotFileManager，由它管理内存生命周期 |
@@ -1751,11 +1789,7 @@ sequenceDiagram
 
         DS->>Shard: ReplaceDownSampleFiles()
         DS->>Shard: 更新 DownSampleLevel
-        Note over DS,Shard: 当前 StartDownSample 结束后未调用 EnableCompAndMerge()
-        Shard->>Comp: CompactionEnable()
-        Shard->>Merge: MergeEnable()
-
-        Note over Shard: 降采样完成后<br/>压缩和合并恢复
+        Note over DS,Shard: 当前实现结束后不调用 EnableCompAndMerge()<br/>压缩/合并保持禁用，需外部流程恢复
     end
 ```
 
@@ -1763,7 +1797,7 @@ sequenceDiagram
 - 降采样和压缩是互斥的：降采样时必须禁用压缩
 - 因为降采样需要读取稳定的文件集合，压缩会改变文件
 - 当前 `StartDownSample` 实现只调用 `DisableCompAndMerge()`；成功、失败或外层 `startDownSampleTask` 路径都没有自动调用 `EnableCompAndMerge()`。这应按当前实现限制/风险理解：降采样后压缩和合并可能保持禁用，除非后续代码或外部流程显式恢复。
-- 恢复后，shard 标记为已降采样，压缩器跳过它
+- 降采样完成后 shard 标记为已降采样（`DownSampleLevel > 0`），压缩器跳过它
 
 **核心代码** `engine/shard.go` 中的互斥控制（shard 层）：
 
@@ -1966,10 +2000,10 @@ func (s *shard) Close() error {
 | 9 | `s.DisableCompAndMerge()` | **第三步**：禁用压缩和合并，等待正在执行的任务完成 |
 | 11-12 | `s.mu.Lock(); defer s.mu.Unlock()` | 加写锁，防止关闭期间有新的读写操作 |
 | 14-16 | `compWorker.UnregisterShard(s.ident.ShardID)` | **第四步**：从压缩器注销 shard |
-| 26 | `s.closed.Close()` | 发送关闭信号，所有监听 `s.closed` 的 goroutine 退出 |
-| 28 | `s.cancelWalReplay()` | 取消 WAL Replay（如果正在进行） |
-| 29-32 | `s.wal.Close()` | **第五步**：关闭 WAL，刷盘并关闭文件 |
-| 35-41 | `s.activeTbl = nil; nodeMutableLimit.freeResource(curMemSize)` | **第六步**：释放 MemTable 内存资源 |
+| 24 | `s.closed.Close()` | 发送关闭信号，所有监听 `s.closed` 的 goroutine 退出 |
+| 27 | `s.cancelWalReplay()` | 取消 WAL Replay（如果正在进行） |
+| 28-31 | `s.wal.Close()` | **第五步**：关闭 WAL，刷盘并关闭文件 |
+| 34-41 | `s.activeTbl = nil; nodeMutableLimit.freeResource(curMemSize)` | **第六步**：释放 MemTable 内存资源 |
 | 44 | `s.waitSnapshot()` | **第七步**：等待正在执行的 Snapshot 完成 |
 
 **核心代码** `engine/shard.go` 中的 DisableDownSample（关闭顺序第一步）：
@@ -1993,7 +2027,7 @@ func (s *shard) CanDoDownSample() bool {
 | 1-4 | `func (s *shard) DisableDownSample()` | 关闭降采样信号 + 等待正在执行的降采样完成 |
 | 2 | `s.stopDownSample.Close()` | 关闭信号通道，`CanDoDownSample()` 返回 false |
 | 3 | `s.dswg.Wait()` | 阻塞等待，直到正在执行的降采样 goroutine 退出 |
-| 5-10 | `func (s *shard) CanDoDownSample() bool` | 降采样服务每次循环调用此方法，检查是否可以继续 |
+| 6-11 | `func (s *shard) CanDoDownSample() bool` | 降采样服务每次循环调用此方法，检查是否可以继续 |
 
 **具体例子**：
 
@@ -2104,7 +2138,7 @@ sequenceDiagram
 ```
 
 **隐患**：
-- 多级降采样需要按顺序执行：先 Level 1，再 Level 2
+- 多级降采样在语义上需要按顺序执行：先 Level 1，再 Level 2；顺序保证由 `downSampleInorder` 开关控制（默认 false）
 - 如果 Level 1 还没完成就开始 Level 2，会导致数据不完整
 - 系统通过 `DownSampleLevel` 追踪当前级别，但并发场景下仍需注意
 
@@ -2130,8 +2164,9 @@ sequenceDiagram
 
 系统如何避免：
   → DownSampleLevel 追踪当前级别
-  → 只有 Level 0 → Level 1 完成后，才允许 Level 1 → Level 2
-  → 通过 DownSampleLevel 字段控制
+  → downSampleInorder=true 时严格逐级：只有 Level 0 → Level 1 完成后，才允许 Level 1 → Level 2
+  → downSampleInorder=false（默认，engine/shard.go:89）时 GetShardDownSamplePolicy 从高到低选择，可能直接选中更高等级
+  → 开关入口：engine/sysctrl.go:153
 ```
 
 ### 11.3 Retention 删除延迟
@@ -2183,28 +2218,28 @@ Retention 删除延迟的影响：
 
 ---
 
-## 11. 端到端实战：一次降采样的完整生命周期
+## 12. 端到端实战：一次降采样的完整生命周期
 
 > 假设 retention policy 配置了 2 级降采样：1m→10m→1h，追踪一次 1m→10m 降采样的完整过程。
 
-### 11.1 降采样策略配置
+### 12.1 降采样策略配置
 
 ```json
 {
   "name": "autogen",
   "duration": "7d",
   "downSamplePolicy": [
-    {"level": 1, "sampleInterval": "10m", "timeInterval": "1h"},
-    {"level": 2, "sampleInterval": "1h", "timeInterval": "24h"}
+    {"level": 1, "sampleInterval": "24h", "timeInterval": "10m"},
+    {"level": 2, "sampleInterval": "48h", "timeInterval": "1h"}
   ]
 }
 ```
 
 **含义**：
-- Level 1：每 10 分钟的数据聚合为一个点，保留 1 小时
-- Level 2：每 1 小时的数据聚合为一个点，保留 24 小时
+- Level 1：shard 结束 24 小时后开始降采样，按 10 分钟窗口聚合（每个输出点覆盖 10 分钟）
+- Level 2：在 Level 1 之后等待 48 小时，按 1 小时窗口聚合
 
-### 11.2 初始状态
+### 12.2 初始状态
 
 ```
 原始数据 (Level 0, 1m 精度)：
@@ -2229,11 +2264,11 @@ Retention 删除延迟的影响：
 └─────────────────────┴────────┘
 ```
 
-### 11.3 降采样时序图
+### 12.3 降采样时序图
 
 ```mermaid
 sequenceDiagram
-    participant Timer as 1 分钟定时器
+    participant Timer as 30 分钟定时器（默认）
     participant Service as DownSample Service
     participant Handle as handle()
     participant Schema as downSampleQuerySchemaGen()
@@ -2244,7 +2279,7 @@ sequenceDiagram
     participant Write as 写入降采样文件
     participant Replace as ReplaceDownSampleFiles()
 
-    Timer->>Service: 每 1 分钟检查
+    Timer->>Service: 每 30 分钟检查（downsample.check-interval 可配）
     Service->>Handle: handle(shard)
 
     Note over Handle: ===== 检查降采样条件 =====
@@ -2274,7 +2309,7 @@ sequenceDiagram
     Note over Replace: 原子替换降采样文件
 ```
 
-### 11.4 Step 1 详解：genNextLevelSchema — 重写聚合函数
+### 12.4 Step 1 详解：genNextLevelSchema — 重写聚合函数
 
 **代码路径**：`services/downsample/functions.go:146-183`
 
@@ -2320,7 +2355,7 @@ func rewriteField(expr influxql.Expr, callName string) {
 - **第 155 行**：`rewriteField` 重写字段名，如 `value` → `sum_value`
 - **第 178 行**：`v.Val = callName + "_" + v.Val` 将字段名加上聚合前缀
 
-### 11.5 Step 2 详解：聚合计算 — 10 分钟窗口
+### 12.5 Step 2 详解：聚合计算 — 10 分钟窗口
 
 **原始数据**（10 分钟窗口）：
 ```
@@ -2361,7 +2396,7 @@ mean := sum / count = 550.0 / 10 = 55.0  // 平均值
 └─────────────────────┴───────┴───────┴───────┴───────┴─────────┘
 ```
 
-### 11.6 Step 3 详解：写入降采样文件
+### 12.6 Step 3 详解：写入降采样文件
 
 **代码路径**：`engine/shard.go:1654-1726`
 
@@ -2449,7 +2484,7 @@ func (s *shard) StartDownSample(taskID uint64, level int, sdsp *meta.ShardDownSa
 - `s.ReplaceDownSampleFiles()`：成功时原子替换文件（写日志 -> 重命名 -> 删旧 -> 加新）
 - `s.DeleteDownSampleFiles()`：失败时清理临时降采样文件
 
-### 11.7 降采样前后对比
+### 12.7 降采样前后对比
 
 ```
 降采样前 (Level 0, 1m 精度, 15 个点):
@@ -2477,4 +2512,4 @@ func (s *shard) StartDownSample(taskID uint64, level int, sdsp *meta.ShardDownSa
 - **多级降采样**：1m → 10m → 1h，逐级降低精度
 - **聚合函数重写**：count → sum(count)，确保多级聚合正确
 - **原子替换**：ReplaceDownSampleFiles 保证文件列表的一致性
-- **保留原始数据**：降采样后原始数据仍然保留，直到 retention 过期
+- **原始文件被替换**：降采样成功后原始文件会被降采样文件替换并删除（`engine/immutable/mms_tables.go:926-949`），不会保留到 retention 过期；如需保留原始数据，应另建 RP 或另存策略

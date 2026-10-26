@@ -1,5 +1,7 @@
 # Module 1: Write Engine 深度审计报告（庖丁解牛版 v3）
 
+> 代码基线：origin/docs/spec-md-chinese @ 9717d662（2026-04-11）。
+
 > 时序图 + 核心代码逐行解释。先画图，再对照代码，一步一步拆解。
 
 ---
@@ -47,7 +49,7 @@ sequenceDiagram
 2. Handler 创建 `StreamContext`，分块读取请求体
 3. 每个数据块通过 goroutine 池并发解析（`ScheduleUnmarshalWork`）
 4. 解析完成后回调 `RetryWritePointRows`，路由到目标 shard
-5. shard 在普通 tsstore 路径中先调用 `storage.WriteIndex` 填充 TSID，再执行 `writeRows` 写 MemTable/WAL，最后调用 `wait()` 收敛索引结果。tsstore 的 `WriteIndex` 是同步执行并返回空 wait；columnstore 的 `WriteIndexForCols` 才在 goroutine 中异步执行，并通过 wait/WaitGroup 收敛。
+5. shard 在普通 tsstore 路径中先调用 `storage.WriteIndex` 填充 TSID，再执行 `writeRows` 写 MemTable/WAL，最后调用 `wait()` 收敛索引结果。tsstore 的 `WriteIndex` 同步执行并把错误封进 wait 闭包（`engine/ts_storage.go:42-46`）；列存的 `ColumnStoreImpl.WriteIndex` 才在 goroutine 中异步执行、由 wait 收敛（`engine/cs_storage.go:260-282`），列存 `WriteCols` 路径则在 goroutine 中调用 `WriteIndexForCols`（`engine/cs_storage.go:235-244`）。
 
 **核心代码**：`lib/util/lifted/influx/httpd/handler.go` — HTTP 写入入口
 
@@ -290,60 +292,67 @@ type Row struct {
 
 ### 3.1 IndexKey 构造时序图
 
+> 说明：IndexKey 不在行协议解析阶段生成，而是在 coordinator 调用 store 之前由 `(*Row).UnmarshalIndexKeys` 生成（`coordinator/points_writer.go:1017`）。为便于与后续步骤对照，本节沿用“第二步”的编号。
+
 ```mermaid
 sequenceDiagram
     participant Row as influx.Row
-    participant Make as MakeIndexKey()
+    participant Unmarshal as UnmarshalIndexKeys()
     participant Binary as 二进制编码
     participant Result as IndexKey
 
-    Row->>Make: MakeIndexKey(name, tags, dst)
-    Make->>Binary: MarshalUint32(totalLen)
-    Make->>Binary: MarshalUint16(nameLen)
-    Make->>Binary: append(name)
-    Make->>Binary: MarshalUint16(tagCount)
+    Note over Row,Unmarshal: 调用点：PointsWriter.LocalStore.WriteRows
+    Row->>Unmarshal: UnmarshalIndexKeys(indexkeypool)
+    Unmarshal->>Binary: MarshalUint32(indexKl)
+    Unmarshal->>Binary: MarshalUint16(len(Name))
+    Unmarshal->>Binary: append(Name)
+    Unmarshal->>Binary: MarshalUint16(len(Tags))
 
     loop 每个 tag
-        Make->>Binary: MarshalUint16(keyLen)
-        Make->>Binary: append(key)
-        Make->>Binary: MarshalUint16(valueLen)
-        Make->>Binary: append(value)
+        Unmarshal->>Binary: MarshalUint16(keyLen)
+        Unmarshal->>Binary: append(key)
+        Unmarshal->>Binary: MarshalUint16(valueLen)
+        Unmarshal->>Binary: append(value)
     end
 
     Binary-->>Result: [4B total][2B nameLen][name][2B tagCount][2B kLen][key][2B vLen][value]…
 ```
 
-### 3.2 核心代码：`MakeIndexKey()` — 二进制编码
+### 3.2 核心代码：`(*Row).UnmarshalIndexKeys()` — 二进制编码
 
-**代码位置**：`lib/util/lifted/vm/protoparser/influx/parser.go:792-817`
+**代码位置**：`lib/util/lifted/vm/protoparser/influx/parser.go:857-884`
+
+> 编码格式相同的独立函数 `MakeIndexKey(name, tags, dst)` 位于 `lib/util/lifted/vm/protoparser/influx/parser.go:792-817`，但它只被测试使用
+> （`engine/iterators_test.go`），写入链路不会调用。
 
 ```go
-func MakeIndexKey(name string, tags PointTags, dst []byte) []byte {
-    // 计算总长度
-    indexKl := 4 +           // total length (4 bytes)
-        2 +                  // measurement name length (2 bytes)
-        len(name) +          // measurement name
-        2 +                  // tag count (2 bytes)
-        4*len(tags) +        // 每个 tag 的 keyLen(2) + valueLen(2)
-        tags.TagsSize()      // 所有 tag key/value 的实际大小
-    start := len(dst)
+func (r *Row) UnmarshalIndexKeys(indexkeypool []byte) []byte {
+    indexKl := 4 + // total length of indexkey
+        2 + // measurment name length
+        len(r.Name) + // measurment name with version
+        2 + // tag count
+        4*len(r.Tags) + // length of each tag key and value
+        r.Tags.TagsSize() // size of tag keys/values
+    start := len(indexkeypool)
 
-    // 编码总长度
-    dst = encoding.MarshalUint32(dst, uint32(indexKl))
-    // 编码 measurement
-    dst = encoding.MarshalUint16(dst, uint16(len(name)))
-    dst = append(dst, name...)
-    // 编码 tags
-    dst = encoding.MarshalUint16(dst, uint16(len(tags)))
-    for i := range tags {
-        kl := len(tags[i].Key)
-        dst = encoding.MarshalUint16(dst, uint16(kl))
-        dst = append(dst, tags[i].Key...)
-        vl := len(tags[i].Value)
-        dst = encoding.MarshalUint16(dst, uint16(vl))
-        dst = append(dst, tags[i].Value...)
+    // marshal total len
+    indexkeypool = encoding.MarshalUint32(indexkeypool, uint32(indexKl))
+    // marshal measurement
+    indexkeypool = encoding.MarshalUint16(indexkeypool, uint16(len(r.Name)))
+    indexkeypool = append(indexkeypool, r.Name...)
+    // marshal tags
+    indexkeypool = encoding.MarshalUint16(indexkeypool, uint16(len(r.Tags)))
+    for i := range r.Tags {
+        kl := len(r.Tags[i].Key)
+        indexkeypool = encoding.MarshalUint16(indexkeypool, uint16(kl))
+        indexkeypool = append(indexkeypool, r.Tags[i].Key...)
+        vl := len(r.Tags[i].Value)
+        indexkeypool = encoding.MarshalUint16(indexkeypool, uint16(vl))
+        indexkeypool = append(indexkeypool, r.Tags[i].Value...)
     }
-    return dst[start:]
+
+    r.IndexKey = indexkeypool[start:]
+    return indexkeypool
 }
 ```
 
@@ -353,6 +362,7 @@ func MakeIndexKey(name string, tags PointTags, dst []byte) []byte {
 - 每个 tag 编码为：`[key长度][key][value长度][value]`
 - **为什么用二进制编码？** 索引查找时需要按字节比较，二进制编码更高效
 - **为什么 tags 要排序？** 确保相同 tag 组合（不管写入顺序）生成相同的 IndexKey
+- **何时生成？** coordinator 的 `LocalStore.WriteRows` 在调 `store.WriteRows` 前逐行调用 `UnmarshalIndexKeys`（`coordinator/points_writer.go:1014-1020`），随后 `storage.WriteIndex` 用它取 SeriesId（`engine/ts_storage.go:74`）
 
 ---
 
@@ -380,7 +390,7 @@ sequenceDiagram
         end
     end
 
-    Key-->>Row: ShardKey = "cpu,host=server1"
+    Key-->>Row: ShardKey = "cpu_0001,host=server1"（裁剪前）
 ```
 
 ### 4.2 核心代码：`UnmarshalShardKeyByTag()` — 构造分片键
@@ -434,13 +444,19 @@ searchTag:
     if i < len(tags) {
         return ErrPointShouldHaveAllShardKey
     }
+    for j < len(r.Tags)-1 {
+        if err := r.CheckDuplicateTag(j); err != nil {
+            return err
+        }
+        j++
+    }
     return nil
 }
 ```
 
 **通俗解释**：
 - ShardKey 由 measurement name + 指定的 tag 组成
-- 比如 shardKeyTags = `["host"]`，则 ShardKey = `"cpu,host=server1"`
+- 比如 shardKeyTags = `["host"]`，则 ShardKey = `"cpu_0001,host=server1"`（`r.Name` 此时已带版本号）；进入哈希前会裁掉 name 前缀，得到 `"host=server1"`
 - tags 已排序，所以用双指针法高效匹配
 - 如果 shardKey tag 在 fields 中（oid=2），也支持
 
@@ -547,7 +563,7 @@ func (w *PointsWriter) RetryWritePointRows(database, retentionPolicy string, row
     var err error
     start := time.Now()
 
-    // Fence 配置：防止乱序写入
+    // Fence 配置：把 measurement=fence 的行注册为地理围栏定义（services/fence/fence.go:38）
     if config.GetStoreConfig().Fence.FenceEnable {
         fence.RewriteRows(rows)
     }
@@ -577,7 +593,7 @@ func (w *PointsWriter) RetryWritePointRows(database, retentionPolicy string, row
 **通俗解释**：
 - **重试机制**：如果 PtView 错误（分区离线），等待 1 秒后重试
 - **超时控制**：超过配置的超时时间后停止重试
-- **Fence 配置**：防止乱序写入（用于流计算场景）
+- **Fence 配置**：把 measurement 为 `fence` 的行解析为地理围栏定义并落地到 fence 文件（`services/fence/fence.go:38`），与乱序写入无关
 - **resetRowsRouter**：重置路由缓存，下次写入会重新查询 PtView
 
 ### 5.3 核心代码：`writePointRows()` — 写入主流程
@@ -627,7 +643,13 @@ func (w *PointsWriter) writePointRows(database, retentionPolicy string, rows []i
     // 步骤 5: 写入到 shard
     err = w.writeShardMap(database, retentionPolicy, ctx)
     if err != nil {
+        if errno.Equal(err, errno.ErrorTagArrayFormat, errno.WriteErrorArray, errno.SeriesLimited) {
+            return msgservice.PartialWriteError{Reason: err, Dropped: dropped}
+        }
         return err
+    }
+    if partialErr != nil {
+        return msgservice.PartialWriteError{Reason: partialErr, Dropped: dropped}
     }
     return partialErr
 }
@@ -637,6 +659,7 @@ func (w *PointsWriter) writePointRows(database, retentionPolicy string, rows []i
 - **checkDBRP**：检查数据库和 RP 是否存在
 - **routeAndMapOriginRows**：核心路由逻辑，验证每行数据，映射到目标 shard
 - **writeShardMap**：并行写入到各个 shard
+- **PartialWriteError**：部分行失败时返回 `msgservice.PartialWriteError{Reason, Dropped}`，调用方据此区分“全部失败”与“部分写入”
 
 ### 5.4 核心代码：`routeAndMapOriginRows()` — 路由核心
 
@@ -648,11 +671,16 @@ func (w *PointsWriter) routeAndMapOriginRows(
 ) (error, int, error) {
     var partialErr error
     var dropped int
+    var err error
+    var isDropRow bool
+    var pErr error
+    var sh *meta2.ShardInfo
     wh := ctx.getWriteHelper(w)
 
     for i := 0; i < len(rows); i++ {
         r := &rows[i]
 
+        // ...（省略 stream-only 目标 measurement 拒写检查）
         // 步骤 1: 检查时间戳是否在 RP 范围内
         if r.Timestamp < ctx.minTime || !w.inTimeRange(r.Timestamp) {
             errInfo := errno.NewError(errno.WritePointOutOfRP)
@@ -711,6 +739,7 @@ func (w *PointsWriter) routeAndMapOriginRows(
             continue
         }
 
+        // ...（省略 NoMstInDb 重试、MapRowToMeasurement 等分支）
         // 步骤 8: 将行映射到 shard
         ctx.setShardRow(sh, r)
     }
@@ -727,6 +756,7 @@ func (w *PointsWriter) routeAndMapOriginRows(
 - **步骤 7**：计算 ShardKey，找到目标 shard
 - **步骤 8**：将行添加到 shard 的行列表中
 - **错误处理**：部分行失败不影响其他行，记录 dropped 数量
+- **省略的分支**：stream-only 目标 measurement 拒写（`coordinator/points_writer.go:411-420`）、`NoMstInDb + SchemaCleanEn` 时的 `i--` 重试（`coordinator/points_writer.go:499-503`）、`MapRowToMeasurement`（`coordinator/points_writer.go:525-530`）
 
 ### 5.5 具体例子：路由的完整流程
 
@@ -737,32 +767,33 @@ cpu,host=server2 value=88.3 1234567891
 mem,host=server1 value=45.6 1234567892
 ```
 
-路由过程：
+路由过程（假设该 shard group 有 N 个活跃 shard，即 `aliveShardIdxes` 长度为 N；配置 `shardKeyTags = ["host"]`）：
 ```
 行 1: cpu,host=server1
   → createMeasurement("cpu") → MsInfo{Name: "cpu_0001"}
-  → updateShardGroupAndShardKey() → ShardKey = hash("cpu,host=server1") % 8 = 3
-  → ctx.setShardRow(shard3, row1)
+  → updateShardGroupAndShardKey() → r.Name = "cpu_0001"，ShardKey = "cpu_0001,host=server1"
+  → 路由前裁剪 name 前缀：ShardKey = "host=server1"
+  → ShardFor(HashID("host=server1"), aliveShardIdxes) → shardIdx = aliveShardIdxes[hash % N]（记为 shardA）
+  → ctx.setShardRow(shardA, row1)
 
 行 2: cpu,host=server2
   → createMeasurement("cpu") → 复用 MsInfo{Name: "cpu_0001"}
-  → updateShardGroupAndShardKey() → ShardKey = hash("cpu,host=server2") % 8 = 7
-  → ctx.setShardRow(shard7, row2)
+  → ShardKey 裁剪为 "host=server2" → hash 不同 → 记为 shardB
+  → ctx.setShardRow(shardB, row2)
 
 行 3: mem,host=server1
   → createMeasurement("mem") → MsInfo{Name: "mem_0001"}
-  → updateShardGroupAndShardKey() → ShardKey = hash("mem,host=server1") % 8 = 1
-  → ctx.setShardRow(shard1, row3)
+  → ShardKey 裁剪为 "host=server1" → 与行 1 相同（同一 shard group 且 shardKeyTags 相同的前提下）→ shardA
+  → ctx.setShardRow(shardA, row3)
 ```
 
 最终 shardRowMap：
 ```
-shard1: [row3]
-shard3: [row1]
-shard7: [row2]
+shardA: [row1, row3]
+shardB: [row2]
 ```
 
-并行写入：3 个 goroutine 同时写入 3 个 shard。
+并行写入：2 个 goroutine 并行写入 2 个 shard（相同 ShardKey 的行落在同一 shard，体现数据局部性）。
 
 ### 5.6 核心代码：`writeShardMap()` — 并行写入
 
@@ -774,6 +805,7 @@ func (w *PointsWriter) writeShardMap(database, retentionPolicy string, ctx *inje
     var err error
     var mutex sync.Mutex
     var wg sync.WaitGroup
+    var writeCtx *netstorage.WriteContext
 
     wg.Add(shardRowMap.Len())
     for i := range shardRowMap {
@@ -808,7 +840,7 @@ func (w *PointsWriter) writeShardMap(database, retentionPolicy string, ctx *inje
 - **WaitGroup**：等待所有 shard 写入完成
 - **错误处理**：最后一个错误会被返回
 
-### 5.6 核心代码：`writeRowToShard()` — 写入单个 shard
+### 5.7 核心代码：`writeRowToShard()` — 写入单个 shard
 
 **代码位置**：`coordinator/points_writer.go:854-893`
 
@@ -1025,13 +1057,20 @@ Shelf WAL 就像"带实时查询能力的日志"。传统 WAL 只能写入后通
 
 ```go
 func (s *shard) writeRowsToTable(rows influx.Rows, binaryRows []byte) error {
+    var err error
+
     // 步骤 1: 检查是否只读（降采样中）
     if s.ident.ReadOnly {
+        log.Error("write into shard failed")
         if !getDownSampleWriteDrop() {
-            return errors.New("forbid by downSample")
+            err = errors.New("forbid by downSample ")
+            log.Error("write into shard failed", zap.Error(err))
+            return err
         }
         if !syscontrol.IsWriteColdShardEnabled() {
-            return errors.New("forbid by shard moving")
+            err = errors.New("forbid by shard moving")
+            log.Error("write into shard failed", zap.Error(err))
+            return err
         }
         return nil  // 丢弃写入
     }
@@ -1050,7 +1089,9 @@ func (s *shard) writeRowsToTable(rows influx.Rows, binaryRows []byte) error {
     start := time.Now()
     curSize := calculateMemSize(rows)
     err = nodeMutableLimit.allocResource(curSize, mw.timer)
+    atomic.AddInt64(&statistics.PerfStat.WriteGetTokenDurationNs, time.Since(start).Nanoseconds())
     if err != nil {
+        s.log.Info("Alloc resource failed, need retry", zap.Int64("current mem size", curSize))
         return err  // 内存不足，需要重试
     }
 
@@ -1063,6 +1104,9 @@ func (s *shard) writeRowsToTable(rows influx.Rows, binaryRows []byte) error {
     // 步骤 8: 收敛索引结果
     if err == nil {
         err = wait()
+    }
+    if err != nil {
+        return err
     }
 
     s.addRowCounts(int64(len(rows)))
@@ -1103,17 +1147,23 @@ func (s *shard) writeRows(mw *mstWriteCtx, binaryRows []byte, curSize int64) err
     s.snapshotLock.RLock()
     defer s.snapshotLock.RUnlock()
 
+    failpoint.Inject("SlowDownActiveTblWrite", nil)
+
     // 更新内存大小
     s.activeTbl.AddMemSize(curSize)
     
     // 写入 MemTable
     err := s.activeTbl.MTable.WriteRows(s.activeTbl, mmPoints, ctx)
     if err != nil {
+        log.Error("write rows to memory table fail", zap.Uint64("shard", s.ident.ShardID), zap.Error(err))
         return fmt.Errorf("failed to write rows to memtable: %w", err)
     }
 
+    atomic.AddInt64(&statistics.PerfStat.WriteRowsDurationNs, time.Since(start).Nanoseconds())
+
     // 写入 WAL
     if err = s.wal.Write(binaryRows, WriteWalLineProtocol, mw.maxTime); err != nil {
+        log.Error("write rows to wal fail", zap.Uint64("shard", s.ident.ShardID), zap.Error(err))
         return fmt.Errorf("failed to write rows to WAL: %w", err)
     }
 
@@ -1211,6 +1261,8 @@ type MemTable struct {
     msInfos   []MsInfo            // 预分配
     memSize   int64
     MTable    MTable
+
+    releaseHook MemTableReleaseHook
 }
 
 // MsInfo 结构
@@ -1220,6 +1272,9 @@ type MsInfo struct {
     Schema   record.Schemas      // schema
     sidMap   map[uint64]*WriteChunk  // SID → WriteChunk
     chunkBufs []WriteChunk       // 预分配的 chunk 缓冲区
+    writeChunk        *WriteChunkForColumnStore  // 列存写入缓冲
+    concurrencyChunks *rowChunks                 // 并发 chunk
+    flushed           bool                       // 是否已 flush
 }
 
 // WriteChunk 结构
@@ -1532,7 +1587,7 @@ func (l *WAL) writeBinary(walRecord *walRecord) error {
 |------|---------------------|---------|
 | **写入速度** | 快（内存操作） | 慢（需要等待磁盘） |
 | **数据安全** | 依赖 WAL 持久化 | 更安全 |
-| **并发性能** | 高（snapshotLock.RLock 允许并发） | 低（WAL 写入需要串行） |
+| **并发性能** | 高（snapshotLock.RLock 允许并发） | 同分区串行、跨分区并行（`l.mu.RLock()` + `writeReq % partitionNum` 轮转，`engine/wal.go:236-238`；每分区 `LogWriter.writeMu` 串行） |
 
 **通俗解释**：
 先写 MemTable 是因为内存操作很快，写入后数据立即可用于查询。WAL 是为了持久化，即使崩溃也能恢复。两者配合，既保证了性能，又保证了数据安全。
@@ -1560,6 +1615,7 @@ sequenceDiagram
         Storage->>Storage: 检查 !forceFlushing()
         Storage-->>Should: true
 
+        Should->>Should: 判断 activeTbl != nil && GetMemSize() > 0
         Should->>Size: activeTbl.NeedFlush()
         alt 内存超过阈值（默认 30MB）
             Size-->>Should: true
@@ -1754,8 +1810,8 @@ func (s *shard) commitSnapshot(snapshot *mutable.MemTable) {
 步骤 2: writeSnapshot()
   → snapshotLock.Lock()
   → wal.Switch() → 切换 WAL 文件
-    → 旧 WAL 文件: wal_001.log, wal_002.log, wal_003.log, wal_004.log
-    → 新 WAL 文件: wal_005.log, wal_006.log, wal_007.log, wal_008.log
+    → 旧 WAL 文件: 1.wal, 2.wal, 3.wal, 4.wal（示意；真实命名为 <fileSeq>.wal）
+    → 新 WAL 文件: 5.wal, 6.wal, 7.wal, 8.wal
   → snapshotTbl = activeTbl（旧的 active → snapshot）
   → activeTbl = memTablePool.Get()（新的 active）
   → snapshotLock.Unlock()
@@ -1764,8 +1820,8 @@ func (s *shard) commitSnapshot(snapshot *mutable.MemTable) {
 
 步骤 4: commitSnapshot(snapshotTbl)
   → 并行 flush 每个 measurement:
-    → cpu_0001: FlushChunks() → 写入 cpu_0001_001.tssp
-    → mem_0001: FlushChunks() → 写入 mem_0001_001.tssp
+    → cpu_0001: FlushChunks() → 写入 00008250-0001-00010001.tssp（示意；真实命名为 <minTime>-<index>-<seq>.tssp）
+    → mem_0001: FlushChunks() → 写入 00008250-0002-00010001.tssp（示意）
   → 释放内存令牌: nodeMutableLimit.freeResource(32MB)
 
 步骤 5: RemoveWalFiles(walFiles) → 删除旧 WAL 文件
@@ -1778,13 +1834,13 @@ func (s *shard) commitSnapshot(snapshot *mutable.MemTable) {
 Before:
   activeTbl = MemTable{memSize: 32MB, 数据: cpu, mem, disk}
   snapshotTbl = nil
-  WAL = wal_001~004.log
+  WAL = 1.wal ~ 4.wal（示意；真实命名为 <fileSeq>.wal）
 
 After:
   activeTbl = MemTable{memSize: 0MB, 空表}
   snapshotTbl = nil（已释放）
-  TSSP = cpu_0001_001.tssp, mem_0001_001.tssp（新文件）
-  WAL = wal_005~008.log（新文件）
+  TSSP = 00008250-0001-00010001.tssp, 00008250-0002-00010001.tssp（新文件，示意）
+  WAL = 5.wal ~ 8.wal（新文件，示意）
 ```
 
 **通俗解释**：
@@ -1798,14 +1854,15 @@ Snapshot 就像"拍照"。MemTable 中的数据积累到一定量后，把它"�
 
 ```mermaid
 sequenceDiagram
-    participant Start as shard.Open()
+    participant Start as shard.replayWal()
     participant Replay as WAL.Replay()
     participant Product as productRecordParallel()
     participant Consume as consumeRecordSerial·Parallel()
     participant Callback as writeWalBuffer()
     participant Force as ForceFlush()
 
-    Start->>Replay: wal.Replay(ctx, callback)
+    Note over Start: Shelf 模式下 replayWal() 直接 return nil（engine/shard.go:1214-1217）
+    Start->>Replay: syncReplayWal → wal.Replay(ctx, callback)
     Replay->>Replay: 创建 channel 数组（每个分区一个）
 
     alt 串行重放
@@ -1893,6 +1950,7 @@ func (l *WAL) Replay(ctx context.Context, callBack ReplayCallFuncType) ([]string
   - **串行**：轮询消费，保证同一 series 的更新顺序
   - **并行**：每个分区独立消费，更快但不保证跨分区顺序
 - **channel**：每个分区一个 channel，buffer=4
+- **前置分支**：`shard.replayWal()` 在 `config.ShelfModeEnabled()` 为真时直接返回 nil（`engine/shard.go:1214-1217`），Shelf 模式不走本节的 WAL 重放；重放由 `shard.Open → replayWal → syncReplayWal` 触发，并分同步/异步两种（`engine/shard.go:1226`）
 
 ### 10.3 核心代码：`replayPhysicRecord()` — 解析单条 WAL 记录
 
@@ -1909,33 +1967,53 @@ func (l *WAL) replayPhysicRecord(fr *bufio.Reader, walFileName string,
         return recordCompBuff, io.EOF
     }
 
-    // 步骤 2: 解析类型和长度
+    if n != WalRecordHeadSize {
+        return recordCompBuff, io.EOF
+    }
+
+    // 步骤 2: 解析并校验类型与长度
     writeWalType := WalRecordType(recordHeader[0])
+    if writeWalType <= WriteWalUnKnownType || writeWalType >= WriteWalEnd {
+        l.log.Error("unKnown write wal type", zap.Int("writeWalType", int(writeWalType)))
+        return recordCompBuff, io.EOF
+    }
     compBinaryLen := binary.BigEndian.Uint32(recordHeader[1:WalRecordHeadSize])
-    
+
     // 步骤 3: 准备缓冲区
     recordCompBuff = bufferpool.Resize(recordCompBuff, int(compBinaryLen))
 
     // 步骤 4: 读取压缩数据
+    var rowsObjects = getWalRowsObjects()
+    var binaryBuff = rowsObjects.rowsDataBuff[:cap(rowsObjects.rowsDataBuff)]
+    wr := &walRecord{writeWalType: writeWalType}
+
     n, err = io.ReadFull(fr, recordCompBuff)
-    
-    // 步骤 5: Snappy 解压
-    binaryBuff, innerErr = snappy.Decode(binaryBuff, recordCompBuff)
-    if innerErr != nil {
-        return recordCompBuff, io.EOF
-    }
+    if err == nil || err == io.EOF {
+        // 步骤 5: Snappy 解压
+        var innerErr error
+        binaryBuff, innerErr = snappy.Decode(binaryBuff, recordCompBuff)
+        if innerErr != nil {
+            return recordCompBuff, io.EOF
+        }
 
-    // 步骤 6: 反序列化
-    if writeWalType == WriteWalLineProtocol {
-        rowsObjects, err = l.unmarshalRows(binaryBuff, rowsObjects)
-        wr.rowsObjs = rowsObjects
-    } else {
-        wr.binary = binaryBuff
-    }
+        // 步骤 6: 反序列化
+        if writeWalType == WriteWalLineProtocol {
+            rowsObjects, err = l.unmarshalRows(binaryBuff, rowsObjects)
+            if err != nil {
+                return recordCompBuff, io.EOF
+            }
+            rowsObjects.rowsDataBuff = binaryBuff
+            wr.rowsObjs = rowsObjects
+        } else {
+            wr.binary = binaryBuff
+        }
 
-    // 步骤 7: 调用回调函数
-    innerErr = callBack(wr)
-    return recordCompBuff, innerErr
+        // 步骤 7: 调用回调函数
+        innerErr = callBack(wr)
+        return recordCompBuff, innerErr
+    }
+    // ...（省略读取失败的错误日志）
+    return recordCompBuff, io.EOF
 }
 ```
 
@@ -1969,7 +2047,7 @@ sequenceDiagram
 
     Note over C3: PointRows.Unmarshal
     Note over C3: → unmarshalRows → Row.unmarshal
-    Note over C3: MakeIndexKey → 二进制编码
+    Note over C3: UnmarshalIndexKeys → 二进制编码（由 coordinator 调用）
     Note over C3: UnmarshalShardKeyByTag
 
     Note over C4: shard.WriteRows → writeRowsToTable
@@ -1994,14 +2072,14 @@ sequenceDiagram
 
 > 以 `cpu,host=server1,region=us value=99.5,temperature=25.0 1234567890` 为例，追踪它从 HTTP 请求到落盘的每一步。
 
-### 12.1 完端到端时序图
+### 12.1 端到端时序图
 
 ```mermaid
 sequenceDiagram
     participant Client as 客户端
     participant HTTP as HTTP Handler
     participant Parser as influx.Row.unmarshal()
-    participant IndexKey as MakeIndexKey()
+    participant IndexKey as UnmarshalIndexKeys()
     participant ShardKey as UnmarshalShardKeyByTag()
     participant Hash as xxhash.Sum64()
     participant Route as routeAndMapOriginRows()
@@ -2021,22 +2099,23 @@ sequenceDiagram
     Parser->>Parser: Fields = [(value,99.5,FLOAT),(temperature,25.0,FLOAT)]
     Parser->>Parser: Timestamp = 1234567890
 
-    Note over IndexKey: Step 2: 生成 IndexKey
+    Note over IndexKey: Step 2: IndexKey 编码格式（数据布局；实际生成时机见 Step 5 之后）
     IndexKey->>IndexKey: [4B 总长度][2B 3]["cpu"][2B 2][2B 4]["host"][2B 7]["server1"][2B 6]["region"][2B 2]["us"]
 
     Note over ShardKey: Step 3: 构造 ShardKey
-    ShardKey->>ShardKey: ShardKey = "cpu,host=server1"
+    ShardKey->>ShardKey: ShardKey = "cpu_0001,host=server1"，路由前裁剪为 "host=server1"
 
     Note over Hash: Step 4: xxhash 路由
-    Hash->>Hash: hash = xxhash.Sum64("cpu,host=server1") = 0x7A3F…
-    Hash->>Hash: shardIdx = hash % 4 = 2 → Shard[2]
+    Hash->>Hash: hash = xxhash.Sum64("host=server1")（64 位）
+    Hash->>Hash: shardIdx = aliveShardIdxes[hash % N]（N = 活跃 shard 数）
 
     Note over Route: Step 5: coordinator 路由
     Route->>Route: 验证 timestamp 在 RP 范围内
     Route->>Route: sort.Stable(&Fields)
     Route->>Route: createMeasurement("cpu")
-    Route->>Route: updateShardGroupAndShardKey → ShardInfo(ID:201)
-    Route->>Route: ctx.setShardRow(shard201, row)
+    Route->>Route: updateShardGroupAndShardKey() → *ShardInfo
+    Route->>Route: ctx.setShardRow(sh, row)
+    Route->>IndexKey: LocalStore.WriteRows → UnmarshalIndexKeys（coordinator/points_writer.go:1017）
 
     Route->>SPDY: writeRowToShard → TSDBStore.WriteRows()
     SPDY->>Shard: 本地 store 直接调用；远端目标经 transport/SPDY 到 ts-store
@@ -2044,21 +2123,21 @@ sequenceDiagram
     Note over Shard: Step 6: shard 写入
     Shard->>Shard: writeRowsToTable()
     Shard->>Shard: mapRows() → 按 measurement 分组
-    Shard->>Shard: allocResource(128 bytes) → 内存令牌
+    Shard->>Shard: allocResource(curSize) → 内存令牌
     Shard->>Shard: storage.WriteIndex() → 同步构建 tsstore 索引
 
     Shard->>MemTable: activeTbl.MTable.WriteRows()
     Note over MemTable: Step 7: MemTable 写入（先执行）
     MemTable->>MemTable: CreateMsInfo("cpu_0001")
-    MemTable->>MemTable: CreateChunk(SID=67890) → WriteChunk
+    MemTable->>MemTable: CreateChunk(sid) → WriteChunk
     MemTable->>MemTable: appendFields(timestamp=1234567890,<br/>fields=[(value,99.5),(temperature,25.0)])
 
     Shard->>WAL: wal.Write(binaryRows)
     Note over WAL: Step 8: WAL 写入（后执行）
-    Shard->>Shard: wait() → 收敛索引结果
     WAL->>WAL: snappy.Encode(binaryRows)
     WAL->>WAL: [Type=0x01][Len=4B][CompressedData]
-    WAL->>WAL: logWriter[writeReq%4].Write(compBuf)
+    WAL->>WAL: logWriter[writeReq % partitionNum].Write(compBuf)
+    Shard->>Shard: wait() → 收敛索引结果
 
     Note over Snap: Step 9: Snapshot (异步触发)
     Snap->>Snap: 100ms 定时器检查
@@ -2081,7 +2160,7 @@ cpu,host=server1,region=us value=99.5,temperature=25.0 1234567890
 func (r *Row) unmarshal(s string, ...) {
     // s = "cpu,host=server1,region=us value=99.5,temperature=25.0 1234567890"
 
-    // 找第一个空格 → n=27
+    // 找第一个空格 → n=26
     n := nextUnescapedChar(s, ' ', ...)
     measurementTags := s[:n]  // "cpu,host=server1,region=us"
     s = stripLeadingWhitespace(s[n+1:])  // "value=99.5,temperature=25.0 1234567890"
@@ -2138,57 +2217,61 @@ Row{
     Fields:    [{Key:"value", Value:99.5, Type:FLOAT}, {Key:"temperature", Value:25.0, Type:FLOAT}],
     Timestamp: 1234567890,
     // 以下字段在后续步骤填充
-    IndexKey:  nil,  // Step 2 填充
+    IndexKey:  nil,  // 解析阶段为 nil；coordinator 调 store 前填充（Step 5 之后）
     ShardKey:  nil,  // Step 3 填充
-    PrimaryId: 0,    // Step 5 填充
-    SeriesId:  0,    // Step 5 填充
+    PrimaryId: 0,    // Step 6 storage.WriteIndex 填充（engine/ts_storage.go:74-79）
+    SeriesId:  0,    // Step 6 storage.WriteIndex 填充
 }
 ```
 
 ### 12.3 Step 2 详解：IndexKey 生成 — 二进制编码
 
-**代码路径**：`lib/util/lifted/vm/protoparser/influx/parser.go:792-817`
+> 与 §3.2 相同：实际生成函数是 `(*Row).UnmarshalIndexKeys`（`lib/util/lifted/vm/protoparser/influx/parser.go:857-884`），由 coordinator 的 `LocalStore.WriteRows` 在调 store 前调用（`coordinator/points_writer.go:1014-1020`）。
 
-**输入**：`name="cpu"`, `tags=[{host,server1},{region,us}]`
+**代码路径**：`lib/util/lifted/vm/protoparser/influx/parser.go:857-884`
+
+**输入**：`r.Name="cpu"`, `r.Tags=[{host,server1},{region,us}]`
 
 ```go
-func MakeIndexKey(name string, tags PointTags, dst []byte) []byte {
+func (r *Row) UnmarshalIndexKeys(indexkeypool []byte) []byte {
     // 计算总长度
     indexKl := 4 +           // total length (4 bytes) = 4
         2 +                  // measurement name length (2 bytes) = 2
-        len(name) +          // "cpu" = 3
+        len(r.Name) +        // "cpu" = 3
         2 +                  // tag count (2 bytes) = 2
-        4*len(tags) +        // 2 tags × 4 bytes = 8
-        tags.TagsSize()      // "host"+"server1"+"region"+"us" = 4+7+6+2 = 19
+        4*len(r.Tags) +      // 2 tags × 4 bytes = 8
+        r.Tags.TagsSize()    // "host"+"server1"+"region"+"us" = 4+7+6+2 = 19
     // indexKl = 4 + 2 + 3 + 2 + 8 + 19 = 38
+    // ...
 ```
 
 **逐行解释**：
 - `4`：总长度字段本身占 4 字节
 - `2`：measurement name 长度字段占 2 字节
-- `len("cpu")` = 3：measurement name 本身占 3 字节
+- `len(r.Name)` = 3：measurement name 本身占 3 字节
 - `2`：tag 数量字段占 2 字节
 - `4*2` = 8：每个 tag 的 keyLen(2) + valueLen(2)，共 2 个 tag
-- `tags.TagsSize()` = `len("host")+len("server1")+len("region")+len("us")` = 4+7+6+2 = 19
+- `r.Tags.TagsSize()` = `len("host")+len("server1")+len("region")+len("us")` = 4+7+6+2 = 19
 
 ```go
+    // 示意：按示例值展开编码过程
     // 编码过程（逐字节）
-    dst = encoding.MarshalUint32(dst, 38)      // [0x00, 0x00, 0x00, 0x26]
-    dst = encoding.MarshalUint16(dst, 3)       // [0x00, 0x03]
-    dst = append(dst, "cpu"...)                 // [0x63, 0x70, 0x75]
-    dst = encoding.MarshalUint16(dst, 2)       // [0x00, 0x02] (tag count)
+    indexkeypool = encoding.MarshalUint32(indexkeypool, 38)      // [0x00, 0x00, 0x00, 0x26]
+    indexkeypool = encoding.MarshalUint16(indexkeypool, 3)       // [0x00, 0x03]
+    indexkeypool = append(indexkeypool, "cpu"...)                 // [0x63, 0x70, 0x75]
+    indexkeypool = encoding.MarshalUint16(indexkeypool, 2)       // [0x00, 0x02] (tag count)
 
     // Tag 1: host=server1
-    dst = encoding.MarshalUint16(dst, 4)       // [0x00, 0x04] (key len)
-    dst = append(dst, "host"...)                // [0x68, 0x6F, 0x73, 0x74]
-    dst = encoding.MarshalUint16(dst, 7)       // [0x00, 0x07] (value len)
-    dst = append(dst, "server1"...)             // [0x73, 0x65, 0x72, 0x76, 0x65, 0x72, 0x31]
+    indexkeypool = encoding.MarshalUint16(indexkeypool, 4)       // [0x00, 0x04] (key len)
+    indexkeypool = append(indexkeypool, "host"...)                // [0x68, 0x6F, 0x73, 0x74]
+    indexkeypool = encoding.MarshalUint16(indexkeypool, 7)       // [0x00, 0x07] (value len)
+    indexkeypool = append(indexkeypool, "server1"...)             // [0x73, 0x65, 0x72, 0x76, 0x65, 0x72, 0x31]
 
     // Tag 2: region=us
-    dst = encoding.MarshalUint16(dst, 6)       // [0x00, 0x06] (key len)
-    dst = append(dst, "region"...)              // [0x72, 0x65, 0x67, 0x69, 0x6F, 0x6E]
-    dst = encoding.MarshalUint16(dst, 2)       // [0x00, 0x02] (value len)
-    dst = append(dst, "us"...)                  // [0x75, 0x73]
+    indexkeypool = encoding.MarshalUint16(indexkeypool, 6)       // [0x00, 0x06] (key len)
+    indexkeypool = append(indexkeypool, "region"...)              // [0x72, 0x65, 0x67, 0x69, 0x6F, 0x6E]
+    indexkeypool = encoding.MarshalUint16(indexkeypool, 2)       // [0x00, 0x02] (value len)
+    indexkeypool = append(indexkeypool, "us"...)                  // [0x75, 0x73]
 }
 ```
 
@@ -2213,27 +2296,28 @@ func MakeIndexKey(name string, tags PointTags, dst []byte) []byte {
 
 > IndexKey 是索引系统中最核心的数据结构之一。它的编码方式直接影响查询性能。
 
-**原因 1：二进制编码比字符串拼接更紧凑**
+**原因 1：定长前缀 + 变长内容，定位字段无需扫描分隔符**
 ```
 字符串拼接方式："cpu,host=server1,region=us"
-  长度 = 29 字节（包含逗号、等号等分隔符）
+  长度 = 26 字节（含逗号、等号等分隔符）
 
 二进制编码方式：[4B总长][2B名长][cpu][2B标签数][2B键长][host][2B值长][server1]...
-  长度 ≈ 25 字节（无分隔符，长度字段用固定 2 字节）
+  长度 = 38 字节（本例比字符串多 12 字节）
 
-节省约 15% 的存储空间，且解析速度更快
+结论：编码并不“更省空间”，而是用固定长度前缀换取 O(1) 的字段定位与按字节比较能力
 ```
 
-**原因 2：支持前缀匹配和范围查询**
+**原因 2：可直接按字节比较与前缀 seek**
 ```
-二进制编码的结构化格式支持高效的前缀匹配：
+IndexKey 的布局是自描述的：[4B 总长][2B 名长][name][2B tag 数][2B key 长][key][2B value 长][value]...
 
-查询：WHERE host = 'server1'
-  1. 构造前缀：[0x01] + [measurement] + [0x02] + [host] + [server1]
-  2. 在 B-Tree 索引中做前缀扫描
-  3. 所有匹配的 IndexKey 连续存储，一次 IO 就能读取
+查询 WHERE host = 'server1' 时：
+  1. 按长度前缀直接跳到第 1 个 tag 的 key/value，不需要解析逗号/等号
+  2. 底层倒排索引是 mergeset（LSM 式 merge set，engine/index/tsi/mergeset_index.go:266），
+     支持按字节序做前缀 seek
+  3. 相同前缀的 key 在 mergeset 中相邻，可连续扫描
 
-如果用字符串拼接，需要先解析逗号和等号，再做比较，效率低得多
+字符串拼接则需要先解析分隔符再比较，多一层解析开销
 ```
 
 **原因 3：Tags 排序保证幂等性**
@@ -2257,14 +2341,14 @@ func MakeIndexKey(name string, tags PointTags, dst []byte) []byte {
 
 ```go
 func (r *Row) UnmarshalShardKeyByTag(tags []string) error {
-    r.ShardKey = append(r.ShardKey[:0], r.Name...)  // r.ShardKey = "cpu"
+    r.ShardKey = append(r.ShardKey[:0], r.Name...)  // r.ShardKey = "cpu_0001"（r.Name 此时已带版本号）
 
     // 双指针法匹配
     i, j := 0, 0  // i → tags=["host"], j → r.Tags=[{host,server1},{region,us}]
     for i < len(tags) && j < len(r.Tags) {
         // tags[0]="host" == r.Tags[0].Key="host" → 匹配！
         if tags[i] == r.Tags[j].Key {
-            r.appendShardKey(j)  // r.ShardKey = "cpu,host=server1"
+            r.appendShardKey(j)  // r.ShardKey = "cpu_0001,host=server1"
             i++  // i=1
         }
         j++  // j=1
@@ -2275,12 +2359,13 @@ func (r *Row) UnmarshalShardKeyByTag(tags []string) error {
 ```
 
 **逐行解释**：
-- `r.ShardKey = "cpu"` — 从 measurement name 开始
+- `r.ShardKey = "cpu_0001"` — 从 measurement name 开始（此时 `r.Name` 已由 createMeasurement 换成带版本号的名字）
 - `tags[0]="host"` == `r.Tags[0].Key="host"` → 匹配
-- `appendShardKey(0)` → `r.ShardKey = "cpu,host=server1"`
+- `appendShardKey(0)` → `r.ShardKey = "cpu_0001,host=server1"`
 - 循环结束，`i=1 == len(tags)=1`，所有 shardKey tags 都找到了
 
-**最终 ShardKey**：`"cpu,host=server1"`
+**此时的 ShardKey**：`"cpu_0001,host=server1"`；进入哈希前会裁剪掉 name 前缀
+（`r.ShardKey = r.ShardKey[len(r.Name)+1:]`，`coordinator/points_writer.go:786`）→ `"host=server1"`
 
 **为什么 ShardKey 不包含 region？**
 - ShardKey 只包含配置的 `shardKeyTags`，不包含所有 tags
@@ -2292,35 +2377,34 @@ func (r *Row) UnmarshalShardKeyByTag(tags []string) error {
 **代码路径**：`lib/util/lifted/influx/meta/shardinfo.go:571-573, 393-399`
 
 ```go
-// 步骤 1: 计算哈希值
-hash := xxhash.Sum64([]byte("cpu,host=server1"))
-// 假设 hash = 0x7A3F8B2C1D4E5F60 (64 位)
+// 步骤 1: 计算哈希值（输入是裁剪掉 measurement name 后的 ShardKey）
+hash := xxhash.Sum64([]byte("host=server1"))
+// 假设 hash = 0x7A3F8B2C1D4E5F60（64 位，示意）
 
 // 步骤 2: 选择 shard
 func (sgi *ShardGroupInfo) ShardFor(hash uint64, aliveShardIdxes []int) *ShardInfo {
-    // 假设 aliveShardIdxes = [0, 1, 2, 3] (4 个活跃 shard)
+    // aliveShardIdxes 为当前活跃 shard 的下标列表，长度 N 即参与取模的 shard 数
     shardIdx := aliveShardIdxes[hash % uint64(len(aliveShardIdxes))]
-    // shardIdx = 0x7A3F8B2C1D4E5F60 % 4 = 0 (偶数)
-    // 假设实际计算结果是 2
-    return &sgi.Shards[2]  // 返回 Shard[2]
+    return &sgi.Shards[shardIdx]
 }
 ```
 
 **逐行解释**：
-- `xxhash.Sum64()` 对 `"cpu,host=server1"` 计算 64 位哈希值
-- `hash % 4` 取模得到 shard 索引（假设 4 个活跃 shard）
+- `xxhash.Sum64()` 对裁剪后的 ShardKey `"host=server1"` 计算 64 位哈希值
+- `hash % N` 取模（N = `len(aliveShardIdxes)`）得到 shard 索引
 - 相同的 ShardKey 总是路由到相同的 shard，保证数据局部性
 
 **关键设计**：
-- 如果 host=server1 的数据路由到 Shard[2]，那么所有 host=server1 的数据都会路由到 Shard[2]
+- 如果 host=server1 的数据路由到某个 shard，那么所有 host=server1 的数据都会路由到同一个 shard
 - 这样查询 `WHERE host='server1'` 只需要扫描一个 shard，提高查询效率
 - 如果 shard 数量变化（扩容/缩容），aliveShardIdxes 会更新，路由也会相应变化
 
 ### 12.6 Step 5 详解：coordinator 路由 — 验证与分组
 
-**代码路径**：`coordinator/points_writer.go:381-612`
+**代码路径**：`coordinator/points_writer.go:381-544`
 
 ```go
+// 示意：省略错误处理与流相关分支
 func (w *PointsWriter) routeAndMapOriginRows(...) {
     for i := 0; i < len(rows); i++ {
         r = &rows[i]  // r = &Row{Name:"cpu", Tags:[...], Fields:[...], Timestamp:1234567890}
@@ -2348,10 +2432,10 @@ func (w *PointsWriter) routeAndMapOriginRows(...) {
 
         // 步骤 6: 计算 ShardKey，找到目标 shard
         err, sh, _ = w.updateShardGroupAndShardKey(database, retentionPolicy, r, ctx, ...)
-        // sh = &ShardInfo{ID: 201, Owners: [{NodeID:1}, {NodeID:2}]}
+        // sh = &ShardInfo{ID: <shardId>, Owners: [...]}（示意）
 
         // 步骤 7: 将行映射到 shard
-        ctx.setShardRow(sh, r)  // shardMap[201] = append(shardMap[201], r)
+        ctx.setShardRow(sh, r)  // shardMap[<shardId>] = append(shardMap[<shardId>], r)
     }
 }
 ```
@@ -2365,10 +2449,10 @@ func (w *PointsWriter) routeAndMapOriginRows(...) {
 **路由结果**：
 ```go
 shardMap = {
-    ShardInfo{ID:201}: [
+    ShardInfo{ID:<shardId>}: [
         Row{Name:"cpu_0001", Tags:[{host,server1},{region,us}],
             Fields:[{temperature,25.0},{value,99.5}], Timestamp:1234567890,
-            ShardKey:"cpu,host=server1", IndexKey:[...], PrimaryId:67890},
+            ShardKey:"cpu_0001,host=server1", IndexKey:[...], PrimaryId:67890},
     ],
 }
 ```
@@ -2391,9 +2475,21 @@ func (s *shard) WriteRows(rows []influx.Row, binaryRows []byte) error {
     // 标记正在写入（防止 shard 被关闭）
     defer s.markBeingWritten()()
 
-    // 调用 writeRowsToTable
-    err = s.writeRowsToTable(rows, binaryRows)
-    return err
+    var err error
+    if s.engineType == config.TSSTORE && config.ShelfModeEnabled() {
+        err = s.writeRowsShelfMode(rows)  // Shelf WAL 模式
+    } else {
+        err = s.writeRowsToTable(rows, binaryRows)  // 普通模式
+    }
+    if err != nil {
+        log.Error("write buffer failed", zap.Error(err))
+        atomic.AddInt64(&statistics.PerfStat.WriteReqErrors, 1)
+        return err
+    }
+
+    atomic.AddInt64(&statistics.PerfStat.WriteRowsBatch, 1)
+    atomic.AddInt64(&statistics.PerfStat.WriteRowsCount, int64(len(rows)))
+    return nil
 }
 ```
 
@@ -2401,11 +2497,16 @@ func (s *shard) WriteRows(rows []influx.Row, binaryRows []byte) error {
 - `s.isClosing()`：检查 shard 是否正在关闭，如果关闭则拒绝写入
 - `s.mu.RLock()`：读锁，允许多个 goroutine 并发写入
 - `s.markBeingWritten()`：标记正在写入，防止 shard 在写入过程中被关闭
+- `config.ShelfModeEnabled()`：`engineType == TSSTORE` 且开启 Shelf 时走 `writeRowsShelfMode`，否则走 `writeRowsToTable`
 
 ```go
 func (s *shard) writeRowsToTable(rows influx.Rows, binaryRows []byte) error {
+    var err error
+
     // 步骤 1: 更新最后写入时间
     atomic.StoreUint64(&s.lastWriteTime, fasttime.UnixTimestamp())
+
+    // ...（省略 getMstWriteCtx/putMstWriteCtx）
 
     // 步骤 2: 按 measurement 分组
     mapRows(rows, mw)
@@ -2429,6 +2530,11 @@ func (s *shard) writeRowsToTable(rows influx.Rows, binaryRows []byte) error {
     if err == nil {
         err = wait()
     }
+    if err != nil {
+        return err
+    }
+
+    s.addRowCounts(int64(len(rows)))
     return nil
 }
 ```
@@ -2437,7 +2543,7 @@ func (s *shard) writeRowsToTable(rows influx.Rows, binaryRows []byte) error {
 - `mapRows()`：将行按 measurement 分组，方便批量处理
 - `calculateMemSize()`：计算行数据的内存大小
 - `nodeMutableLimit.allocResource()`：申请内存令牌，如果内存不足会阻塞等待
-- `WriteIndex()`：普通 tsstore 同步构建索引并返回 `wait`；columnstore 的列写入索引在 goroutine 中异步执行
+- `WriteIndex()`：普通 tsstore 同步构建索引并把错误封进 `wait` 闭包；列存的 `ColumnStoreImpl.WriteIndex` 在 goroutine 中异步执行、由 `wait` 收敛
 - `writeRows()`：在 `WriteIndex` 之后写入 MemTable 和 WAL，内部顺序是 `MTable.WriteRows` → `wal.Write`
 
 ### 12.8 Step 7 详解：MemTable 写入 — 列式存储
@@ -2467,8 +2573,12 @@ func (t *tsMemTableImpl) WriteRows(table *MemTable, rowsD *dictpool.Dict, wc Wri
                 // 创建索引条目：ShardKey → SID
             }
 
-            // 步骤 4: 追加字段数据
+            // 步骤 4: 追加字段数据（内部校验 schema；不一致且未复制过时先 copySchema/扩容，见 engine/mutable/ts_table.go:355-369）
             _, err = t.appendFields(msInfo, chunk, rs[index].Timestamp, rs[index].Fields)
+            if err != nil {
+                return err
+            }
+            // ...（省略 wc.AddRowCountsBySid 与统计埋点）
         }
     }
     return nil
@@ -2519,6 +2629,7 @@ func (t *tsMemTableImpl) appendFields(msInfo *MsInfo, chunk *WriteChunk, time in
 - `writeRec.init(msInfo.Schema)`：初始化 record，创建列式存储结构
 - `checkSchemaIsSame()`：检查新数据的 schema 是否与 record 一致
 - `record.AppendFieldsToRecord()`：将字段数据追加到 record 的列中
+- **schema 变化**：`sameSchema=false` 且 `schemaCopyed=false` 时会 `copySchema`、`ReserveColVal` 扩容并置 `schemaCopyed=true`（`engine/mutable/ts_table.go:355-369`）
 
 **MemTable 写入后的数据布局**：
 ```
@@ -2561,20 +2672,30 @@ func (l *WAL) Write(rows []byte, typ WalRecordType, maxRowTime int64) error {
     // typ = WriteWalLineProtocol
     // maxRowTime = 1234567890
 
+    if !l.walEnabled {
+        return nil  // WAL 未启用
+    }
+    if len(rows) == 0 {
+        return nil  // 空数据
+    }
+
     // 更新最大时间戳
     l.mu.Lock()
     l.maxRowTime = max(l.maxRowTime, maxRowTime)  // l.maxRowTime = 1234567890
     l.mu.Unlock()
 
     // 写入 WAL
+    start := time.Now()
+    failpoint.Inject("SlowDownWalWrite", nil)
     err := l.writeBinary(&walRecord{binary: rows, writeWalType: typ})
+    atomic.AddInt64(&statistics.PerfStat.WriteWalDurationNs, time.Since(start).Nanoseconds())
     return err
 }
 ```
 
 **逐行解释**：
 - `rows`：序列化后的行数据，包含 measurement、tags、fields、timestamp
-- `maxRowTime`：更新 WAL 的最大时间戳，用于判断是否需要 snapshot
+- `maxRowTime`：更新 WAL 的最大时间戳，`Switch()` 时写入 `WalFiles.maxTime`，用于 stream WAL 的文件命名与过期清理（`engine/wal.go:254`、`engine/wal_manager.go:189-208`）；snapshot 触发只看 `NeedFlush()`/`timeToSnapshot()`
 - `writeBinary()`：实际写入 WAL 文件
 
 ```go
@@ -2589,16 +2710,23 @@ func (l *WAL) writeBinary(walRecord *walRecord) error {
     // 假设压缩后 compData = [0x1A, 0x2B, 0x3C, ...] (变长)
 
     // 步骤 3: 编码记录头
-    compBuf[0] = byte(WalRecordType)  // 0x01 (WriteWalLineProtocol)
-    binary.BigEndian.PutUint32(compBuf[1:5], uint32(len(compData)))
-    // compBuf[1:5] = [0x00, 0x00, 0x00, 0x0A] (假设压缩后长度=10)
-    compBuf = compBuf[:5+len(compData)]
+    compBuf[0] = byte(walRecord.writeWalType)  // 0x01 (WriteWalLineProtocol)
+    binary.BigEndian.PutUint32(compBuf[1:WalRecordHeadSize], uint32(len(compData)))
+    // compBuf[1:WalRecordHeadSize] = [0x00, 0x00, 0x00, 0x0A] (假设压缩后长度=10)
+    compBuf = compBuf[:WalRecordHeadSize+len(compData)]
+
+    // ...（省略缓冲区归还的 defer 块）
 
     // 步骤 4: 选择分区并写入
+    l.mu.RLock()
     partitionIdx := (atomic.AddUint64(&l.writeReq, 1) - 1) % uint64(l.partitionNum)
     // 假设 l.writeReq=42, l.partitionNum=4 → partitionIdx = 41 % 4 = 1
-    err := l.logWriter[1].Write(compBuf)
-    return err
+    err := l.logWriter[partitionIdx].Write(compBuf)
+    l.mu.RUnlock()
+    if err != nil {
+        panic(fmt.Errorf("writing WAL entry failed: %v", err))
+    }
+    return nil
 }
 ```
 
@@ -2841,49 +2969,34 @@ func (s *shard) commitSnapshot(snapshot *mutable.MemTable) {
 - `s.checkMstDeleting(msName)`：跳过正在删除的 measurement，避免冲突
 - `FlushChunks()`：把 MemTable 中的数据写入 TSSP 文件（列式存储格式）
 
-**TSSP 文件格式**（简化）：
+**TSSP 文件格式**（示意：仅表达逻辑结构，字段名/偏移并非真实布局；真实格式见 `13_tssp_file_format_spec.md`）：
 ```
 TSSP 文件 {
-    Header: {
-        Magic: "TSSP"
-        Version: 1
-        Measurement: "cpu_0001"
-        Schema: [{Key:"value", Type:FLOAT}, {Key:"temperature", Type:FLOAT}]
-    }
-    Data Blocks: [
-        Block 1: {
-            SeriesID: 67890
-            TimeRange: [1234567890, 1234567890]
-            Columns: [
-                {Name:"value",       Type:FLOAT, Values:[99.5]},
-                {Name:"temperature", Type:FLOAT, Values:[25.0]},
-                {Name:"time",        Type:INT,   Values:[1234567890]},
-            ]
+    Header: [tableMagic "53ac2021"][version]      // engine/immutable/table.go:24-28
+    Measurement Blocks: [
+        Block {
+            SeriesID
+            TimeRange
+            Columns（列式：value / temperature / time）
         }
     ]
-    Index: {
-        SeriesID 67890 → Block 1, Offset:0, Size:128
-    }
-    Footer: {
-        IndexOffset: 1024
-        BlockCount: 1
-    }
+    Index / Trailer（series → block 定位）
 }
 ```
 
 ### 12.11 总结：一条数据点的完整生命周期
 
-| 步骤 | 位置 | 输入 | 输出 | 耗时 |
+| 步骤 | 位置 | 输入 | 输出 | 耗时（量级示意，未实测） |
 |------|------|------|------|------|
-| 1. Line Protocol 解析 | `influx/parser.go:1169` | 字符串 | Row 结构体 | ~1μs |
-| 2. IndexKey 生成 | `influx/parser.go:792` | name+tags | 二进制 IndexKey | ~0.5μs |
-| 3. ShardKey 构造 | `influx/parser.go:307` | name+tags+config | ShardKey 字符串 | ~0.3μs |
-| 4. xxhash 路由 | `shardinfo.go:571` | ShardKey | 目标 Shard | ~0.1μs |
-| 5. coordinator 路由 | `points_writer.go:381` | Row | shardMap | ~5μs |
-| 6. shard 写入 | `shard.go:527` | rows | MemTable+WAL | ~10μs |
-| 7. MemTable 写入 | `ts_table.go:295` | rows | 内存中的列式数据 | ~3μs |
-| 8. WAL 写入 | `wal.go:245` | binaryRows | WAL 文件 | ~5μs |
-| 9. Snapshot | `ts_storage.go:129` | MemTable | TSSP 文件 | ~100ms (异步) |
+| 1. Line Protocol 解析 | `lib/util/lifted/vm/protoparser/influx/parser.go:1169` | 字符串 | Row 结构体 | ~1μs |
+| 2. IndexKey 生成 | `lib/util/lifted/vm/protoparser/influx/parser.go:857` | Row.Name+Row.Tags | 二进制 IndexKey | ~0.5μs |
+| 3. ShardKey 构造 | `lib/util/lifted/vm/protoparser/influx/parser.go:307` | name+tags+config | ShardKey 字符串 | ~0.3μs |
+| 4. xxhash 路由 | `lib/util/lifted/influx/meta/shardinfo.go:571` | 裁剪后的 ShardKey | 目标 Shard 下标 | ~0.1μs |
+| 5. coordinator 路由 | `coordinator/points_writer.go:381` | Row | shardMap | ~5μs |
+| 6. shard 写入 | `engine/shard.go:527` | rows | MemTable+WAL | ~10μs |
+| 7. MemTable 写入 | `engine/mutable/ts_table.go:295` | rows | 内存中的列式数据 | ~3μs |
+| 8. WAL 写入 | `engine/wal.go:245` | binaryRows | WAL 文件 | ~5μs |
+| 9. Snapshot | `engine/ts_storage.go:129` | MemTable | TSSP 文件 | ~100ms (异步) |
 
 **关键设计点**：
 1. **列式存储**：MemTable 使用列式存储（record.Record），同一列的数据连续存储，提高查询效率

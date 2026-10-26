@@ -1,5 +1,7 @@
 # Module 3: Query Engine 深度审计报告（庖丁解牛版 v3）
 
+> 代码基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）。文中 `file:line` 均以该快照为准。
+
 > 时序图优先，逐步拆解。SQL → AST → 逻辑计划 → DAG → 执行，每一步都不放过。核心代码逐行解释。
 
 ---
@@ -25,7 +27,7 @@ sequenceDiagram
     SQL->>Planner: BuildLogicalPlan()
     Planner-->>SQL: 逻辑计划树
 
-    SQL->>Optimizer: BuildHeuristicPlanner()
+    SQL->>Optimizer: BuildHeuristicPlanner()（仅未命中模板时）
     Optimizer-->>SQL: 优化后的计划
 
     SQL->>Builder: ExecutorBuilder.Build()
@@ -49,8 +51,7 @@ sequenceDiagram
 
 ```go
 // 查询入口函数：编译、准备、启动执行
-func Select(ctx context.Context, stmt *influxql.SelectStatement,
-    shardMapper query.ShardMapper, opt query.SelectOptions) (hybridqp.Executor, error) {
+func Select(ctx context.Context, stmt *influxql.SelectStatement, shardMapper query.ShardMapper, opt query.SelectOptions) (hybridqp.Executor, error) {
 
     s, err := query.Prepare(stmt, shardMapper, opt)   // 预编译：映射 Shard
     if err != nil {
@@ -64,7 +65,7 @@ func Select(ctx context.Context, stmt *influxql.SelectStatement,
 
 **逐行解释**：
 - `query.Prepare(stmt, shardMapper, opt)`：预编译阶段，映射 Shard 到节点，创建 `preparedStatement`
-- `preparedStatement.BuildLogicalPlan()`：构建逻辑计划 + 启发式优化
+- `preparedStatement.BuildLogicalPlan()`：构建逻辑计划（模板命中直接返回，否则执行启发式优化）
 - `ExecutorBuilder.Build()`：把逻辑计划转换成 DAG
 - `PipelineExecutor.Execute()`：并行执行 DAG 中的 Transform
 
@@ -84,21 +85,24 @@ func Select(ctx context.Context, stmt *influxql.SelectStatement,
 
 步骤 2：构建逻辑计划
   输入：SelectStatement AST
-  输出：逻辑计划树
-    - FilterTransform (WHERE host='server1')
+  输出：逻辑计划树（数据流方向）
+    - ChunkReader (读取 cpu)
+    - Exchange (SERIES → READER → SHARD → NODE)
+    - StreamAggregateTransform (mean)
     - IntervalTransform (GROUP BY time(1m))
-    - AggTransform (mean)
+    - MaterializeTransform (Project，列裁剪)
+    - FillTransform (默认 FILL(null))
     - LimitTransform (LIMIT 10)
 
-步骤 3：优化
+步骤 3：模板匹配与优化
   输入：逻辑计划树
-  输出：优化后的计划
-    - 谓词下推：把 WHERE 条件推到数据源
-    - Limit 下推：把 LIMIT 推到数据源
-    - 聚合下推：把部分聚合推到数据源
+  输出：最终计划
+    - 该查询命中 AGG_INTERVAL_LIMIT 模板，直接使用预构建模板（不执行启发式优化）
+    - 未命中模板时才执行启发式优化：Limit 下推、聚合下推、聚合展开等
+    - WHERE 条件随 opt.Condition 下发到读取层，由 TSSP reader 逐行求值
 
 步骤 4：DAG 构建
-  输入：优化后的计划
+  输入：最终计划（模板或优化后）
   输出：TransformDAG
     - 每个 Transform 一个 goroutine
     - 通过 Channel 连接
@@ -130,25 +134,25 @@ sequenceDiagram
 
     Note over Lexer: 第一步：词法分析（分词）
     Lexer->>Lexer: 识别 token 序列
-    Lexer->>Lexer: SELECT → Token_SELECT
-    Lexer->>Lexer: mean → Token_IDENT
-    Lexer->>Lexer: ( → Token_LPAREN
-    Lexer->>Lexer: value → Token_IDENT
-    Lexer->>Lexer: ) → Token_RPAREN
-    Lexer->>Lexer: FROM → Token_FROM
-    Lexer->>Lexer: cpu → Token_IDENT
-    Lexer->>Lexer: WHERE → Token_WHERE
-    Lexer->>Lexer: host → Token_IDENT
-    Lexer->>Lexer: = → Token_EQ
-    Lexer->>Lexer: 'server1' → Token_STRING
-    Lexer->>Lexer: GROUP → Token_GROUP
-    Lexer->>Lexer: BY → Token_BY
-    Lexer->>Lexer: time → Token_IDENT
-    Lexer->>Lexer: ( → Token_LPAREN
-    Lexer->>Lexer: 1m → Token_DURATION
-    Lexer->>Lexer: ) → Token_RPAREN
-    Lexer->>Lexer: LIMIT → Token_LIMIT
-    Lexer->>Lexer: 10 → Token_INTEGER
+    Lexer->>Lexer: SELECT → SELECT
+    Lexer->>Lexer: mean → IDENT
+    Lexer->>Lexer: ( → LPAREN
+    Lexer->>Lexer: value → IDENT
+    Lexer->>Lexer: ) → RPAREN
+    Lexer->>Lexer: FROM → FROM
+    Lexer->>Lexer: cpu → IDENT
+    Lexer->>Lexer: WHERE → WHERE
+    Lexer->>Lexer: host → IDENT
+    Lexer->>Lexer: = → EQ
+    Lexer->>Lexer: 'server1' → STRING
+    Lexer->>Lexer: GROUP → GROUP
+    Lexer->>Lexer: BY → BY
+    Lexer->>Lexer: time → IDENT
+    Lexer->>Lexer: ( → LPAREN
+    Lexer->>Lexer: 1m → DURATIONVAL
+    Lexer->>Lexer: ) → RPAREN
+    Lexer->>Lexer: LIMIT → LIMIT
+    Lexer->>Lexer: 10 → INTEGER
 
     Note over Parser: 第二步：语法分析（根据 sql.y 文法规则）
     Parser->>Parser: 匹配 SELECT 语法规则
@@ -176,10 +180,10 @@ sequenceDiagram
     AST->>Fields: Fields: [(Expr: mean(value), Alias: "")]
     Note over Fields: 每个 Field 包含:<br/>表达式 (Call: mean)<br/>参数 (Ref: value)<br/>别名 (Alias)
 
-    AST->>Sources: Sources: [(Database: "mydb",<br/>RetentionPolicy: "autogen",<br/>Name: "cpu")]
+    AST->>Sources: Sources: [(Database: "",<br/>RetentionPolicy: "",<br/>Name: "cpu")]
     Note over Sources: Measurement 信息:<br/>数据库、保留策略、表名
 
-    AST->>Where: Condition: BinaryExpr<br/>Op: AND<br/>LHS: BinaryExpr(host = 'server1')<br/>RHS: nil
+    AST->>Where: Condition: BinaryExpr<br/>Op: EQ<br/>LHS: Ref(host)<br/>RHS: StringLiteral(server1)
     Note over Where: WHERE 条件树:<br/>可以嵌套 AND/OR/NOT
 
     AST->>Group: Dimensions: [(Expr: Call(time, [1m]))]
@@ -207,20 +211,18 @@ sequenceDiagram
     Expr->>Lit: 'server1' → StringLiteral(Val: "server1")
 ```
 
-**核心代码** `influxql/parser.go`：
+**核心代码** `lib/util/lifted/influx/influxql/parser.go`：
 
 ```go
 // 语法分析器（Parser）
-// 注意：没有独立的 Lexer 结构体，词法扫描由 bufScanner 完成
+// 注意：词法分析由 Scanner 完成，Parser 通过 bufScanner 做带缓冲的 token 预读
 type Parser struct {
     s      *bufScanner               // 带缓冲的扫描器（内部封装词法分析）
     params map[string]interface{}     // 绑定参数（用于参数化查询）
 }
 
 // 解析 SQL 文本，返回 *Query（包含多个 Statement），不是 *SelectStatement
-func ParseQuery(s string) (*Query, error) {
-    return NewParser(strings.NewReader(s)).ParseQuery()
-}
+func ParseQuery(s string) (*Query, error) { return NewParser(strings.NewReader(s)).ParseQuery() }
 ```
 
 **具体例子**：
@@ -240,7 +242,7 @@ func ParseQuery(s string) (*Query, error) {
         - Expr: Call{Name: "mean", Args: [Ref{Val: "value"}]}
         - Alias: ""
     - Sources: [cpu]
-      - Source[0]: {Database: "mydb", RetentionPolicy: "autogen", Name: "cpu"}
+      - Source[0]: {Database: "", RetentionPolicy: "", Name: "cpu"}   // 库名/RP 由上层注入
     - Condition: BinaryExpr{Op: EQ, LHS: Ref{Val: "host"}, RHS: StringLiteral{Val: "server1"}}
     - Dimensions: [time(1m)]
       - Dimension[0]: Call{Name: "time", Args: [DurationLiteral{Val: 1m}]}
@@ -277,7 +279,7 @@ sequenceDiagram
 
     Select->>Build: BuildLogicalPlan(stmt, opt)
 
-    Build->>Schema: NewQuerySchema(stmt)
+    Build->>Schema: NewQuerySchemaWithJoinCase(...)
     Schema->>Schema: 解析 Fields、Sources、Condition<br/>构建查询 Schema
     Schema-->>Build: querySchema
 
@@ -296,7 +298,7 @@ sequenceDiagram
         Extended-->>Build: 逻辑计划树
     end
 
-    Build->>Planner: BuildHeuristicPlanner(plan)
+    Build->>Planner: 仅 Extended 路径：BuildHeuristicPlanner(plan)
     Planner->>Planner: FindBestExp()<br/>应用优化规则
     Planner-->>Build: 优化后的逻辑计划
 ```
@@ -321,9 +323,10 @@ func (p *preparedStatement) BuildLogicalPlan(ctx context.Context) (hybridqp.Quer
 	rewriteVarfName(p.stmt.Fields)                 // 重写变量名
 
 	// ===== 步骤 1: 构建 QuerySchema =====
-	schema := NewQuerySchemaWithJoinCase(p.stmt.Fields, p.stmt.Sources, p.stmt.ColumnNames(), opt,
-		p.stmt.JoinSource, p.stmt.UnionSource, p.stmt.UnnestSource, p.stmt.SortFields)
+	schema := NewQuerySchemaWithJoinCase(p.stmt.Fields, p.stmt.Sources, p.stmt.ColumnNames(), opt, p.stmt.JoinSource, p.stmt.UnionSource,
+		p.stmt.UnnestSource, p.stmt.SortFields)
 	schema.SetPromCalls(p.stmt.PromSubCalls)
+	// ...
 
 	// ===== 步骤 2: 尝试匹配模板 =====
 	HaveOnlyCSStore := schema.Sources().HaveOnlyCSStore()
@@ -338,6 +341,7 @@ func (p *preparedStatement) BuildLogicalPlan(ctx context.Context) (hybridqp.Quer
 			}
 			schema.SetPlanType(planType)
 			plan, err := p.buildPlanByCache(ctx, schema, templatePlan, &mstsReqs)
+			// ...
 			return plan, mstsReqs, err              // 模板快速路径，直接返回
 		}
 	}
@@ -347,6 +351,7 @@ func (p *preparedStatement) BuildLogicalPlan(ctx context.Context) (hybridqp.Quer
 	if err != nil {
 		return nil, mstsReqs, err
 	}
+	// ...
 
 	// ===== 步骤 4: 启发式优化 =====
 	planner := p.optimizer()
@@ -370,6 +375,7 @@ func (p *preparedStatement) BuildLogicalPlan(ctx context.Context) (hybridqp.Quer
 			best = ReplaceSortAggWithHashAgg(best)[0]
 		}
 	}
+	// ...
 
 	return best, mstsReqs, nil
 }
@@ -380,7 +386,7 @@ func (p *preparedStatement) BuildLogicalPlan(ctx context.Context) (hybridqp.Quer
 - `GetPlanType(schema, p.stmt)`：尝试匹配 6 种模板（见 3.2 节）
 - `planType != UNKNOWN`：匹配到模板，用预构建的计划，跳过复杂优化
 - `buildExtendedPlan()`：通用路径，从头构建逻辑计划
-- `planner.FindBestExp()`：启发式优化（谓词下推、列裁剪等）
+- `planner.FindBestExp()`：启发式优化（仅通用路径；实际规则为 Limit/聚合下推、聚合展开、DISTINCT 下推等）
 - `ReplaceSortAggMergeWithHashAgg()`：列存专用优化，用 HashAgg 替代 SortAgg
 
 ### 3.2 GetPlanType — 6 种模板匹配
@@ -515,14 +521,21 @@ sequenceDiagram
     SQL->>Tree: SELECT mean(value) FROM cpu<br/>WHERE host='server1'<br/>GROUP BY time(1m) LIMIT 10
 
     Note over Tree: 逻辑计划树（从上到下）
+    Tree->>Tree: LogicalHttpSender - 输出
     Tree->>Tree: LogicalLimit(N: 10) - 限制返回 10 行
-    Tree->>Tree: LogicalAggregate(Func: mean, Field: value) - 聚合计算
+    Tree->>Tree: LogicalFill - 空窗口填充（默认 FILL(null)）
+    Tree->>Tree: LogicalProject - 列裁剪
     Tree->>Tree: LogicalInterval(Duration: 1m) - 1 分钟时间窗口
-    Tree->>Tree: LogicalFilter(host = 'server1') - 过滤条件
-    Tree->>Tree: LogicalExchange(type: READER_EXCHANGE) - Reader 交换节点
-    Tree->>Tree: LogicalReader(Table: cpu) - 数据源
+    Tree->>Tree: LogicalAggregate(Func: mean, Field: value) - 聚合计算
+    Tree->>Tree: LogicalExchange(type: NODE_EXCHANGE) - 跨节点交换
+    Tree->>Tree: LogicalExchange(type: SHARD_EXCHANGE) - 跨 Shard 交换
+    Tree->>Tree: LogicalIndexScan - 索引扫描
+    Tree->>Tree: LogicalExchange(type: READER_EXCHANGE) - 跨 Reader 交换
+    Tree->>Tree: LogicalReader - 数据源
+    Tree->>Tree: LogicalExchange(type: SERIES_EXCHANGE) - 跨 Series 交换
+    Tree->>Tree: LogicalSeries - Series
 
-    Note over Tree: 执行顺序（从下到上）：<br/>Reader → Exchange → Filter → Interval → Aggregate → Limit
+    Note over Tree: 执行顺序（从下到上）：<br/>Series → Exchange(SERIES) → Reader → Exchange(READER) → IndexScan → Exchange(SHARD) → Exchange(NODE) → Aggregate → Interval → Project → Fill → Limit → HttpSender
 ```
 
 **核心代码** `engine/executor/logic_plan.go`（关键 LogicalPlan 结构）：
@@ -555,7 +568,7 @@ type LogicalAggregate struct {
 	LogicalPlanSingle
 }
 
-// LogicalExchange — 交换节点（lines 2080-2093）
+// LogicalExchange — 交换节点（lines 2080-2083）
 type LogicalExchange struct {
 	LogicalPlanSingle
 	LogicalExchangeBase                          // 嵌入 Exchange 基类
@@ -655,19 +668,20 @@ sequenceDiagram
     participant Rules as 优化规则
     participant Output as 优化后计划
 
-    Input->>Planner: Limit → Aggregate → Interval → Filter → ReaderExchange → Reader
+    Input->>Planner: Exchange(NODE) → Exchange(SHARD) → IndexScan → Exchange(READER) → Reader → Aggregate → Interval → Project → Fill → Limit → HttpSender
 
     Planner->>Rules: 应用优化规则
 
-    Note over Rules: 规则 1: 谓词下推<br/>Filter 尽量靠近 Source
-    Rules->>Rules: Filter 从 Aggregate 下方<br/>推到 ReaderExchange 上方
+    Note over Rules: 规则 1: LIMIT 下推<br/>下推到 Exchange / Reader / Series
+    Rules->>Rules: LogicalLimit 越过 Exchange<br/>尽量靠近数据源
 
-    Note over Rules: 规则 2: 列裁剪<br/>只读取需要的列
-    Rules->>Rules: 只读取 value 和 host 列<br/>不读取其他列
+    Note over Rules: 规则 2: 聚合下推<br/>下推到 Exchange / Reader / Series
+    Rules->>Rules: LogicalAggregate 下推<br/>在数据源侧先做局部聚合
 
-    Note over Rules: 规则 3: 常量折叠<br/>预计算常量表达式
-    Rules->>Rules: 1+2 → 3
+    Note over Rules: 规则 3: 聚合展开
+    Rules->>Rules: 全局聚合拆分为<br/>局部聚合 + 最终聚合
 
+    Note over Rules: 另有 SUBQUERY、Castor 聚合裁剪（HEIMADLL）、DISTINCT 下推
     Rules-->>Output: 优化后的计划
 ```
 
@@ -679,7 +693,7 @@ sequenceDiagram
 func (p *HeuPlannerImpl) FindBestExp() hybridqp.QueryNode {
     p.executeProgram(p.mainProgram)   // 执行所有优化规则
     final := p.buildFinalPlan(p.root) // 从 DAG 构建最终计划
-    hybridqp.WalkQueryNodeInPostOrder(p, final) // 后序遍历，分配节点 ID
+    hybridqp.WalkQueryNodeInPostOrder(p, final) // 后序遍历并调用 DeriveOperations()
     return final
 }
 ```
@@ -687,7 +701,7 @@ func (p *HeuPlannerImpl) FindBestExp() hybridqp.QueryNode {
 **逐行解释**：
 - `p.executeProgram(p.mainProgram)`：执行主优化程序，遍历 DAG 中每个节点，尝试匹配并应用优化规则
 - `p.buildFinalPlan(p.root)`：从优化后的 DAG 根节点构建最终的逻辑计划树
-- `hybridqp.WalkQueryNodeInPostOrder(p, final)`：后序遍历计划树，为每个节点分配唯一 ID
+- `hybridqp.WalkQueryNodeInPostOrder(p, final)`：后序遍历计划树，对每个节点调用 `DeriveOperations()`
 
 ### 4.3 核心代码：applyRules() — 规则应用的不动点循环
 
@@ -695,30 +709,62 @@ func (p *HeuPlannerImpl) FindBestExp() hybridqp.QueryNode {
 
 ```go
 func (p *HeuPlannerImpl) applyRules(ruleSet RuleSet) {
-    for {
-        iter := p.dag.GetGraphIterator(p.root, p.currentProgram.matchOrder)
-        fixedPoint = true  // 假设达到不动点
-        for {
-            vertex, nodes := iter.Next()
-            if vertex == nil { break }
-            for rule := range ruleSet {
-                newVertex := p.applyRule(rule, vertex, nodes)
-                if newVertex != nil {
-                    fixedPoint = false  // 有规则匹配，继续循环
-                }
-            }
-        }
-        if fixedPoint { break }  // 没有规则匹配，达到不动点
-    }
+	forceRestartAfterTransformation := p.currentProgram.matchOrder != ARBITRARY &&
+		p.currentProgram.matchOrder != DEPTH_FIRST
+	nMatches := 0
+	var fixedPoint bool
+
+	nodes := listPool.Get()
+	defer func() {
+		listPool.Put(nodes)
+	}()
+
+	for {
+		iter := p.dag.GetGraphIterator(p.root, p.currentProgram.matchOrder)
+		fixedPoint = true
+		for {
+			if !iter.HasNext() {
+				break
+			}
+			vertex := iter.Next()
+			for rule := range ruleSet {
+				newVertex := p.applyRule(rule, vertex, nodes)
+				if newVertex == nil || newVertex.Equals(vertex) {
+					continue
+				}
+				nMatches++
+				if nMatches >= p.currentProgram.matchLimit {
+					return
+				}
+				if forceRestartAfterTransformation {
+					iter = p.dag.GetGraphIterator(p.root, p.currentProgram.matchOrder)
+				} else {
+					iter = p.dag.GetGraphIterator(newVertex, p.currentProgram.matchOrder)
+					if p.currentProgram.matchOrder == DEPTH_FIRST {
+						nMatches = p.depthFirstApply(iter, ruleSet, nMatches)
+					}
+					if nMatches >= p.currentProgram.matchLimit {
+						return
+					}
+					fixedPoint = false
+				}
+				break
+			}
+		}
+		if fixedPoint {
+			break
+		}
+	}
 }
 ```
 
 **逐行解释**：
-- 外层 `for` 循环：反复遍历 DAG，直到没有规则可以匹配（不动点）
-- `iter.Next()`：按匹配顺序（深度优先或任意）遍历 DAG 中的每个节点
-- `p.applyRule(rule, vertex, nodes)`：尝试将规则应用到当前节点，如果匹配则返回新的节点
-- `fixedPoint = false`：只要有规则匹配成功，就需要重新遍历（因为新节点可能触发更多优化）
-- `if fixedPoint { break }`：所有规则都不匹配，优化完成
+- 外层 `for` 循环：反复遍历 DAG，直到没有规则再产生有效变换（不动点）
+- `iter.HasNext()` / `iter.Next()`：按匹配顺序（深度优先或任意）遍历 DAG 中的每个节点；`nodes` 是循环外从 `listPool` 取出的候选节点链表
+- `p.applyRule(rule, vertex, nodes)`：尝试将规则应用到当前节点；`newVertex == nil || newVertex.Equals(vertex)` 表示未发生有效变换
+- `nMatches` / `matchLimit`：命中次数达到上限时提前返回
+- `fixedPoint = false`：仅在非 forceRestart 分支发生变换时置位，需要重新遍历
+- `if fixedPoint { break }`：没有规则再产生变换，达到不动点
 
 ### 4.4 已注册的优化规则
 
@@ -726,52 +772,55 @@ func (p *HeuPlannerImpl) applyRules(ruleSet RuleSet) {
 
 ```go
 func initSqlHeuInstruction() {
-    // 谓词下推：将 WHERE 条件推到数据源附近
-    RULE_SUBQUERY
-    RULE_PUSHDOWN_LIMIT    // LIMIT 下推：尽早丢弃不需要的数据
-    RULE_PUSHDOWN_AGG      // 聚合下推：在数据源侧先做局部聚合
-    RULE_SPREAD_AGG        // 聚合展开：将全局聚合拆分为 局部聚合 + 最终聚合
-    RULE_HEIMADLL_PUSHDOWN // HAVING 下推
-    RULE_PUSHDOWN_DISTINCT // DISTINCT 下推
+	rules := []OptRuleCatagory{
+		RULE_SUBQUERY,
+		RULE_PUSHDOWN_LIMIT,
+		RULE_PUSHDOWN_AGG,
+		RULE_SPREAD_AGG,
+		RULE_HEIMADLL_PUSHDOWN,
+		RULE_PUSHDOWN_DISTINCT,
+	}
+	// ... 16 条 AddRule(...) + 按类别挂载到 sqlHeuInstruction ...
 }
 ```
 
 **通俗解释**：
-- **谓词下推**（最常用）：把 `WHERE host='server1'` 从最顶层推到数据源附近，这样在读数据时就过滤掉不匹配的行，减少后续处理的数据量
+- **子查询改写**（RULE_SUBQUERY）：把聚合/投影等算子下推到子查询，减少子查询输出
 - **LIMIT 下推**：把 `LIMIT 10` 推到数据源侧，每个节点只返回 10 条，最后合并时再取 Top 10
 - **聚合下推**：把聚合计算推到数据源侧先做局部状态。`mean(value)` 不能简单地对多个局部 mean 再求 mean，真实语义需要携带 `sum/count` 中间态，最终按 `sum(sum) / sum(count)` 加权合并。
 - **聚合展开**：将 `COUNT(*)` 拆分为每个节点的 `COUNT(*)` + 汇总节点的 `SUM(count)`
+- **Castor 聚合裁剪**（RULE_HEIMADLL_PUSHDOWN）：针对 PromQL castor 聚合的裁剪规则
+- **DISTINCT 下推**（RULE_PUSHDOWN_DISTINCT）：把 DISTINCT 下推到交换节点
+- **WHERE 条件**：不是启发式规则；`opt.Condition` 随 schema 下发，由 TSSP reader 逐行求值（见 13.6 Step 4.2）
 
-### 4.5 具体例子：优化前后的计划对比
+### 4.5 具体例子：模板命中时的计划（不执行启发式优化）
 
 假设查询：`SELECT mean(value) FROM cpu WHERE host='server1' GROUP BY time(1m) LIMIT 10`
 
-**优化前的逻辑计划**（从上到下）：
+**模板命中的逻辑计划**（该查询不走启发式优化，从上到下）：
 ```
-Limit(10)
-  └── Aggregate(mean(value))
-        └── Interval(1m)
-              └── Filter(host='server1')
-                    └── ReaderExchange
-                          └── Reader(cpu)
-```
-
-**优化后的逻辑计划**（谓词下推 + LIMIT 下推）：
-```
-Limit(10)
-  └── Aggregate(mean(value))        ← 聚合下推：局部 sum/count 中间态
-        └── Interval(1m)
-              └── ReaderExchange
-                    └── Filter(host='server1')  ← Filter 下推到数据源
-                          └── Reader(cpu)
+HttpSender
+  └── Limit(10)
+        └── Fill(默认 null)
+              └── Project(列裁剪)
+                    └── Interval(1m)
+                          └── Aggregate(mean(value))
+                                └── Exchange(NODE)
+                                      └── Exchange(SHARD)
+                                            └── IndexScan
+                                                  └── Exchange(READER)
+                                                        └── Reader
+                                                              └── Exchange(SERIES)
+                                                                    └── Series(cpu)
 ```
 
-**关键变化**：
-- `Filter(host='server1')` 从 `Interval` 下方推到了 `ReaderExchange` 下方（靠近数据源）
-- 这样每个 ts-store 节点在读数据时就过滤掉 `host != 'server1'` 的行，减少网络传输和后续处理的数据量
+**关键点**：
+- 该查询命中 `AGG_INTERVAL_LIMIT` 模板，`BuildLogicalPlan` 在模板分支直接返回，不会执行 `FindBestExp()`
+- `WHERE host='server1'` 不是由 `Filter` 节点执行，而是随 `opt.Condition` 下发，在 TSSP reader 中逐行求值（`engine/immutable/reader.go:962`）
+- 只有未命中模板的查询才进入 `buildExtendedPlan`，此时可应用 LIMIT 下推、聚合下推/展开、DISTINCT 下推等规则
 
 **通俗解释**：
-想象你去图书馆找书。优化前：先把所有书搬到办公室，再挑出你要的。优化后：在图书馆里就挑出你要的，只搬回需要的书。谓词下推就是这个"在源头就过滤"的思想。
+想象你去图书馆找书。虽然 openGemini 没有名为"谓词下推"的启发式规则，但 WHERE 条件会随查询选项一起下发到读取层，效果上仍是"在源头就过滤"。
 
 ---
 
@@ -791,31 +840,41 @@ sequenceDiagram
     Builder->>Builder: addNodeToDag(cloneNode)<br/>递归遍历逻辑计划树
 
     Note over Builder: 递归遍历每个逻辑节点
-    Builder->>Builder: 当前节点 = LogicalLimit
+    Builder->>Builder: 当前节点 = LogicalHttpSender（根）
 
-    Builder->>Factory: 查找 "LogicalLimit" 对应的 TransformCreator
-    Factory-->>Builder: LimitTransformCreator
+    Builder->>Factory: 查找 "LogicalHttpSender" 对应的 TransformCreator
+    Factory-->>Builder: HttpSenderTransformCreator
 
     Builder->>Builder: creator.Create(plan, options)
-    Builder-->>DAG: 创建 LimitTransform Processor
+    Builder-->>DAG: 创建 HttpSenderTransform Processor
 
     Builder->>DAG: dag.AddEdge(child, vertex)<br/>连接边
 
     Note over Builder: 继续递归子节点…
-    Builder->>Builder: 当前节点 = LogicalAggregate
-    Builder->>Factory: 查找 "LogicalAggregate"
-    Factory-->>Builder: AggTransformCreator
-    Builder->>DAG: 创建 AggTransform Processor
+    Builder->>Builder: 当前节点 = LogicalLimit
+    Builder->>Factory: 查找 "LogicalLimit"
+    Factory-->>Builder: LimitTransformCreator
+    Builder->>DAG: 创建 LimitTransform Processor
+
+    Builder->>Builder: 当前节点 = LogicalFill
+    Builder->>Factory: 查找 "LogicalFill"
+    Factory-->>Builder: FillTransformCreator
+    Builder->>DAG: 创建 FillTransform Processor
+
+    Builder->>Builder: 当前节点 = LogicalProject
+    Builder->>Factory: 查找 "LogicalProject"
+    Factory-->>Builder: MaterializeTransformCreator
+    Builder->>DAG: 创建 MaterializeTransform Processor
 
     Builder->>Builder: 当前节点 = LogicalInterval
     Builder->>Factory: 查找 "LogicalInterval"
     Factory-->>Builder: IntervalTransformCreator
     Builder->>DAG: 创建 IntervalTransform Processor
 
-    Builder->>Builder: 当前节点 = LogicalFilter
-    Builder->>Factory: 查找 "LogicalFilter"
-    Factory-->>Builder: FilterTransformCreator
-    Builder->>DAG: 创建 FilterTransform Processor
+    Builder->>Builder: 当前节点 = LogicalAggregate
+    Builder->>Factory: 查找 "LogicalAggregate"
+    Factory-->>Builder: StreamAggregateTransformCreator
+    Builder->>DAG: 创建 StreamAggregateTransform Processor
 
     Builder->>Builder: 当前节点 = LogicalExchange
     Builder->>Builder: addExchangeToDag(exchange)
@@ -823,7 +882,7 @@ sequenceDiagram
 
     Builder->>Builder: 当前节点 = LogicalReader
     Builder->>Builder: addReaderToDag(reader)
-    Note over Builder: 创建 TableScanTransform
+    Note over Builder: 创建 ChunkReader（读取 TSSP 文件）
 
     Builder-->>DAG: TransformDAG 构建完成
 ```
@@ -882,58 +941,77 @@ func (builder *ExecutorBuilder) Build(node hybridqp.QueryNode) (hybridqp.Executo
 假设逻辑计划树如下：
 
 ```
-逻辑计划树：
-  LimitTransform (LIMIT 10)
-    └── AggTransform (mean)
-        └── IntervalTransform (GROUP BY time(1m))
-            └── FilterTransform (WHERE host='server1')
-                └── TableScanTransform (读取 cpu 表)
+逻辑计划树（根在上）：
+  LogicalHttpSender
+    └── LogicalLimit (LIMIT 10)
+          └── LogicalFill (默认 null)
+                └── LogicalProject (列裁剪)
+                      └── LogicalInterval (GROUP BY time(1m))
+                            └── LogicalAggregate (mean)
+                                  └── LogicalExchange (NODE)
+                                        └── LogicalExchange (SHARD)
+                                              └── LogicalIndexScan
+                                                    └── LogicalExchange (READER)
+                                                          └── LogicalReader
+                                                                └── LogicalExchange (SERIES)
+                                                                      └── LogicalSeries (cpu)
 ```
 
 DAG 构建过程：
 
 ```
 步骤 1：克隆逻辑计划
-  cloneNode = LimitTransform.Clone()
+  cloneNode = node.Clone()  // node 为根 LogicalHttpSender
 
-步骤 2：递归构建 DAG
-  → 处理 LimitTransform
+步骤 2：递归构建 DAG（AddEdge 的参数为 child, parent）
+  → 处理 HttpSender
+    → 查找 "LogicalHttpSender" → HttpSenderTransformCreator
+    → 创建 HttpSenderTransform Processor
+
+  → 处理 Limit
     → 查找 "LogicalLimit" → LimitTransformCreator
     → 创建 LimitTransform Processor
-    → dag.AddEdge(root, limitVertex)
+    → dag.AddEdge(limitVertex, httpSenderVertex)
 
-  → 处理 AggTransform
-    → 查找 "LogicalAggregate" → AggTransformCreator
-    → 创建 AggTransform Processor
-    → dag.AddEdge(limitVertex, aggVertex)
+  → 处理 Fill
+    → 查找 "LogicalFill" → FillTransformCreator
+    → 创建 FillTransform Processor
+    → dag.AddEdge(fillVertex, limitVertex)
 
-  → 处理 IntervalTransform
+  → 处理 Project
+    → 查找 "LogicalProject" → MaterializeTransformCreator
+    → 创建 MaterializeTransform Processor
+    → dag.AddEdge(projectVertex, fillVertex)
+
+  → 处理 Interval
     → 查找 "LogicalInterval" → IntervalTransformCreator
     → 创建 IntervalTransform Processor
-    → dag.AddEdge(aggVertex, intervalVertex)
+    → dag.AddEdge(intervalVertex, projectVertex)
 
-  → 处理 FilterTransform
-    → 查找 "LogicalFilter" → FilterTransformCreator
-    → 创建 FilterTransform Processor
-    → dag.AddEdge(intervalVertex, filterVertex)
+  → 处理 Aggregate
+    → 查找 "LogicalAggregate" → StreamAggregateTransformCreator
+    → 创建 StreamAggregateTransform Processor
+    → dag.AddEdge(aggregateVertex, intervalVertex)
 
-  → 处理 TableScanTransform
-    → 查找 "LogicalReader" → TableScanTransformCreator
-    → 创建 TableScanTransform Processor
-    → dag.AddEdge(filterVertex, scanVertex)
+  → 处理 Exchange / IndexScan / Reader
+    → addExchangeToDag / addIndexScan / addReaderToDag
+    → 创建 MergeTransform、IndexScanTransform、ChunkReader
+    → dag.AddEdge(scanVertex, aggregateVertex)
 
 步骤 3：创建流水线执行器
   → NewPipelineExecutorFromDag(dag, root)
-  → 从 LimitTransform 开始执行
+  → 从根 HttpSender 开始执行
 ```
 
 **通俗解释**：
 DAG 构建就像"搭建流水线"。把逻辑计划转换成可以并行执行的流水线：
-1. **LimitTransform**：最后一个工序，只保留 10 个结果
-2. **AggTransform**：计算平均值
-3. **IntervalTransform**：按 1 分钟窗口分组
-4. **FilterTransform**：过滤 host=server1 的数据
-5. **TableScanTransform**：从磁盘读取数据
+1. **LimitTransform**：只保留 10 个结果
+2. **FillTransform**：补齐空窗口
+3. **MaterializeTransform**：列裁剪
+4. **IntervalTransform**：按 1 分钟窗口分组
+5. **StreamAggregateTransform**：计算平均值
+6. **ChunkReader**：从磁盘读取数据
+（WHERE 条件不在 DAG 的 Filter 节点执行，而是在读取层按 opt.Condition 过滤）
 
 每个工序（Transform）是一个独立的 goroutine，通过 Channel 连接，实现并行处理！
 
@@ -962,17 +1040,21 @@ sequenceDiagram
         Builder->>Builder: addIndexScan(indexScan)
     else LogicalHashMerge
         Node-->>Builder: 类型 = *LogicalHashMerge
-        alt IsUnifyPlan
-            Builder->>Default: addDefaultNode(hashMerge)
+        alt !IsUnifyPlan
+            Builder->>Builder: addHashMerge(hashMerge)
         else 有 ExchangeType
             Builder->>Exchange: addExchangeToDag(hashMerge)
+        else 其他
+            Builder->>Default: addDefaultNode(hashMerge)
         end
     else LogicalHashAgg
         Node-->>Builder: 类型 = *LogicalHashAgg
-        alt IsUnifyPlan
-            Builder->>Default: addDefaultNode(hashAgg)
+        alt !IsUnifyPlan
+            Builder->>Builder: addHashAgg(hashAgg)
         else 有 ExchangeType
             Builder->>Exchange: addExchangeToDag(hashAgg)
+        else 其他
+            Builder->>Default: addDefaultNode(hashAgg)
         end
     else 默认
         Node-->>Builder: 其他类型
@@ -1022,7 +1104,7 @@ func (builder *ExecutorBuilder) addNodeToDag(node hybridqp.QueryNode) (*Transfor
 **逐行解释**：
 - `switch n := node.(type)`：Go 类型断言，根据逻辑节点类型分发
 - `*LogicalExchange`：Exchange 节点，调用 `addExchangeToDag` 处理（见 5.3 节）
-- `*LogicalReader`：Reader 节点，创建 TableScanTransform
+- `*LogicalReader`：Reader 节点，创建 ChunkReader
 - `*LogicalHashMerge`/`*LogicalHashAgg`：根据是否 UnifyPlan 和 ExchangeType 决定处理方式
 - `default`：其他节点类型，调用 `addDefaultNode`（通过 TransformCreatorFactory 查找 Creator）
 
@@ -1050,18 +1132,18 @@ sequenceDiagram
     else SHARD_EXCHANGE
         Exchange-->>Builder: 跨 Shard
         Builder->>Shard: addShardExchange(exchange)
-        Shard-->>Builder: 创建多个 ShardReader + MergeTransform
+        Shard-->>Builder: 按 Shard 克隆子计划 + MergeTransform
     else SINGLE_SHARD_EXCHANGE
         Exchange-->>Builder: 单 Shard
         Builder->>Shard: addSingleShardExchange(exchange)
     else READER_EXCHANGE
         Exchange-->>Builder: 跨 Reader
         Builder->>Reader: addReaderExchange(exchange)
-        Reader-->>Builder: 创建多个 TSSP Reader + SortedMergeTransform
+        Reader-->>Builder: 按 Calls 选择 MergeTransform 或 SortedMerge（单 Reader 直接复用）
     else SERIES_EXCHANGE
         Exchange-->>Builder: 跨 Series
         Builder->>Series: addSeriesExchange(exchange)
-        Series-->>Builder: 创建多个 SeriesReader + SeriesMergeTransform
+        Series-->>Builder: 多路 Series 合并（MergeTransform / 二叉树合并）
     end
 ```
 
@@ -1090,10 +1172,10 @@ func (builder *ExecutorBuilder) addExchangeToDag(exchange Exchange) (*TransformV
 
 **逐行解释**：
 - 根据 ExchangeType 分发到不同的构建方法
-- `addNodeExchange`：创建多个远程连接（到其他 ts-store 节点），加 MergeTransform
-- `addShardExchange`：创建多个 ShardReader（同一节点不同 Shard），加 MergeTransform
-- `addReaderExchange`：创建多个 TSSP Reader（同一 Shard 不同文件），加 SortedMergeTransform
-- `addSeriesExchange`：创建多个 SeriesReader，加 SeriesMergeTransform
+- `addNodeExchange`：消费者侧为每个 RemoteQuery 创建 RPCReaderTransform，再加 MergeTransform
+- `addShardExchange`：按 Shard 克隆子计划（同一节点不同 Shard），再加 MergeTransform；单 Shard 走 addOneShardExchange
+- `addReaderExchange`：同一 Shard 多个 Reader 时，按 schema 选择 MergeTransform（有 Calls 且无 StreamCall）或 SortedMerge（SortMergeTransf）；单 Reader 直接复用子计划
+- `addSeriesExchange`：addDefaultExchange 或二叉树合并，统一使用 MergeTransform，不存在独立的 SeriesMergeTransform
 
 ### 5.4 TransformCreatorFactory — Transform 注册表
 
@@ -1105,14 +1187,14 @@ sequenceDiagram
 
     Note over Init: 系统启动时，30+ 个 Transform 文件<br/>各自注册自己的 Creator
 
-    Init->>Factory: RegistryTransformCreator("LogicalFilter", FilterTransformCreator)
-    Init->>Factory: RegistryTransformCreator("LogicalAggregate", AggTransformCreator)
-    Init->>Factory: RegistryTransformCreator("LogicalInterval", IntervalTransformCreator)
-    Init->>Factory: RegistryTransformCreator("LogicalLimit", LimitTransformCreator)
-    Init->>Factory: RegistryTransformCreator("LogicalSort", SortTransformCreator)
-    Init->>Factory: RegistryTransformCreator("LogicalFill", FillTransformCreator)
-    Init->>Factory: RegistryTransformCreator("LogicalProject", ProjectTransformCreator)
-    Init->>Factory: RegistryTransformCreator("HttpSender", HttpSenderTransformCreator)
+    Init->>Factory: RegistryTransformCreator(&LogicalFilter{}, &FilterTransformCreator{})
+    Init->>Factory: RegistryTransformCreator(&LogicalAggregate{}, &StreamAggregateTransformCreator{})
+    Init->>Factory: RegistryTransformCreator(&LogicalInterval{}, &IntervalTransformCreator{})
+    Init->>Factory: RegistryTransformCreator(&LogicalLimit{}, &LimitTransformCreator{})
+    Init->>Factory: RegistryTransformCreator(&LogicalSort{}, &SortTransformCreator{})
+    Init->>Factory: RegistryTransformCreator(&LogicalFill{}, &FillTransformCreator{})
+    Init->>Factory: RegistryTransformCreator(&LogicalProject{}, &MaterializeTransformCreator{})
+    Init->>Factory: RegistryTransformCreator(&LogicalHttpSender{}, &HttpSenderTransformCreator{})
     Note over Factory: … 更多 Transform
 
     Note over Factory: 查询时查找
@@ -1123,7 +1205,7 @@ sequenceDiagram
 **核心代码** `engine/executor/dag.go:424-467`：
 
 ```go
-// TransformCreator 接口：每个 Transform 实现这个接口
+// TransformCreator 接口：每个 Creator 结构体实现这个接口，Create 返回 Processor
 type TransformCreator interface {
 	Create(LogicalPlan, *query.ProcessorOptions) (Processor, error)
 }
@@ -1167,7 +1249,7 @@ func GetTransformFactoryInstance() *TransformCreatorFactory {
 ```
 
 **逐行解释**：
-- `TransformCreator` 接口：每个 Transform 类型实现这个接口，提供 `Create` 方法
+- `TransformCreator` 接口：每个 Creator 结构体实现这个接口，`Create` 返回一个 Processor（Transform）
 - `RegistryTransformCreator`：注册函数，系统启动时每个 Transform 文件调用一次
 - `plan.String()`：获取逻辑计划的名称（如 "LogicalFilter"），作为注册的 key
 - `GetTransformFactoryInstance()`：单例模式，全局只有一个工厂实例
@@ -1183,27 +1265,27 @@ sequenceDiagram
 
     Note over Plan: SELECT mean(value) FROM cpu<br/>WHERE host='server1'<br/>GROUP BY time(1m) LIMIT 10
 
-    Plan->>Builder: LogicalLimit → LogicalAggregate → LogicalInterval<br/>→ LogicalFilter → LogicalExchange(READER) → LogicalReader
+    Plan->>Builder: LogicalHttpSender → LogicalLimit → LogicalFill → LogicalProject<br/>→ LogicalInterval → LogicalAggregate → Exchange(NODE/SHARD/READER/SERIES) → LogicalReader
 
-    Note over Builder: 第 1 步：处理 LogicalReader
-    Builder->>DAG: 创建 TableScanTransform (Reader)
+    Note over Builder: 第 1 步：处理 LogicalReader / Exchange
+    Builder->>DAG: 创建 ChunkReader + MergeTransform
 
-    Note over Builder: 第 2 步：处理 LogicalExchange(READER)
-    Builder->>DAG: 创建 SortedMergeTransform<br/>合并多个 Reader 的结果
+    Note over Builder: 第 2 步：处理 LogicalAggregate
+    Builder->>DAG: 创建 StreamAggregateTransform<br/>连接到读取侧
 
-    Note over Builder: 第 3 步：处理 LogicalFilter
-    Builder->>DAG: 创建 FilterTransform<br/>连接到 SortedMergeTransform
+    Note over Builder: 第 3 步：处理 LogicalInterval
+    Builder->>DAG: 创建 IntervalTransform<br/>连接到 StreamAggregateTransform
 
-    Note over Builder: 第 4 步：处理 LogicalInterval
-    Builder->>DAG: 创建 IntervalTransform<br/>连接到 FilterTransform
+    Note over Builder: 第 4 步：处理 LogicalProject
+    Builder->>DAG: 创建 MaterializeTransform<br/>连接到 IntervalTransform
 
-    Note over Builder: 第 5 步：处理 LogicalAggregate
-    Builder->>DAG: 创建 AggTransform<br/>连接到 IntervalTransform
+    Note over Builder: 第 5 步：处理 LogicalFill
+    Builder->>DAG: 创建 FillTransform<br/>连接到 MaterializeTransform
 
     Note over Builder: 第 6 步：处理 LogicalLimit
-    Builder->>DAG: 创建 LimitTransform<br/>连接到 AggTransform
+    Builder->>DAG: 创建 LimitTransform<br/>连接到 FillTransform
 
-    Note over Builder: 第 7 步：添加 HttpSender
+    Note over Builder: 第 7 步：处理 LogicalHttpSender
     Builder->>DAG: 创建 HttpSenderTransform<br/>连接到 LimitTransform
 
     DAG->>DAG: 构建完成！
@@ -1223,21 +1305,21 @@ sequenceDiagram
     participant Output as 输出 Transform
 
     Note over Source: 数据源（读数据）
-    Source->>Source: TableScanTransform<br/>从存储读取 Chunk
+    Source->>Source: ChunkReader<br/>从存储读取 Chunk
     Source->>Source: IndexScanTransform<br/>从索引读取 TSID
 
     Note over Process: 处理（加工数据）
-    Process->>Process: FilterTransform<br/>过滤 WHERE 条件
+    Process->>Process: FilterTransform<br/>仅子查询/CTE 路径的 WHERE 过滤<br/>（普通 measurement 在 TSSP reader 中求值）
     Process->>Process: IntervalTransform<br/>按时间窗口分组
-    Process->>Process: AggTransform<br/>聚合计算 (count/sum/mean)
+    Process->>Process: StreamAggregateTransform<br/>聚合计算 (count/sum/mean)
     Process->>Process: FillTransform<br/>填充缺失值
-    Process->>Process: ProjectTransform<br/>列裁剪
+    Process->>Process: MaterializeTransform<br/>列裁剪（Project）
     Process->>Process: SortTransform<br/>排序
     Process->>Process: LimitTransform<br/>限制行数
 
     Note over Merge: 合并（多路归并）
     Merge->>Merge: MergeTransform<br/>合并多节点结果
-    Merge->>Merge: SortedMergeTransform<br/>有序合并
+    Merge->>Merge: MergeTransform(SortMergeTransf)<br/>有序合并
     Merge->>Merge: HashMergeTransform<br/>哈希合并
 
     Note over Output: 输出（返回结果）
@@ -1279,6 +1361,8 @@ type Processor interface {
 
 **代码位置**：`engine/executor/filter_transform.go:28-45`
 
+> 注意：普通 measurement 查询不会构建 `LogicalFilter`（WHERE 条件在读取层求值，见 13.6 Step 4.2）；本节的 FilterTransform 用于子查询 / CTE / IN 等路径。
+
 ```go
 type FilterTransform struct {
     BaseProcessor
@@ -1316,28 +1400,44 @@ type FilterTransform struct {
 ```go
 // 注意：filterHelper 返回值为 void（无返回值），直接修改 trans.resultChunk
 func (trans *FilterTransform) filterHelper(c Chunk) {
-    index := 0
-    trans.tagFilterMapInit(index, c)           // 初始化 tag 过滤 map
-    for i := 0; i < c.NumberOfRows(); i++ {
-        if index < len(c.TagIndex())-1 && i == c.TagIndex()[index+1] {
-            index++
-            trans.tagFilterMapInit(index, c)    // 切换 tag 分组时更新 map
-        }
-        for j, f := range trans.Output.RowDataType.Fields() {
-            trans.filterMap[f.Expr.(*influxql.VarRef).Val] = trans.valueFunc[j](i, c.Column(j))
-        }
-        multiValuer := []influxql.Valuer{influxql.MapValuer(trans.filterMap)}
-        // ... PromQL 相关处理 ...
-        valuer := influxql.ValuerEval{
-            Valuer: influxql.MultiValuer(multiValuer...),
-        }
-        if valuer.EvalBool(trans.opt.Condition) {  // 评估 WHERE 条件
-            // 条件为 true：原地修改 trans.resultChunk，追加这一行
-            trans.param.chunkLen, trans.param.start, trans.param.end = trans.resultChunk.Len(), i, i+1
-            trans.resultChunk.AppendTimes(c.Time()[i : i+1])
-            trans.CoProcessor.WorkOnChunk(c, trans.resultChunk, trans.param)
-        }
-    }
+	index := 0
+	trans.tagFilterMapInit(index, c)
+	if trans.resultChunk.Name() != c.Name() {
+		trans.resultChunk.SetName(c.Name())
+	}
+	var multiValuer []influxql.Valuer
+	for i := 0; i < c.NumberOfRows(); i++ {
+		if index < len(c.TagIndex())-1 && i == c.TagIndex()[index+1] {
+			index++
+			trans.tagFilterMapInit(index, c)
+		}
+		for j, f := range trans.Output.RowDataType.Fields() {
+			trans.filterMap[f.Expr.(*influxql.VarRef).Val] = trans.valueFunc[j](i, c.Column(j))
+		}
+		multiValuer = multiValuer[:0]
+		multiValuer = append(multiValuer, influxql.MapValuer(trans.filterMap))
+		if trans.opt.IsPromQuery() {
+			cv := NewChunkValuer(trans.opt.IsPromQuery())
+			cv.SetValueFnOnlyPromTime()
+			cv.ref = c
+			cv.index = i
+			multiValuer = append(multiValuer, cv)
+			multiValuer = append(multiValuer, PromTimeValuer{})
+			multiValuer = append(multiValuer, query.MathValuer{})
+		}
+		valuer := influxql.ValuerEval{
+			Valuer: influxql.MultiValuer(multiValuer...),
+		}
+		if valuer.EvalBool(trans.opt.Condition) {
+			if len(trans.resultChunk.Tags()) == 0 ||
+				!bytes.Equal(trans.resultChunk.Tags()[len(trans.resultChunk.Tags())-1].subset, c.Tags()[findIndex(c.TagIndex(), i)].subset) {
+				trans.resultChunk.AppendTagsAndIndex(c.Tags()[findIndex(c.TagIndex(), i)], trans.resultChunk.NumberOfRows())
+			}
+			trans.param.chunkLen, trans.param.start, trans.param.end = trans.resultChunk.Len(), i, i+1
+			trans.resultChunk.AppendTimes(c.Time()[i : i+1])
+			trans.CoProcessor.WorkOnChunk(c, trans.resultChunk, trans.param)
+		}
+	}
 }
 ```
 
@@ -1409,9 +1509,9 @@ func (trans *IntervalTransform) work(c Chunk) {
 **逐行解释**：
 - `trans.chunkPool.GetChunk()`：从 `CircularChunkPool` 对象池获取 Chunk（不是通用 `getChunk`）
 - `newChunk.AppendTagsAndIndexes()`：复制 Chunk 的 tags 和 tagIndex
-- `trans.opt.Window(t)`：根据时间戳计算窗口起始时间，比如 `t=1234567891` → `startTime=1234567800`（按 1 分钟窗口）
+- `trans.opt.Window(t)`：根据时间戳计算窗口起始时间，比如 `t=1234567891` → `startTime=1234567860`（按 1 分钟窗口）
 - `newChunk.ResetTime(i, startTime)`：将时间戳重置为窗口起始时间
-- `trans.coProcessor.WorkOnChunk()`：调用列级处理器，对每个列做聚合计算
+- `trans.coProcessor.WorkOnChunk()`：调用列级处理器，把输入列数据复制到新 Chunk（不做聚合）
 - `trans.sendChunk(newChunk)`：将结果 Chunk 发送到 `trans.Outputs[0].State` channel
 
 **具体例子**：
@@ -1427,11 +1527,11 @@ IntervalTransform 输出：
 time          host       value
 1234567800    server1    99.5    ← 时间重置为窗口起始
 1234567800    server1    88.3    ← 同一窗口
-1234567800    server2    77.1    ← 同一窗口
+1234567860    server2    77.1    ← 下一窗口起始
 ```
 
 **通俗解释**：
-IntervalTransform 就像一个"时间分组器"。它把同一分钟内的所有数据点的时间戳都改成这一分钟的起始时间，这样后续的 AggTransform 就可以按相同时间戳做聚合了。
+IntervalTransform 就像一个"时间对齐器"。它把同一分钟内的所有数据点的时间戳都改成这一分钟的起始时间；聚合本身由数据流上游的 StreamAggregateTransform 完成，Interval 只负责把结果时间对齐到窗口起点。
 
 ### 6.5 核心代码：HashJoinTransform — 多表 Join
 
@@ -1514,14 +1614,14 @@ type HashJoinTransform struct {
 ```
 
 **逐行解释**：
-- `BuildSide` / `ProbeSide`：Hash Join 分两阶段——Build 阶段构建 HashMap，Probe 阶段探测匹配。Inner/Left Join 时右表做 Build，Right Join 时左表做 Build
+- `BuildSide` / `ProbeSide`：Hash Join 分两阶段——Build 阶段构建 HashMap，Probe 阶段探测匹配。仅 `RightOuterJoin` 时左表做 Build，其余 JoinType 用右表做 Build
 - `newMst` / `leftMst` / `rightMst`：记录新旧 measurement 名，用于字段映射和结果合并
-- `joinType`：支持 `InnerJoin`、`LeftOuterJoin`、`RightOuterJoin`、`FullOuterJoin`
+- `joinType`：支持 `InnerJoin`、`LeftOuterJoin`、`RightOuterJoin`、`OuterJoin`、`FullJoin`、`UnknownJoin`
 - `joinCase`：保存原始 Join 语句节点，用于获取 Join 元信息
 - `joinTimeMatch`：时间匹配函数，处理带时间条件的 Join
 - `groupMap`：核心数据结构，将 Join Key 映射到 Build 侧的 Chunk 分组
 - `inputs`：两个 ChunkPort，分别接收左表和右表的数据
-- `matchedRightGroupIds` / `matchedRightGroupTimes`：追踪已匹配的右表分组，用于 Full Outer Join 的未匹配行处理
+- `matchedRightGroupIds` / `matchedRightGroupTimes`：追踪已匹配的右表分组，用于 FullJoin/OuterJoin 的未匹配行处理
 
 **三种 Join 实现**：
 
@@ -1529,7 +1629,7 @@ type HashJoinTransform struct {
 |------|------|----------|
 | HashJoinTransform | `hash_join_transform.go` | 等值 Join，性能最优 |
 | FullJoinTransform | `full_join_transform.go` | Full Join，需要全量匹配 |
-| SortMergeJoinTransform | `sort_merge_join_transform.go` | 已排序数据的 Join，内存友好 |
+| SortMergeJoinTransform | `sort_merge_join_transform.go` | join key 属于 group by 维度且为 tag 等值比较；否则回落 HashJoin |
 
 **具体例子**：
 
@@ -1588,6 +1688,7 @@ sequenceDiagram
 ```go
 type FillTransform struct {
     BaseProcessor
+    // ... sameTag、bufChunkNum、intervalNum、fillChunkSize、closedSignal、newChunk、tmpChunk 等字段 ...
 
     startTime     int64              // 查询起始时间
     endTime       int64              // 查询结束时间
@@ -1596,6 +1697,7 @@ type FillTransform struct {
     prevChunk     Chunk              // 上一个窗口的 Chunk（用于 FILL(previous)）
     fillItem      []*FillItem        // 每列的填充逻辑
     fillProcessor []FillProcessor    // 填充处理器
+    // ... coProcessor、chunkPool、prevValues、readAts、inputChunk/nextSignal、window/prevWindow 等字段 ...
 
     Inputs        ChunkPorts         // 输入端口
     Outputs       ChunkPorts         // 输出端口
@@ -1607,7 +1709,7 @@ type FillTransform struct {
 - `fillVal`：FILL 指定的值，如 `FILL(0)` 时 fillVal=0
 - `prevChunk`：保存上一个窗口的数据，用于 `FILL(previous)`
 - `fillItem`：每列独立的填充逻辑，因为不同类型的列填充方式不同（Float 填 0.0，Integer 填 0，String 填 ""）
-- `opt.Fill`：填充类型，取值为 `NullFill`、`PreviousFill`、`NoneFill`、`NumberFill`、`LinearFill`
+- `opt.Fill`：填充类型，取值为 `NullFill`、`NoFill`、`NumberFill`、`PreviousFill`、`LinearFill`（SQL 的 `FILL(none)` 对应 `NoFill`）
 
 **具体例子**：
 
@@ -1651,7 +1753,7 @@ sequenceDiagram
     SQL->>Sub: SELECT * FROM<br/>(SELECT mean(value) FROM cpu<br/>GROUP BY time(1m))<br/>WHERE mean > 50
 
     Sub->>Inner: 构建内层查询选项
-    Note over Inner: 继承外层的 Authorizer<br/>限制时间范围不超过外层<br/>独立的 Interval/Dimensions
+    Note over Inner: 继承外层的 Authorizer<br/>限制时间范围不超过外层<br/>非 Prom/非 NoPushDownDim 时下推外层 Dimensions
 
     Inner->>Inner: 执行内层查询
     Inner-->>Sub: 内层结果 Chunk
@@ -1660,37 +1762,37 @@ sequenceDiagram
     SQL->>Output: 应用外层 WHERE/ORDER BY/LIMIT
 ```
 
-**核心代码**：`engine/executor/subquery.go:28-60`
+**核心代码**：`engine/executor/subquery.go:28-114`
 
 ```go
 type SubQueryBuilder struct {
-    qc   query.LogicalPlanCreator
-    stmt *influxql.SelectStatement
+	qc   query.LogicalPlanCreator
+	stmt *influxql.SelectStatement
 }
 
-func (b *SubQueryBuilder) newSubOptions(ctx context.Context,
-    opt *query.ProcessorOptions) (query.ProcessorOptions, error) {
-    // 子查询不支持 EXCEPT 维度
-    if len(b.stmt.ExceptDimensions) > 0 {
-        return query.ProcessorOptions{}, fmt.Errorf("except: sub-query or join-query is unsupported")
-    }
-    // 继承外层查询的授权、限制等选项
-    subOpt, err := query.NewProcessorOptionsStmt(b.stmt, query.SelectOptions{
-        Authorizer:  opt.Authorizer,
-        MaxSeriesN:  opt.MaxSeriesN,
-        ChunkedSize: opt.ChunkedSize,
-        Chunked:     opt.Chunked,
-        ChunkSize:   opt.ChunkSize,
-        RowsChan:    opt.RowsChan,
-    })
-    // 时间范围不超过外层
-    if subOpt.StartTime < opt.StartTime {
-        subOpt.StartTime = opt.StartTime
-    }
-    if subOpt.EndTime > opt.EndTime {
-        subOpt.EndTime = opt.EndTime
-    }
-    return subOpt, nil
+func (b *SubQueryBuilder) newSubOptions(ctx context.Context, opt *query.ProcessorOptions) (query.ProcessorOptions, error) {
+	if len(b.stmt.ExceptDimensions) > 0 {
+		return query.ProcessorOptions{}, fmt.Errorf("except: sub-query or join-query is unsupported")
+	}
+	subOpt, err := query.NewProcessorOptionsStmt(b.stmt, query.SelectOptions{
+		Authorizer:  opt.Authorizer,
+		MaxSeriesN:  opt.MaxSeriesN,
+		ChunkedSize: opt.ChunkedSize,
+		Chunked:     opt.Chunked,
+		ChunkSize:   opt.ChunkSize,
+		RowsChan:    opt.RowsChan,
+	})
+	if err != nil {
+		return query.ProcessorOptions{}, err
+	}
+	if subOpt.StartTime < opt.StartTime {
+		subOpt.StartTime = opt.StartTime
+	}
+	if subOpt.EndTime > opt.EndTime {
+		subOpt.EndTime = opt.EndTime
+	}
+	// ... NowKey、NoPushDownDim、维度下推、Condition 重算、SLimit/SOffset、Fill/PromQuery 等 ...
+	return subOpt, nil
 }
 ```
 
@@ -1758,11 +1860,13 @@ CTE 就像"中间变量"。你可以在查询中先定义一个临时结果集�
 ```mermaid
 sequenceDiagram
     participant Main as PipelineExecutor
-    participant P1 as TableScanTransform
-    participant P2 as FilterTransform
+    participant P1 as ChunkReader
+    participant P2 as StreamAggregateTransform
     participant P3 as IntervalTransform
-    participant P4 as AggTransform
-    participant P5 as HttpSenderTransform
+    participant P4 as MaterializeTransform
+    participant P5 as FillTransform
+    participant P6 as LimitTransform
+    participant P7 as HttpSenderTransform
 
     Main->>Main: Execute(ctx)
     Main->>Main: InitContext(ctx)
@@ -1775,26 +1879,34 @@ sequenceDiagram
         Main->>P3: go work(P3)
         Main->>P4: go work(P4)
         Main->>P5: go work(P5)
+        Main->>P6: go work(P6)
+        Main->>P7: go work(P7)
     end
 
-    Note over P1,P5: 所有 goroutine 并行运行
+    Note over P1,P7: 所有 goroutine 并行运行
 
-    P1->>P1: 从存储读取 Chunk
+    P1->>P1: 从存储读取 Chunk（按 opt.Condition 过滤）
     P1->>P2: ChunkPort: 发送 Chunk
     Note over P1,P2: channel buffer=1<br/>P1 放一个后阻塞<br/>P2 取出后 P1 继续
 
-    P2->>P2: 过滤 Chunk
-    P2->>P3: ChunkPort: 发送 Chunk
+    P2->>P2: 聚合计算
+    P2->>P3: ChunkPort: 发送聚合结果
 
-    P3->>P3: 时间窗口分组
+    P3->>P3: 时间戳对齐到窗口起点
     P3->>P4: ChunkPort: 发送 Chunk
 
-    P4->>P4: 聚合计算
+    P4->>P4: 列裁剪
     P4->>P5: ChunkPort: 发送结果
 
-    P5->>P5: 编码 + 发送给客户端
+    P5->>P5: 补齐空窗口
+    P5->>P6: ChunkPort: 发送结果
 
-    Note over P1,P5: 所有 goroutine 完成后
+    P6->>P6: 限制行数
+    P6->>P7: ChunkPort: 发送结果
+
+    P7->>P7: 编码 + 发送给客户端
+
+    Note over P1,P7: 所有 goroutine 完成后
     Main->>Main: wg.Wait() 返回
     Main->>Main: Release() + destroyContext()
     Note over Main: 查询结束
@@ -1827,30 +1939,31 @@ type PipelineExecutor struct {
 
 时间轴：
   00:00.000 - 启动所有 goroutine
-    → TableScanTransform: goroutine 1
-    → FilterTransform: goroutine 2
+    → ChunkReader: goroutine 1
+    → StreamAggregateTransform: goroutine 2
     → IntervalTransform: goroutine 3
-    → AggTransform: goroutine 4
-    → HttpSenderTransform: goroutine 5
+    → MaterializeTransform: goroutine 4
+    → FillTransform: goroutine 5
+    → LimitTransform: goroutine 6
+    → HttpSenderTransform: goroutine 7
 
-  00:00.001 - TableScanTransform 读取第一个 Chunk
+  00:00.001 - ChunkReader 读取第一个 Chunk
     → Chunk: [(t1, 99.5, host=server1), (t2, 88.3, host=server1), ...]
+    → 按 opt.Condition 过滤：只保留 host=server1 的行
     → 发送到 Channel (buffer=1)
     → Channel 满了，阻塞等待
 
-  00:00.002 - FilterTransform 取出 Chunk
-    → 过滤：只保留 host=server1 的行
-    → 结果：[(t1, 99.5), (t2, 88.3), ...]
+  00:00.002 - StreamAggregateTransform 取出 Chunk
+    → 计算 mean
+    → 结果：[(t1_mod, 93.9)]
     → 发送到下一个 Channel
 
   00:00.003 - IntervalTransform 取出 Chunk
-    → 按 1 分钟窗口分组
-    → 结果：[(t1_mod, 99.5), (t1_mod, 88.3), ...]
+    → 时间戳对齐到 1 分钟窗口起点
     → 发送到下一个 Channel
 
-  00:00.004 - AggTransform 取出 Chunk
-    → 计算 mean
-    → 结果：[(t1_mod, 93.9)]
+  00:00.004 - MaterializeTransform / FillTransform / LimitTransform 依次处理
+    → 列裁剪、补齐空窗口、LIMIT 10
     → 发送到下一个 Channel
 
   00:00.005 - HttpSenderTransform 取出结果
@@ -1864,10 +1977,10 @@ type PipelineExecutor struct {
 
 **通俗解释**：
 流水线执行就像"工厂流水线"。每个工序（Transform）是一个独立的工人，通过传送带（Channel）连接：
-1. **TableScanTransform**：从仓库（磁盘）取出原材料（数据）
-2. **FilterTransform**：检查原材料，去掉不合格的
-3. **IntervalTransform**：把原材料按时间分组
-4. **AggTransform**：计算每组的平均值
+1. **ChunkReader**：从仓库（磁盘）取出原材料（数据），并按 WHERE 条件过滤
+2. **StreamAggregateTransform**：计算每组的平均值
+3. **IntervalTransform**：把结果时间对齐到窗口起点
+4. **MaterializeTransform / FillTransform / LimitTransform**：列裁剪、补空窗口、限制行数
 5. **HttpSenderTransform**：把成品打包发给客户
 
 每个工人同时工作，传送带上有 buffer=1，就像一个临时存放区。这样整个流水线可以并行处理，效率很高！
@@ -1928,7 +2041,7 @@ func (exec *PipelineExecutor) Execute(ctx context.Context) error {
 ```
 
 **逐行解释**：
-- `exec.InitContext(ctx)`：初始化执行上下文（包括取消函数、超时等）
+- `exec.InitContext(ctx)`：创建可取消的查询上下文并防止重复初始化
 - `wg.Add(len(exec.processors))`：设置 WaitGroup 计数 = Processor 数量
 - `go func(processor Processor)`：为每个 Processor 启动独立 goroutine
 - `exec.work(processor)`：执行 Processor 的 Work 方法（读取输入、处理、发送输出）
@@ -1967,20 +2080,21 @@ sequenceDiagram
     Note over Port: buffer=1 只来自 Connect()<br/>ConnectNoneCache() 使用无缓冲 channel
 ```
 
-**核心代码** `engine/executor/processor.go:42-49`（Port 接口）和 `processor.go:65-71`（ChunkPort 结构体）：
+**核心代码** `engine/executor/processor.go:42-49`（Port 接口）和 `engine/executor/processor.go:65-95`（ChunkPort 结构体与连接方法）：
 
 ```go
+// engine/executor/processor.go:42-49
 // Port 接口
 type Port interface {
 	Equal(to Port) bool
 	Connect(to Port)                              // 连接到另一个 Port
-	ConnectNoneCache(to Port)                     // 无缓存连接
 	Redirect(to Port)                             // 重定向
 	ConnectionId() uintptr
 	Close()                                       // 关闭
 	Release()                                     // 释放
 }
 
+// engine/executor/processor.go:65-95
 // ChunkPort 结构
 type ChunkPort struct {
 	RowDataType hybridqp.RowDataType               // 行数据类型（列定义）
@@ -2016,7 +2130,7 @@ func (p *ChunkPort) ConnectNoneCache(to Port) {
 - `OrigiState chan Chunk`：原始 channel，Redirect 时保存原始值
 - `Redirected bool`：是否被重定向（优化时可能重定向 ChunkPort 到其他 Processor）
 - `Connect(to Port)`：创建 `make(chan Chunk, PORT_CHAN_SIZE)` 并让上下游共享；当前 `PORT_CHAN_SIZE` 为 1
-- `ConnectNoneCache(to Port)`：创建 `make(chan Chunk)` 无缓冲 channel，常用于 CTE、IN、IndexScan、SparseIndexScan 等不希望中间缓存的路径
+- `ConnectNoneCache(to Port)`：`*ChunkPort` 的方法（不在 `Port` 接口中），创建 `make(chan Chunk)` 无缓冲 channel，常用于 CTE、IN、IndexScan、SparseIndexScan 等不希望中间缓存的路径
 - `Close()`：关闭 channel（发送结束信号）
 
 ### 7.3 错误处理 — Crash/Abort 级联
@@ -2063,7 +2177,7 @@ sequenceDiagram
     Client->>SQL: SELECT mean(value) FROM cpu<br/>WHERE host='server1'<br/>GROUP BY time(1m)
 
     Note over SQL: 第一步：Scatter（扇出）
-    SQL->>Meta: MapShards(sources, opt)
+    SQL->>Meta: MapShards(stmt, timeRange, opt, condition)
     Meta-->>SQL: shardMap = (shard1: Node1, shard2: Node2, shard3: Node3)
 
     SQL->>SQL: 构建 RemoteQuery 列表
@@ -2075,9 +2189,9 @@ sequenceDiagram
     end
 
     par 并发执行本地查询
-        S1->>S1: 本地 DAG: Reader → Filter → Aggregate
-        S2->>S2: 本地 DAG: Reader → Filter → Aggregate
-        S3->>S3: 本地 DAG: Reader → Filter → Aggregate
+        S1->>S1: 本地 DAG: Reader → Aggregate → Interval → Project → Fill → Limit
+        S2->>S2: 本地 DAG: Reader → Aggregate → Interval → Project → Fill → Limit
+        S3->>S3: 本地 DAG: Reader → Aggregate → Interval → Project → Fill → Limit
     end
 
     Note over SQL: 第二步：Gather（汇聚）
@@ -2100,7 +2214,7 @@ sequenceDiagram
     participant E2 as ExchangeTransform 2
     participant E3 as ExchangeTransform 3
     participant Merge as MergeTransform
-    participant Agg as AggTransform
+    participant Agg as StreamAggregateTransform
     participant Limit as LimitTransform
     participant Out as HttpSenderTransform
 
@@ -2173,12 +2287,19 @@ type RemoteQuery struct {
 
 ```go
 type RPCReaderTransform struct {
-    BaseProcessor
-    Output     *ChunkPort     // 输出端口：将接收到的 Chunk 发送给下游
-    client     RPCClient      // RPC 客户端，负责网络通信
-    abortSignal chan struct{}  // 中止信号
-    opt        *query.ProcessorOptions
-    query      []byte         // 序列化的查询节点
+	BaseProcessor
+
+	client RPCClient
+	Output *ChunkPort
+
+	distributed hybridqp.QueryNode
+	abortSignal chan struct{}
+	aborted     bool
+
+	span        *tracing.Span
+	outputSpan  *tracing.Span
+	queryId     uint64
+	NoMarkCrash bool
 }
 ```
 
@@ -2186,25 +2307,36 @@ type RPCReaderTransform struct {
 
 ```go
 func (t *RPCReaderTransform) Work(ctx context.Context) error {
-    // 序列化查询节点
-    queryNode := hybridqp.MustMarshal(t.root)
-    // 初始化 RPC 客户端
-    t.client.Init(t.nodeID, queryNode)
-    // 注册 Chunk 接收回调
-    t.client.Register("chunkResponse", func(chunk *Chunk) {
-        t.Output.Write(chunk)  // 将接收到的 Chunk 写入输出端口
-    })
-    // 启动 RPC 客户端（阻塞直到查询完成）
-    return t.client.Run(ctx)
+	t.initSpan()
+
+	queryNode, err := MarshalQueryNode(t.distributed)
+	if err != nil {
+		return err
+	}
+	client := &t.client
+	client.Init(ctx, queryNode)
+	client.StartAnalyze(t.BaseSpan())
+	client.AddHandler(ChunkResponseMessage, t.chunkResponse)
+
+	defer func() {
+		bufferpool.Put(queryNode)
+		client.FinishAnalyze()
+		tracing.Finish(t.span, t.outputSpan)
+		t.Output.Close()
+	}()
+
+	statistics.ExecutorStat.SourceWidth.Push(int64(t.Output.RowDataType.NumColumn()))
+
+	// ... 重试语义说明 ...
+	return client.Run()
 }
 ```
 
 **逐行解释**：
-- `hybridqp.MustMarshal(t.root)`：将查询计划序列化为字节，通过网络发送给远端节点
-- `t.client.Init(t.nodeID, queryNode)`：初始化 RPC 客户端，指定目标节点和查询
-- `t.client.Register("chunkResponse", ...)`：注册回调函数，当远端返回 Chunk 时触发
-- `t.Output.Write(chunk)`：将接收到的 Chunk 写入输出端口，传递给下游 Transform
-- `t.client.Run(ctx)`：启动 RPC 客户端，阻塞直到查询完成或中止
+- `MarshalQueryNode(t.distributed)`：把分布式查询节点序列化为字节
+- `client.Init(ctx, queryNode)`：初始化 RPC 客户端并传入查询
+- `client.AddHandler(ChunkResponseMessage, t.chunkResponse)`：注册 chunkResponse 回调；回调通过 `t.Output.State <- chunk` 写出
+- `client.Run()`：发送请求并阻塞等待远端完成（内部 `trans.Wait()`）
 
 ### 8.6 具体例子：分布式查询的完整流程
 
@@ -2224,18 +2356,18 @@ func (t *RPCReaderTransform) Work(ctx context.Context) error {
 
 **本地执行阶段**（每个 ts-store 节点）：
 1. 接收 RemoteQuery，反序列化为本地 DAG
-2. 本地 DAG：`Reader → Filter(host='server1') → Interval(1m) → Agg(mean(value))`
+2. 本地 DAG：`Reader → Aggregate(mean(value)) → Interval(1m) → Project → Fill → Limit`
 3. 每个节点返回自己的聚合结果（~10 行）
 
 **Gather 阶段**（ts-sql 汇聚）：
 1. 接收 3 个节点的 Chunk（每个 ~10 行）
 2. MergeTransform：合并 3 个 Chunk（~30 行）
-3. AggTransform：最终聚合（计算全局 mean）
+3. StreamAggregateTransform：最终聚合（计算全局 mean）
 4. LimitTransform：取前 10 行
 5. 返回给客户端
 
 **通俗解释**：
-Scatter-Gather 就像"分而治之"。ts-sql 是"总指挥"，把查询任务分发给多个 ts-store"工人"，每个工人处理自己的数据，最后总指挥汇总结果。这样查询速度比单节点快 N 倍（N = 节点数）。
+Scatter-Gather 就像"分而治之"。ts-sql 是"总指挥"，把查询任务分发给多个 ts-store"工人"，每个工人处理自己的数据，最后总指挥汇总结果。这样查询吞吐会随节点数提升（理想情况下接近线性；未做基准测试）。
 
 > **深入阅读**：Shard 到节点的映射逻辑（`ClusterShardMapper.MapShards`、`RemoteQueryETraitsAndSrc`、PtView 路由）详见 [Module 6: 集群通信](./06_cluster_routing_spec.md) 第 5-6 节。本节聚焦于查询引擎内部的 DAG 构建和执行，Shard 物理位置的确定由 coordinator 层完成。
 
@@ -2339,7 +2471,8 @@ type Column interface {
 //   - nilsV2 *Bitmap          — nil 位图（非 []byte），标记哪些行有值
 //   - floatValues []float64   — Float 类型的值数组
 //   - integerValues []int64   — Integer 类型的值数组
-//   - stringValuesV2 []byte   — String 类型的紧凑存储（字节数组 + offset）
+//   - stringBytes []byte      — String 类型的紧凑存储
+//   - offset []uint32         — String 值的偏移数组
 //   - booleanValues []bool    — Boolean 类型的值数组
 ```
 
@@ -2422,14 +2555,15 @@ time:  1234567801 1234567830 1234567890 1234567900 1234567950
 ```
 行 0: Window(1234567801) = 1234567800  ← 窗口 1 起始
 行 1: Window(1234567830) = 1234567800  ← 同一窗口
-行 2: Window(1234567890) = 1234567800  ← 同一窗口
-行 3: Window(1234567900) = 1234567900  ← 窗口 2 起始（变化！）
-行 4: Window(1234567950) = 1234567900  ← 同一窗口
+行 2: Window(1234567890) = 1234567860  ← 窗口 2 起始（变化！）
+行 3: Window(1234567900) = 1234567860  ← 同一窗口
+行 4: Window(1234567950) = 1234567920  ← 窗口 3 起始（变化！）
 ```
 
-生成的 `intervalIndex = [0, 3]`：
-- 窗口 1：行 0~2（时间 1234567800）
-- 窗口 2：行 3~4（时间 1234567900）
+生成的 `intervalIndex = [0, 2, 4]`：
+- 窗口 1：行 0~1（时间 1234567800）
+- 窗口 2：行 2~3（时间 1234567860）
+- 窗口 3：行 4（时间 1234567920）
 
 ---
 
@@ -2454,15 +2588,11 @@ sequenceDiagram
 
     Co->>Chunk: 读取 Chunk
 
-    par 并行处理不同列
-        R1->>R1: WorkOnChunk(cpu 列)
-    and
-        R2->>R2: WorkOnChunk(memory 列)
-    and
-        R3->>R3: WorkOnChunk(disk 列)
-    end
+    R1->>R1: WorkOnChunk(cpu 列)
+    R2->>R2: WorkOnChunk(memory 列)
+    R3->>R3: WorkOnChunk(disk 列)
 
-    Note over Chunk: 同一个 Chunk 只读一次<br/>三个 Routine 分别处理不同列<br/>减少 IO 和内存拷贝
+    Note over Chunk: 同一个 Chunk 只读一次<br/>三个 Routine 串行处理不同列<br/>减少 IO 和内存拷贝
 ```
 
 ### 10.2 核心代码：CoProcessor 接口 — 列级批量处理
@@ -2478,7 +2608,7 @@ type CoProcessor interface {
 **通俗解释**：
 - `CoProcessor` 是一个"列级处理器"，负责批量处理 Chunk 中的多个列
 - 每个 Transform（如 FilterTransform、IntervalTransform）都有一个 CoProcessor
-- CoProcessor 内部有多个 Routine，每个 Routine 处理一个列
+- CoProcessor 内部有多个 Routine，每个 Routine 处理一个列；`WorkOnChunk` 内按顺序逐个调用（不是按列并行）
 
 ### 10.3 核心代码：CoProcessorImpl 结构体
 
@@ -2528,10 +2658,12 @@ type RoutineImpl struct {
 **逐行解释**：
 - `inOrdinal`：输入列在 Chunk 中的索引，比如 `0` 表示第一列
 - `outOrdinal`：输出列在结果 Chunk 中的索引
-- `iterator`：迭代器，实际执行列级计算（如 Filter、Interval、Agg）
+- `iterator`：迭代器，实际执行列级计算（如按行复制、Interval 时间对齐、聚合）
 - `endPoint`：迭代器端点，包含 `InputPoint` 和 `OutputPoint`（各含 Chunk + Ordinal）
 
 ### 10.5 具体例子：FilterTransform 的 CoProcessor
+
+> 注意：普通 measurement 查询不使用 FilterTransform（WHERE 在读取层求值）；这里仅以 FilterTransform 为例说明 CoProcessor 的按列复制机制。
 
 假设查询：`SELECT host, value FROM cpu WHERE value > 80`
 
@@ -2547,15 +2679,15 @@ FilterTransform 的 CoProcessor 有 2 个 Routine：
 - Routine 2：处理 value 列（inOrdinal=1, outOrdinal=1）
 
 执行过程：
-1. Routine 2（value 列）先评估 WHERE 条件 `value > 80`：
+1. `filterHelper` 逐行用 `valuer.EvalBool` 评估 WHERE 条件 `value > 80`：
    - 行 0: 99.5 > 80 → true（保留）
    - 行 1: 88.3 > 80 → true（保留）
    - 行 2: 77.1 > 80 → false（过滤）
    - 行 3: 66.0 > 80 → false（过滤）
    - 行 4: 55.5 > 80 → false（过滤）
-2. Routine 1（host 列）根据过滤结果复制匹配的行：
-   - 行 0: host = s1（保留）
-   - 行 1: host = s2（保留）
+2. 条件命中后，`CoProcessor.WorkOnChunk` 按列复制该行（两个 Routine 都是 LimitIterator）：
+   - Routine 0（host 列）复制 host
+   - Routine 1（value 列）复制 value
 
 输出 Chunk：
 ```
@@ -2565,7 +2697,7 @@ value: 99.5  88.3
 ```
 
 **通俗解释**：
-CoProcessor 就像一个"多列并行处理器"。当查询涉及多个字段时，每个字段由一个 Routine 处理，所有 Routine 共享同一个 Chunk，避免重复读取数据。这样既节省内存，又提高处理效率。
+CoProcessor 就像一个"多列批量处理器"。当查询涉及多个字段时，每个字段由一个 Routine 处理，所有 Routine 共享同一个 Chunk、串行按列处理，避免重复读取数据。这样既节省内存，又提高处理效率。
 
 ---
 
@@ -2650,7 +2782,7 @@ DAG 模型：
   每次操作涉及：goroutine 切换、Channel 收发
   总开销：约 4000 次 Channel 操作
 
-差距：1000 倍！
+示意：调用次数相差约 1000 倍（未做基准测试）
 ```
 
 **DAG 模型的代价：**
@@ -2778,7 +2910,7 @@ sequenceDiagram
 
     Fast->>Fast: 直接使用预构建的计划<br/>跳过复杂优化<br/>直接执行
 
-    Note over Fast: 常见查询占 80%+<br/>模板化后延迟降低
+    Note over Fast: 常见聚合查询命中模板<br/>避免重复构建与优化计划
 ```
 
 ---
@@ -2862,10 +2994,11 @@ sequenceDiagram
     participant Planner as BuildLogicalPlan()
     participant Builder as ExecutorBuilder.Build()
     participant Executor as PipelineExecutor.Execute()
-    participant Reader as TableScanTransform
-    participant Filter as FilterTransform
+    participant Reader as ChunkReader
+    participant Agg as StreamAggregateTransform
     participant Interval as IntervalTransform
-    participant Agg as AggTransform
+    participant Project as MaterializeTransform
+    participant Fill as FillTransform
     participant Limit as LimitTransform
     participant Sender as HttpSenderTransform
 
@@ -2879,19 +3012,20 @@ sequenceDiagram
     SQL->>Planner: BuildLogicalPlan(stmt)
     Planner->>Planner: GetPlanType → AGG_INTERVAL_LIMIT (匹配模板)
     Planner->>Planner: buildPlanByCache → 使用预构建模板
-    Planner->>Planner: HeuristicPlanner.FindBestExp() → 谓词下推
-    Planner-->>SQL: 优化后的逻辑计划树
+    Planner->>Planner: 模板命中，跳过 HeuristicPlanner.FindBestExp()
+    Planner-->>SQL: 模板逻辑计划树
 
     Note over SQL: ===== Step 3: 构建 DAG =====
     SQL->>Builder: ExecutorBuilder.Build(plan)
     Builder->>Builder: addNodeToDag(递归遍历)
-    Builder->>Builder: LogicalReader → TableScanTransform
-    Builder->>Builder: LogicalExchange(READER) → SortedMergeTransform
-    Builder->>Builder: LogicalFilter → FilterTransform
+    Builder->>Builder: LogicalReader → ChunkReader
+    Builder->>Builder: LogicalExchange(READER) → MergeTransform（有 Calls）
+    Builder->>Builder: LogicalAggregate → StreamAggregateTransform
     Builder->>Builder: LogicalInterval → IntervalTransform
-    Builder->>Builder: LogicalAggregate → AggTransform
+    Builder->>Builder: LogicalProject → MaterializeTransform
+    Builder->>Builder: LogicalFill → FillTransform
     Builder->>Builder: LogicalLimit → LimitTransform
-    Builder->>Builder: HttpSender → HttpSenderTransform
+    Builder->>Builder: LogicalHttpSender → HttpSenderTransform
     Builder-->>SQL: TransformDAG 构建完成
 
     Note over SQL: ===== Step 4: 流水线执行 =====
@@ -2899,17 +3033,20 @@ sequenceDiagram
     Executor->>Executor: 为每个 Processor 启动 goroutine
 
     par 并行执行
-        Reader->>Reader: 从 TSSP 文件读取 Chunk
-        Reader->>Filter: ChunkPort: 发送 Chunk
-    and
-        Filter->>Filter: 过滤 host='server1'
-        Filter->>Interval: ChunkPort: 发送 Chunk
-    and
-        Interval->>Interval: 按 5 分钟窗口分组
-        Interval->>Agg: ChunkPort: 发送分组后的 Chunk
+        Reader->>Reader: 从 TSSP 文件读取 Chunk（按 opt.Condition 过滤）
+        Reader->>Agg: ChunkPort: 发送 Chunk
     and
         Agg->>Agg: 计算 mean(value)
-        Agg->>Limit: ChunkPort: 发送聚合结果
+        Agg->>Interval: ChunkPort: 发送聚合结果
+    and
+        Interval->>Interval: 时间戳对齐到 5 分钟窗口起点
+        Interval->>Project: ChunkPort: 发送分组后的 Chunk
+    and
+        Project->>Project: 列裁剪
+        Project->>Fill: ChunkPort: 发送结果
+    and
+        Fill->>Fill: 补齐空窗口
+        Fill->>Limit: ChunkPort: 发送结果
     and
         Limit->>Limit: 限制 3 行
         Limit->>Sender: ChunkPort: 发送结果
@@ -2927,29 +3064,29 @@ sequenceDiagram
 SELECT mean(value) FROM cpu WHERE host='server1' GROUP BY time(5m) LIMIT 3
 ```
 
-**代码路径**：`influxql/parser.go`
+**代码路径**：`lib/util/lifted/influx/influxql/parser.go`
 
 **词法分析（Lexer）**：
 ```
-Token_SELECT  → "SELECT"
-Token_IDENT   → "mean"
-Token_LPAREN  → "("
-Token_IDENT   → "value"
-Token_RPAREN  → ")"
-Token_FROM    → "FROM"
-Token_IDENT   → "cpu"
-Token_WHERE   → "WHERE"
-Token_IDENT   → "host"
-Token_EQ      → "="
-Token_STRING  → "'server1'"
-Token_GROUP   → "GROUP"
-Token_BY      → "BY"
-Token_IDENT   → "time"
-Token_LPAREN  → "("
-Token_DURATION→ "5m"
-Token_RPAREN  → ")"
-Token_LIMIT   → "LIMIT"
-Token_INTEGER → "3"
+SELECT  → "SELECT"
+IDENT   → "mean"
+LPAREN  → "("
+IDENT   → "value"
+RPAREN  → ")"
+FROM    → "FROM"
+IDENT   → "cpu"
+WHERE   → "WHERE"
+IDENT   → "host"
+EQ      → "="
+STRING  → "'server1'"
+GROUP   → "GROUP"
+BY      → "BY"
+IDENT   → "time"
+LPAREN  → "("
+DURATIONVAL → "5m"
+RPAREN  → ")"
+LIMIT   → "LIMIT"
+INTEGER → "3"
 ```
 
 **语法分析（Parser）** → SelectStatement AST：
@@ -2959,7 +3096,7 @@ SelectStatement{
         {Expr: Call{Name: "mean", Args: [Ref{Val: "value"}]}},
     },
     Sources: Sources{
-        &Measurement{Database: "mydb", RetentionPolicy: "autogen", Name: "cpu"},
+        &Measurement{Database: "", RetentionPolicy: "", Name: "cpu"},  // 库名/RP 由上层注入
     },
     Condition: BinaryExpr{
         Op: EQ,
@@ -2983,49 +3120,37 @@ SelectStatement{
 
 ### 13.3 Step 2 详解：构建逻辑计划 — 从 AST 到计划树
 
-**代码路径**：`engine/executor/select.go:179-247`
+**代码路径**：`engine/executor/select.go:179-256`
 
 ```go
 func (p *preparedStatement) BuildLogicalPlan(ctx context.Context) (hybridqp.QueryNode, hybridqp.Trait, error) {
     // 步骤 1: 构建 QuerySchema
-    schema := NewQuerySchemaWithJoinCase(p.stmt.Fields, p.stmt.Sources, ...)
-    // schema 包含：
-    //   - Fields: [mean(value)]
-    //   - Sources: [cpu]
-    //   - Condition: host='server1'
-    //   - Dimensions: [time(5m)]
-    //   - Limit: 3
+    schema := NewQuerySchemaWithJoinCase(p.stmt.Fields, p.stmt.Sources, p.stmt.ColumnNames(), opt, ...)
+    // ...
 
     // 步骤 2: 尝试匹配模板
     planType := GetPlanType(schema, p.stmt)
-    // GetPlanType 检查：
-    //   - 有聚合函数？ yes (mean)
-    //   - 有 GROUP BY time？ yes (5m)
-    //   - 有 LIMIT？ yes (3)
-    //   → 匹配 AGG_INTERVAL_LIMIT 模板
-
+    // 本例 mean + GROUP BY time(5m) + LIMIT 3 → AGG_INTERVAL_LIMIT
     if planType != UNKNOWN {
-        // 使用预构建模板
-        templatePlan := SqlPlanTemplate[planType].GetPlan()
-        // templatePlan = [
-        //   LogicalLimit,
-        //   LogicalAggregate,
-        //   LogicalInterval,
-        //   LogicalFilter,
-        //   LogicalExchange(READER_EXCHANGE),
-        //   LogicalReader,
-        // ]
-        plan, _ := p.buildPlanByCache(ctx, schema, templatePlan, &mstsReqs)
-        return plan, mstsReqs, nil  // 模板快速路径
+        // 使用预构建模板（localStorageForQuery 为 nil 时）
+        var templatePlan []hybridqp.QueryNode
+        templatePlan = SqlPlanTemplate[planType].GetPlan()
+        // 模板节点（自底向上）：LogicalSeries → Exchange(SERIES) → Reader
+        //   → Exchange(READER) → IndexScan → Exchange(SHARD) → Exchange(NODE)
+        //   → Aggregate → Interval → Project → Fill → Limit → HttpSender
+        plan, err := p.buildPlanByCache(ctx, schema, templatePlan, &mstsReqs)
+        return plan, mstsReqs, err  // 模板快速路径，直接返回（不执行启发式优化）
     }
 
-    // 步骤 3: 启发式优化
+    // 步骤 3: 通用路径 + 启发式优化
+    plan, err := buildExtendedPlan(ctx, p.stmt, p.qc, schema)
+    if err != nil {
+        return nil, mstsReqs, err
+    }
+    // ...
     planner := p.optimizer()
     planner.SetRoot(plan)
     best := planner.FindBestExp()
-    // 优化规则：
-    //   - 谓词下推：Filter 从 Aggregate 下方推到 ReaderExchange 上方
-    //   - 列裁剪：只读取 value 和 host 列
     return best, mstsReqs, nil
 }
 ```
@@ -3033,17 +3158,24 @@ func (p *preparedStatement) BuildLogicalPlan(ctx context.Context) (hybridqp.Quer
 **逐行解释**：
 - `NewQuerySchemaWithJoinCase()`：把 AST 解析成 QuerySchema
 - `GetPlanType()`：尝试匹配模板，本例匹配 `AGG_INTERVAL_LIMIT`
-- `buildPlanByCache()`：使用预构建模板，跳过复杂优化
-- `FindBestExp()`：应用启发式优化规则
+- `buildPlanByCache()`：使用预构建模板，跳过复杂优化（本例走此路径）
+- `FindBestExp()`：仅通用路径执行启发式优化
 
-**优化后的逻辑计划树**：
+**模板命中的逻辑计划树**：
 ```
-LogicalLimit{N: 3}
-  └── LogicalAggregate{Func: mean, Field: value}
-        └── LogicalInterval{Duration: 5m}
-              └── LogicalFilter{host = 'server1'}
-                    └── LogicalExchange{type: READER_EXCHANGE}
-                          └── LogicalReader{Table: cpu}
+LogicalHttpSender
+  └── LogicalLimit{N: 3}
+        └── LogicalFill{Fill: null}
+              └── LogicalProject
+                    └── LogicalInterval{Duration: 5m}
+                          └── LogicalAggregate{Func: mean, Field: value}
+                                └── LogicalExchange{type: NODE_EXCHANGE}
+                                      └── LogicalExchange{type: SHARD_EXCHANGE}
+                                            └── LogicalIndexScan
+                                                  └── LogicalExchange{type: READER_EXCHANGE}
+                                                        └── LogicalReader
+                                                              └── LogicalExchange{type: SERIES_EXCHANGE}
+                                                                    └── LogicalSeries{Table: cpu}
 ```
 
 ### 13.4 Step 3 详解：DAG 构建 — 从逻辑计划到执行图
@@ -3051,20 +3183,29 @@ LogicalLimit{N: 3}
 **代码路径**：`engine/executor/pipeline_executor.go:667-678, 1521-1554`
 
 ```go
+// engine/executor/pipeline_executor.go:667-678
 func (builder *ExecutorBuilder) Build(node hybridqp.QueryNode) (hybridqp.Executor, error) {
+    if node == nil {
+        return nil, nil
+    }
+    var err error
     cloneNode := node.Clone()  // 克隆逻辑计划
-    builder.root, _ = builder.addNodeToDag(cloneNode)  // 递归构建 DAG
-    return NewPipelineExecutorFromDag(builder.dag, builder.root), nil
+    builder.root, err = builder.addNodeToDag(cloneNode)  // 递归构建 DAG
+    // ...
+    return NewPipelineExecutorFromDag(builder.dag, builder.root), err
 }
 
+// engine/executor/pipeline_executor.go:1521-1554
 func (builder *ExecutorBuilder) addNodeToDag(node hybridqp.QueryNode) (*TransformVertex, error) {
     switch n := node.(type) {
     case *LogicalExchange:
-        return builder.addExchangeToDag(n)  // Exchange 节点
+        return builder.addExchangeToDag(n.Clone().(*LogicalExchange))  // Exchange 节点
     case *LogicalReader:
-        return builder.addReaderToDag(n)    // Reader 节点
+        return builder.addReaderToDag(n)                               // Reader 节点
+    // ... LogicalIndexScan / LogicalSparseIndexScan / LogicalHashMerge / LogicalHashAgg /
+    //     LogicalColumnStoreReader / LogicalTableFunction 分支 ...
     default:
-        return builder.addDefaultNode(n)    // 默认处理
+        return builder.addDefaultNode(n.Clone())                       // 默认处理
     }
 }
 ```
@@ -3078,45 +3219,45 @@ func (builder *ExecutorBuilder) addNodeToDag(node hybridqp.QueryNode) (*Transfor
 **DAG 构建过程**：
 
 ```
-Step 1: 处理 LogicalReader
-  → 创建 TableScanTransform (读取 TSSP 文件)
+Step 1: 处理 LogicalReader / LogicalExchange
+  → 创建 ChunkReader（读取 TSSP 文件）
+  → READER_EXCHANGE 按 schema 选择 MergeTransform（有 Calls）或 SortedMerge；单 Reader 直接复用
 
-Step 2: 处理 LogicalExchange(READER_EXCHANGE)
-  → 创建 SortedMergeTransform (合并多个 Reader 的结果)
-  → 如果有多个 TSSP 文件，创建多个 Reader
+Step 2: 处理 LogicalIndexScan / Exchange(SHARD/NODE)
+  → 创建 IndexScanTransform
+  → 上层 Exchange 创建 MergeTransform / RPC 算子
 
-Step 3: 处理 LogicalFilter
-  → 创建 FilterTransform (过滤 host='server1')
-  → 连接到 SortedMergeTransform
+Step 3: 处理 LogicalAggregate
+  → 创建 StreamAggregateTransform (计算 mean(value))
 
 Step 4: 处理 LogicalInterval
-  → 创建 IntervalTransform (按 5 分钟窗口分组)
-  → 连接到 FilterTransform
+  → 创建 IntervalTransform (时间戳对齐到 5 分钟窗口)
 
-Step 5: 处理 LogicalAggregate
-  → 创建 AggTransform (计算 mean(value))
-  → 连接到 IntervalTransform
+Step 5: 处理 LogicalProject
+  → 创建 MaterializeTransform (列裁剪)
 
-Step 6: 处理 LogicalLimit
+Step 6: 处理 LogicalFill
+  → 创建 FillTransform (默认 FILL(null))
+
+Step 7: 处理 LogicalLimit
   → 创建 LimitTransform (限制 3 行)
-  → 连接到 AggTransform
 
-Step 7: 添加 HttpSender
+Step 8: 处理 LogicalHttpSender
   → 创建 HttpSenderTransform (编码 + 发送给客户端)
-  → 连接到 LimitTransform
 ```
 
 **最终 DAG 结构**：
 ```
 HttpSenderTransform
   └── LimitTransform (LIMIT 3)
-        └── AggTransform (mean(value))
-              └── IntervalTransform (GROUP BY time(5m))
-                    └── FilterTransform (WHERE host='server1')
-                          └── SortedMergeTransform (合并多个 Reader)
-                                ├── TableScanTransform (Reader 1: TSSP 文件 1)
-                                ├── TableScanTransform (Reader 2: TSSP 文件 2)
-                                └── TableScanTransform (Reader 3: TSSP 文件 3)
+        └── FillTransform (FILL null)
+              └── MaterializeTransform (Project)
+                    └── IntervalTransform (GROUP BY time(5m))
+                          └── StreamAggregateTransform (mean(value))
+                                └── MergeTransform (READER_EXCHANGE, 有 Calls)
+                                      ├── ChunkReader (Reader 1: TSSP 文件 1)
+                                      ├── ChunkReader (Reader 2: TSSP 文件 2)
+                                      └── ChunkReader (Reader 3: TSSP 文件 3)
 ```
 
 ### 13.5 Step 4 详解：流水线执行 — 每个 Processor 干啥
@@ -3152,7 +3293,7 @@ func (exec *PipelineExecutor) Execute(ctx context.Context) error {
                     processorErr = err
                     statistics.ExecutorStat.ExecFailed.Increase()
                     if errno.IsRetryErrorForPtView(processorErr) {
-                        exec.NoMarkCrash()  // PtView 错误可重试
+                        exec.NoMarkCrash()  // 网络/分区归属类可重试错误
                     } else {
                         exec.Crash()        // 其他错误触发崩溃
                     }
@@ -3176,10 +3317,10 @@ func (exec *PipelineExecutor) Execute(ctx context.Context) error {
 
 **逐行解释**：
 - `exec.RunTimeStats.Begin()/End()`：统计整个执行耗时
-- `exec.InitContext(ctx)`：初始化执行上下文（包括 tracing、资源分配）
+- `exec.InitContext(ctx)`：创建可取消的查询上下文并防止重复初始化
 - `once.Do(func(){...})`：使用 `sync.Once` 确保只记录第一个错误，避免多个 goroutine 竞争写入
-- `errno.IsRetryErrorForPtView(processorErr)`：判断是否为 PtView 一致性错误（可自动刷新 PtView 并重试）
-- `exec.Crash()` vs `exec.NoMarkCrash()`：前者标记为不可恢复错误，后者允许重试
+- `errno.IsRetryErrorForPtView(processorErr)`：判断是否为网络类/分区归属类可重试错误（如 connection reset、dbpt 不在本节点）
+- `exec.Crash()` vs `exec.NoMarkCrash()`：两者都会置 crashed 并 cancel；后者调用 `InterruptWithoutMark()`，供上层重试
 - `processor.FinishSpan()`：结束每个 Processor 的 tracing span，用于性能分析
 - `errno.NoFieldSelected`：查询结果无匹配字段时返回 nil（非错误）
 
@@ -3210,10 +3351,10 @@ func (exec *PipelineExecutor) Execute(ctx context.Context) error {
 └─────────────────────┴───────┴────────┘
 ```
 
-#### Step 4.1: TableScanTransform — 读取数据
+#### Step 4.1: ChunkReader — 读取数据
 
 ```
-TableScanTransform 从 TSSP 文件读取 Chunk：
+ChunkReader 从 TSSP 文件读取 Chunk：
 ┌─────────────────────┬───────┬────────┐
 │ time                │ host  │ value  │
 ├─────────────────────┼───────┼────────┤
@@ -3223,80 +3364,28 @@ TableScanTransform 从 TSSP 文件读取 Chunk：
 │ ...                 │ ...   │ ...    │
 └─────────────────────┴───────┴────────┘
 
-通过 ChunkPort 发送给 FilterTransform
+通过 ChunkPort 发送给流式算子（Aggregate）
 ```
 
-#### Step 4.2: FilterTransform — 过滤 WHERE 条件
+#### Step 4.2: WHERE 条件过滤 — 读取层（普通查询不使用 FilterTransform）
+
+普通 measurement 查询的计划中不会出现 `LogicalFilter`；WHERE 条件随 `opt.Condition` 下发到读取层，由 TSSP reader 逐行求值：
 
 ```go
-// engine/executor/filter_transform.go:99-136
-func (trans *FilterTransform) Work(ctx context.Context) error {
-    var wg sync.WaitGroup
-    span := trans.StartSpan("[Filter]TotalWorkCost", false)
-    trans.workTracing = tracing.Start(span, "cost_for_filter", false)
-    defer func() {
-        trans.Close()
-        tracing.Finish(span, trans.workTracing)
-    }()
-
-    runnable := func() {
-        defer func() {
-            close(trans.currChunk)
-            wg.Done()
-        }()
-        for {
-            select {
-            case chunk, ok := <-trans.Input.State:   // 从上游接收 Chunk
-                if !ok {
-                    return
-                }
-                tracing.StartPP(span)
-                tracing.SpanElapsed(trans.workTracing, func() {
-                    trans.currChunk <- chunk           // 发送到内部 channel
-                })
-                tracing.EndPP(span)
-            case <-ctx.Done():
-                return
-            }
-        }
-    }
-    wg.Add(1)
-    go runnable()               // 启动 goroutine 从上游读取
-    trans.transferHelper()      // 主 goroutine 执行过滤逻辑
-    wg.Wait()
-    return nil
+// engine/immutable/reader.go:919-964
+valuer := influxql.ValuerEval{
+	Valuer: influxql.MultiValuer(
+		query.MathValuer{},
+		influxql.FilterMapValuer(filterOption.FiltersMap),
+	),
 }
-
-// engine/executor/filter_transform.go:166-205
-func (trans *FilterTransform) filterHelper(c Chunk) {
-    index := 0
-    trans.tagFilterMapInit(index, c)           // 初始化 tag 过滤 map
-    for i := 0; i < c.NumberOfRows(); i++ {
-        if index < len(c.TagIndex())-1 && i == c.TagIndex()[index+1] {
-            index++
-            trans.tagFilterMapInit(index, c)    // 切换 tag 分组时更新 map
-        }
-        for j, f := range trans.Output.RowDataType.Fields() {
-            trans.filterMap[f.Expr.(*influxql.VarRef).Val] = trans.valueFunc[j](i, c.Column(j))
-        }
-        multiValuer := []influxql.Valuer{influxql.MapValuer(trans.filterMap)}
-        if trans.opt.IsPromQuery() {
-            cv := NewChunkValuer(trans.opt.IsPromQuery())
-            cv.SetValueFnOnlyPromTime()
-            cv.ref = c
-            cv.index = i
-            multiValuer = append(multiValuer, cv, PromTimeValuer{}, query.MathValuer{})
-        }
-        valuer := influxql.ValuerEval{
-            Valuer: influxql.MultiValuer(multiValuer...),
-        }
-        if valuer.EvalBool(trans.opt.Condition) {   // 评估 WHERE 条件
-            // 条件为 true：保留该行
-            trans.param.chunkLen, trans.param.start, trans.param.end = trans.resultChunk.Len(), i, i+1
-            trans.resultChunk.AppendTimes(c.Time()[i : i+1])
-            trans.CoProcessor.WorkOnChunk(c, trans.resultChunk, trans.param)
-        }
-    }
+// ...
+for i := 0; i < rowNum; i++ {
+	rowCon = getRowCondition(con, rowFilters, times[i])
+	// ...
+	if filterOption.FiltersMap.FilterMapEvalBool(valuer, rowCon) {
+		reserveId = append(reserveId, i)
+	}
 }
 ```
 
@@ -3319,9 +3408,11 @@ func (trans *FilterTransform) filterHelper(c Chunk) {
 ```
 
 **逐行解释**：
-- `chunk, ok := <-r.Input.ChunkPort().State`：从上游接收 Chunk
-- `filterChunk(chunk, "host", "server1")`：过滤 host='server1' 的行
-- `r.Output.ChunkPort().State <- filtered`：发送过滤后的 Chunk 给下游
+- `filterOption.FiltersMap`：tag/field 值映射
+- `getRowCondition`：按行拼出与时间相关的条件
+- `FilterMapEvalBool`：求值 WHERE；命中行号加入 `reserveId`，后续按行号重组 Record
+- `FilterTransform` 仅用于子查询 / CTE / IN 等路径（见 6.3）
+
 
 #### Step 4.3: IntervalTransform — 按时间窗口分组
 
@@ -3376,7 +3467,7 @@ func (trans *IntervalTransform) work(c Chunk) {
 }
 ```
 
-**关键区别**：真实实现不会将 Chunk 拆分为多个子 Chunk。而是**原地修改时间戳**（`ResetTime`），将每行的时间戳替换为其所属窗口的起始时间，然后通过 CoProcessor 复制列数据到新 Chunk。聚合操作由下游的 `StreamAggregateTransform` 负责。
+**关键区别**：真实实现不会将 Chunk 拆分为多个子 Chunk。而是**原地修改时间戳**（`ResetTime`），将每行的时间戳替换为其所属窗口的起始时间，然后通过 CoProcessor 复制列数据到新 Chunk。聚合操作由数据流上游的 `StreamAggregateTransform` 负责。
 
 **分组后的数据**：
 
@@ -3411,12 +3502,10 @@ func (trans *IntervalTransform) work(c Chunk) {
 ```
 
 **逐行解释**：
-- `windowStart := t / int64(interval) * int64(interval)`：计算窗口起始时间
-  - 例如：`00:03:00 / 5m * 5m = 0`，窗口起始 = `00:00:00`
-  - 例如：`00:07:00 / 5m * 5m = 1`，窗口起始 = `00:05:00`
-- `IntervalTransform` 不把一个输入 Chunk 拆成多个“窗口 Chunk”；它把每行时间改写为对应窗口起点后继续传给下游，后续 `AggTransform` 再按改写后的时间聚合。
+- `trans.opt.Window(t)`：按 interval/offset 计算窗口起始时间（代码中不存在 `t / interval * interval` 这类简化公式）
+- `IntervalTransform` 不把一个输入 Chunk 拆成多个“窗口 Chunk”；它把每行时间改写为对应窗口起点后继续传给下游。聚合由上游的 `StreamAggregateTransform` 完成，Interval 只做时间对齐。
 
-#### Step 4.4: AggTransform — 聚合计算
+#### Step 4.4: StreamAggregateTransform — 聚合计算
 
 **mean(value) 的计算原理**：
 
@@ -3462,11 +3551,21 @@ func (trans *StreamAggregateTransform) run(ctx context.Context, errs *errno.Errs
 }
 
 // engine/executor/agg_transform.go:248-304 — 聚合 goroutine
-func (trans *StreamAggregateTransform) reduce(ctx context.Context, errs *errno.Errs) {
+func (trans *StreamAggregateTransform) reduce(
+    ctx context.Context, errs *errno.Errs,
+) {
+    var ok bool
+    // ... defer 中的 closeNextSignal / panic recovery ...
     trans.bufChunk, ok = <-trans.inputChunk    // 获取第一个 Chunk
-    if !ok { return }
+    if !ok {
+        // ...
+        return
+    }
     trans.newChunk = trans.chunkPool.GetChunk()
     for {
+        if *trans.closedSignal {
+            return
+        }
         if trans.bufChunk == nil {
             if trans.newChunk.NumberOfRows() > 0 {
                 trans.sendChunk()              // 发送最后的结果
@@ -3479,14 +3578,18 @@ func (trans *StreamAggregateTransform) reduce(ctx context.Context, errs *errno.E
         } else if trans.newChunk.NumberOfRows() >= trans.opt.ChunkSize {
             trans.sendChunk()
         }
+        // ... tracing.SpanElapsed / iteratorParam.err 收集 ...
         trans.compute(trans.bufChunk)          // 执行聚合计算
     }
 }
 
 // engine/executor/agg_transform.go:312-318 — 实际聚合
 func (trans *StreamAggregateTransform) compute(c Chunk) {
-    trans.iteratorParam.Reset()
-    trans.proRes.coProcessor.WorkOnChunk(c, trans.newChunk, trans.iteratorParam)  // 委托给 CoProcessor
+	trans.preProcess(c)
+	trans.proRes.coProcessor.WorkOnChunk(c, trans.newChunk, trans.iteratorParam)  // 委托给 CoProcessor
+	trans.postProcess(c)
+	trans.sameInterval = false
+	trans.bufChunk = trans.nextChunk
 }
 ```
 
@@ -3506,11 +3609,9 @@ func (trans *StreamAggregateTransform) compute(c Chunk) {
 ```
 
 **逐行解释**：
-- `chunk.Value(i, fieldName)`：获取第 i 行的 value 字段值
-- `sum += v.(float64)`：累加所有值
-- `count++`：计数
-- `mean := sum / float64(count)`：计算平均值
-- `result.AppendTime(chunk.WindowStart())`：使用窗口起始时间作为结果的时间戳
+- 聚合由 `proRes.coProcessor` 中的 `FloatMeanIterator` 等完成：内部维护 sum/count，逐行累加
+- `outChunk.AppendTime(...)`：把窗口时间写入结果 Chunk（不存在 `chunk.Value()` / `chunk.WindowStart()` API）
+- `trans.bufChunk = trans.nextChunk`：推进到下一个 Chunk
 
 #### Step 4.5: LimitTransform — 限制行数
 
@@ -3533,7 +3634,7 @@ func (trans *LimitTransform) Work(ctx context.Context) error {
                         trans.SendChunk()        // 发送剩余数据
                     }
                     return
-                    }
+                }
                 // measurement 变化时先发送当前 Chunk
                 if trans.NewChunk.Len() > 0 && trans.NewChunk.Name() != c.Name() {
                     trans.SendChunk()
@@ -3624,9 +3725,9 @@ sequenceDiagram
 
     Note over S1,S3: 每个节点独立执行本地 DAG
     par 并行执行
-        S1->>S1: Reader → Filter → Interval → Agg
-        S2->>S2: Reader → Filter → Interval → Agg
-        S3->>S3: Reader → Filter → Interval → Agg
+        S1->>S1: Reader → Aggregate → Interval → Project → Fill → Limit
+        S2->>S2: Reader → Aggregate → Interval → Project → Fill → Limit
+        S3->>S3: Reader → Aggregate → Interval → Project → Fill → Limit
     end
 
     Note over SQL: ===== Gather（汇聚）=====
@@ -3642,7 +3743,7 @@ sequenceDiagram
 ```
 
 **关键点**：
-- 每个 ts-store 节点独立执行本地 DAG（Reader → Filter → Interval → Agg）
+- 每个 ts-store 节点独立执行本地 DAG（Reader → Aggregate → Interval → Project → Fill → Limit）
 - 协调节点合并所有节点的结果（MergeTransform）；对于 `mean`，合并的是局部 `sum/count` 状态，而不是对局部 mean 做普通平均。
 - 如果是 mean 聚合，协调节点需要做二次聚合（合并多个 mean 值时，需要知道每个节点的 count 和 sum）
 
@@ -3653,8 +3754,8 @@ sequenceDiagram
 | DAG 模型 | 每个算子一个 goroutine，Channel 连接 | 并行执行，高吞吐 |
 | ChunkPort Channel | `Connect()` 使用 buffer=1；`ConnectNoneCache()` 使用无缓冲 channel | 普通流水线天然流控，特殊路径避免额外缓存 |
 | 模板快速路径 | 6 种 PlanType 模板 | 常见查询跳过复杂优化 |
-| 谓词下推 | Filter 尽量靠近 Source | 减少数据传输量 |
-| 列裁剪 | 只读取需要的列 | 减少 IO |
+| 条件下沉 | WHERE 条件随 opt.Condition 下发到读取层 | 减少无效数据传输 |
+| 列裁剪 | Project 只保留需要的列 | 减少 IO |
 | Exchange 分层 | NODE > SHARD > READER > SERIES | 支持不同粒度的并行 |
 | 二叉树合并 | 多路归并使用二叉树结构 | 延迟 O(logN) |
 | Scatter-Gather | 协调节点扇出，汇聚结果 | 分布式查询 |

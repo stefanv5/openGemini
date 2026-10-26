@@ -1,5 +1,7 @@
 # Module 6: Cluster Communication 深度审计报告（庖丁解牛版 v3）
 
+> 基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）。本文所有 `file:line` 与代码摘录均以此提交为准。
+
 > 时序图优先，逐步拆解。每个流程都有 Mermaid 时序图 + 核心代码逐行解释。
 
 ---
@@ -482,7 +484,7 @@ type MultiplexedSession struct {
     cfg       config.Spdy             // 配置
     conn      *MultiplexedConnection  // 底层连接（一个 TCP 连接）
     id        uint64                  // 会话 ID
-    sequence  uint64                  // RPC 协议头序列号，用于请求/响应匹配；SPDY 数据帧头本身使用 ConnID
+    sequence  uint64                  // 会话内保留的序列号（当前仅测试使用）；生产 RPC 的 ProtocolHeader.Sequence 由 spdy/transport 全局计数器生成
     fsm       *FSM                    // 状态机
     recvQueue chan []byte              // 接收队列（channel 实现）
     hdr       header                  // 帧头（16 字节：1 version + 1 type + 2 flags + 8 connID + 4 length）
@@ -536,7 +538,7 @@ func NewMultiplexedSession(cfg config.Spdy, conn *MultiplexedConnection, id uint
 MultiplexedSession 就像"快递柜里的一个格子"：
 - **conn**（底层连接）：整个快递柜（一个 TCP 连接）
 - **id**（会话 ID）：格子编号
-- **sequence**（RPC 序列号）：用于 mux `ProtocolHeader` 的请求/响应匹配，不是 SPDY 数据帧排序字段
+- **sequence**（RPC 序列号）：mux `ProtocolHeader` 的 Sequence 用于请求/响应匹配（生产由 `lib/spdy/transport/transport.go:109` 的全局计数器生成），SPDY 数据帧头本身用 ConnID
 - **fsm**（状态机）：格子的状态（空闲 → 已投递 → 已取件）
 - **recvQueue**（接收队列）：格子里的包裹，等收件人来取
 - **dataAck**（流控）：防止快递员塞太多包裹，格子放不下
@@ -573,27 +575,21 @@ Session 3 (id=3): 写入 disk 表
 
 ```mermaid
 sequenceDiagram
-    participant Sender as 发送方（Client）
+    participant Server as 发送方（Server，被限速）
     participant Window as 流控窗口
-    participant Receiver as 接收方（Server）
+    participant Client as 接收方（Client，发 ACK）
 
-    Sender->>Receiver: 发送数据块 1
-    Sender->>Sender: incr++ (1)
-    Sender->>Receiver: 发送数据块 2
-    Sender->>Sender: incr++ (2)
-    Sender->>Receiver: 发送数据块 3
-    Sender->>Sender: incr++ (3)
-    Sender->>Receiver: 发送数据块 4
-    Sender->>Sender: incr++ (4)
+    Server->>Client: 发送数据块 1..3
+    Server->>Server: Block()：incr 每次 +1
+    Server->>Client: 发送数据块 4
+    Note over Server: incr % size == 0 → Block() 阻塞，等待 DATA_ACK
 
-    Note over Sender: incr % size == 0<br/>触发 ACK 发送
-    Sender->>Receiver: SendDataACK()
+    Client->>Client: Select() 读到包 → Dispatch()<br/>每 size 个包触发 handler
+    Client->>Server: SendDataACK()
 
-    Receiver->>Receiver: SignalOn()
-    Note over Receiver: 解除阻塞
-
-    Sender->>Receiver: 发送数据块 5
-    Sender->>Sender: 继续发送…
+    Server->>Server: recvDataACK → SignalOn()
+    Note over Server: 解除阻塞，继续发送
+    Server->>Client: 发送数据块 5...
 ```
 
 **核心代码**：`lib/spdy/data_ack.go:33-125`
@@ -609,6 +605,8 @@ type DataACK struct {
     handler      func()         // ACK 发送回调
     blockTimeout time.Duration  // 阻塞超时
 }
+
+// ...（NewDataACK / SetBlockTimeout / SetRole / Enable / Disable / Close 等方法略）
 
 // 第 78 行：Incr — 递增计数器
 func (a *DataACK) Incr() {
@@ -667,16 +665,16 @@ func (a *DataACK) Block() error {
 ```
 
 **逐行解释**：
-- **第 84-93 行**：`Dispatch()` 是客户端调用的，每发送 `size` 个数据块后，异步发送一次 ACK
-- **第 95-104 行**：`SignalOn()` 是服务端调用的，收到 ACK 后发送信号，解除 `Block()` 的阻塞
-- **第 106-125 行**：`Block()` 是服务端调用的，当 `incr % size == 0` 时阻塞，等待客户端的 ACK
+- **第 84-93 行**：`Dispatch()` 由 **client 角色在 `Select()` 读到数据时**调用（`lib/spdy/multiplexed_session.go:186-189`）；`role == RoleServer` 直接返回，只有 client 每收到 `size` 个数据块才异步触发一次 `SendDataACK()`
+- **第 95-104 行**：`SignalOn()` 由收到 DATA_ACK 的一侧调用（`recvDataACK`，`lib/spdy/multiplexed_session.go:451-452`），向 `signal` 发信号解除本端 `Block()` 的阻塞
+- **第 106-125 行**：`Block()` 由 **server 角色在 `Send()` 发送数据时**调用（`role == RoleClient` 直接返回）；当 `incr % size == 0` 时阻塞，等待 client 的 DATA_ACK
 - **注意**：`Block()` 通过 `defer func() { a.incr++ }()` 在函数返回前始终递增 `incr`（无论是否阻塞）。这意味着每次调用 `Block()` 都会推进计数器，确保窗口滑动的正确性
 - **设计意图**：类似 TCP 的滑动窗口，防止发送方过快导致接收方缓冲区溢出
 
 **通俗解释**：
 DataACK 流控就像"快递签收确认"：
-- **发送方**（客户端）：每发 4 个包裹（size=4），暂停一下，等签收确认
-- **接收方**（服务端）：收到 4 个包裹后，发一条"已签收"消息
+- **发送方**（Server）：每发 4 个包裹（size=4），暂停一下，等签收确认
+- **接收方**（Client）：收到 4 个包裹后，发一条"已签收"消息
 - **发送方**收到"已签收"后，继续发下一批
 
 这样做的好处：
@@ -685,29 +683,20 @@ DataACK 流控就像"快递签收确认"：
 
 **具体例子**：
 
-窗口大小 size = 4，客户端发送 10 个数据块：
+窗口大小 size = 4，Server 向 Client 发送 10 个响应数据块：
 
 ```
-客户端发送：                    服务端接收：
-数据块 1 → incr=1              接收 ✓
-数据块 2 → incr=2              接收 ✓
-数据块 3 → incr=3              接收 ✓
-数据块 4 → incr=4              接收 ✓
-  → incr % 4 == 0，触发 ACK    → 发送 DataACK
-  → 等待 ACK...                → SignalOn() 解除阻塞
+Server（发送方，RoleServer）:        Client（接收方，RoleClient）:
+数据块 1 → Send() 返回              Select() 读到 ✓ → Dispatch() (1)
+数据块 2 → Send() 返回              Select() 读到 ✓ → Dispatch() (2)
+数据块 3 → Send() 返回              Select() 读到 ✓ → Dispatch() (3)
+数据块 4 → Block() 阻塞             Select() 读到 ✓ → Dispatch() (4)
+  → incr % 4 == 0，等待 DATA_ACK      → incr % 4 == 0，触发 handler
+                                      → 发送 DataACK
+收到 DATA_ACK → SignalOn() 解除阻塞
 
-收到 ACK ✓，继续发送：
-数据块 5 → incr=5              接收 ✓
-数据块 6 → incr=6              接收 ✓
-数据块 7 → incr=7              接收 ✓
-数据块 8 → incr=8              接收 ✓
-  → incr % 4 == 0，触发 ACK    → 发送 DataACK
-  → 等待 ACK...                → SignalOn() 解除阻塞
-
-收到 ACK ✓，继续发送：
-数据块 9 → incr=9              接收 ✓
-数据块 10 → incr=10            接收 ✓
-  → 发送完成
+数据块 5..8 → 重复上述过程（每 4 个阻塞一次）
+数据块 9、10 → Send() 返回，发送完成
 ```
 
 ---
@@ -788,7 +777,7 @@ func NewMultiplexedSessionPool(cfg config.Spdy, network string, address string) 
 MultiplexedSessionPool 就像"出租车调度中心"：
 - **queue**（Session 队列）：空闲出租车的等候区
 - **conn**（底层连接）：公路（TCP 连接）
-- **GetSession()**：乘客叫车
+- **Get()**：乘客叫车
   - 有空车 → 直接派车（从 queue 取出 Session）
   - 没空车 → 新建一辆（创建新 Session）
 - **归还 Session**：乘客下车，出租车回到等候区
@@ -800,13 +789,13 @@ MultiplexedSessionPool 就像"出租车调度中心"：
 ```
 初始状态：queue = []（空），conn = nil
 
-请求 1：GetSession("store1:8080")
+请求 1：pool.Get()（池已绑定 store1:8080）
   → queue 为空，需要新建
   → Dial("store1:8080") 建立 TCP 连接
   → NewMultiplexedSession(conn, id=1)
   → 返回 Session 1
 
-请求 2：GetSession("store1:8080")
+请求 2：pool.Get()（复用同一 TCP 连接）
   → queue 为空，需要新建
   → 复用已有的 TCP 连接
   → NewMultiplexedSession(conn, id=2)
@@ -815,7 +804,7 @@ MultiplexedSessionPool 就像"出租车调度中心"：
 请求 1 完成：归还 Session 1
   → queue = [Session 1]
 
-请求 3：GetSession("store1:8080")
+请求 3：pool.Get()
   → queue 有空闲，直接取出
   → 返回 Session 1（复用）
 
@@ -972,6 +961,7 @@ RETRY:
         for _, ptId := range ctx.Shard.Owners {
             err = w.TSDBStore.WriteRows(ctx, ptView[ptId].Owner.NodeID,
                 ptId, database, retentionPolicy, w.timeout)
+            // ...（ShardMetaNotFound / 其它错误日志分支略，见 points_writer.go:872-887）
             // 第 876 行：如果 Pt 路由变更，重试
             if err != nil && errno.IsRetryErrorForPtView(err) {
                 time.Sleep(100 * time.Millisecond)
@@ -1033,7 +1023,7 @@ func (sgi *ShardGroupInfo) ShardFor(hash uint64, aliveShardIdxes []int) *ShardIn
 - **第 572 行**：`xxhash.Sum64(key)` 是 xxhash 算法的核心，输入字节数组，输出 uint64 哈希值
 - **第 393 行**：`ShardFor` 是路由的核心方法，接收哈希值和存活的 Shard 索引列表
 - **第 398 行**：`hash % uint64(len(aliveShardIdxes))` 取模运算，将哈希值映射到 Shard 索引
-- **设计意图**：使用 `aliveShardIdxes` 而非全部 Shard，确保只路由到存活的 Shard
+- **设计意图**：默认配置（`InitNumOfShards == 0`）下使用 `aliveShardIdxes` 而非全部 Shard，确保只路由到存活的 Shard；`InitNumOfShards > 0` 时改用 measurement 级 `mi.ShardIdexes[sg.ID]`（`coordinator/points_writer.go:788-792`）
 
 **核心代码**：`lib/util/lifted/influx/meta/shardinfo.go:455-468` — ShardInfo 结构体
 
@@ -1265,6 +1255,7 @@ func (csm *ClusterShardMapper) MapShards(stmt *influxql.SelectStatement,
     if err := csm.mapShards(csming, sources, tmin, tmax, condition, &opt); err != nil {
         return nil, err
     }
+    // ...（CTE `AllDependencyCTEs` 与 `InConditons` 分支略，见 shard_mapper.go:70-101）
     return csming, nil
 }
 ```
@@ -1316,7 +1307,7 @@ func (csm *ClusterShardMapping) RemoteQueryETraitsAndSrc(ctx context.Context,
 - **第 685 行**：`shardsMapByNode` 是 `{nodeID: {ptId: []ShardInfo}}`，来自 MapShards
 - **第 688 行**：每个 `(nodeID, ptID, shardInfos)` 组合启动一个 goroutine
 - **第 693 行**：`makeRemoteQuery` 构建 `RemoteQuery`，包含目标节点 ID、Shard 列表、查询选项
-- **第 700 行**：用 `sync.Mutex` 保护 `eTraits` 的并发写入
+- **第 681、711-714 行**：用 `sync.Mutex` 保护 `eTraits` 的并发写入（声明 / 加锁追加）
 - **设计意图**：并行构建 RemoteQuery，充分利用多核 CPU
 
 **通俗解释**：
@@ -1557,6 +1548,7 @@ func (m *NodeManager) Add(nodeID uint64, address string) {
         address: address,
         pools:   make([]*spdy.MultiplexedSessionPool, spdy.ConnPoolSize()),
     }
+    // ...（setStatisticsJob(m.job) 等略）
 }
 
 // 第 92 行：Get 根据 NodeID 获取节点
@@ -1664,6 +1656,7 @@ type Serf struct {
     state      SerfState               // Serf 状态（Alive/Leaving/Left/Shutdown）
     shutdownCh chan struct{}            // 关闭信号
     snapshotter *Snapshotter           // 快照器（持久化成员状态）
+    // ...（其余字段略，如 queryBroadcasts、coordClient、keyManager 等）
 }
 ```
 
@@ -1794,15 +1787,16 @@ type RaftNode struct {
     node      raft.Node         // etcd raft 状态机
     Store     *raftlog.RaftDiskStorage // WAL 存储
     appliedIndex uint64         // 已应用的日志索引
+    // ...（其余 19 个字段略，如 once、ReplayC、tick、ctx、lock、confState、SnapShotter、Identity 等）
 }
 ```
 
 **逐行解释**：
-- **第 58 行**：`proposeC` 是写入请求的入口，Leader 将数据写入此 channel
-- **第 60 行**：`commitC` 是已提交日志的输出，应用到本地状态机
-- **第 66 行**：`id` 是 Raft 节点 ID，值为 `ptId + 1`（每个 Pt 有独立的 Raft 组）
-- **第 68 行**：`peers` 存储 Peer 的映射关系，用于消息路由
-- **第 71 行**：`node` 是 etcd/raft 库的状态机，处理选举、日志复制等核心逻辑
+- **第 59 行**：`proposeC` 是写入请求的入口，Leader 将数据写入此 channel
+- **第 61 行**：`commitC` 是已提交日志的输出，应用到本地状态机
+- **第 69 行**：`id` 是 Raft 节点 ID，值为 `ptId + 1`（每个 Pt 有独立的 Raft 组）
+- **第 70 行**：`peers` 存储 Peer 的映射关系，用于消息路由
+- **第 82 行**：`node` 是 etcd/raft 库的状态机，处理选举、日志复制等核心逻辑
 
 **核心代码**：`lib/raftconn/node.go:316-385` — serveChannels（Raft 消息处理主循环）
 
@@ -1834,6 +1828,7 @@ func (n *RaftNode) serveChannels() {
             // 第 344 行：写入 WAL（持久化日志）
             n.SaveToStorage(&rd.HardState, rd.Entries, &rd.Snapshot)
 
+            // ...（IsValidSnapshot 时更新 confState/appliedIndex，及 Debug 日志略，见 node.go:347-350）
             // 第 354-363 行：同步刷盘（确保数据持久化）
             for rd.MustSync {
                 if err := n.Store.TrySync(); err != nil {
@@ -2082,19 +2077,14 @@ Step 4: 原 Owner 恢复
   → memberIds 中出现 ts-store1
   → getTakeOverNodeForWAF 返回 oid
 
-Step 4: ts-store 2 从 WAL 恢复
-  → ts-store 2 读取 WAL 文件
-  → 恢复未提交的数据
-  → 应用到本地状态机
-
-Step 5: ts-store 2 处理写入
+Step 5: 客户端重试
+  → ts-sql 重新路由到 ts-store1
   → 写入成功
-  → 返回给客户端
 
 结果：
-  → 客户端只重试了一次
-  → 数据没有丢失
-  → 故障切换对客户端透明
+  → 客户端重试直至原 Owner 恢复
+  → 不会自动迁移到 ts-store2（WAF 不选新 owner）
+  → 原 Owner 长时间不恢复时，写入持续阻塞
 ```
 
 ---
@@ -2135,15 +2125,15 @@ sequenceDiagram
 场景：Node2 持续故障（宕机 10 分钟）
 
 每次查询请求：
-  GetSession("Node2:8080")
+  pool.Get()（池已绑定 Node2:8080）
   → 连接失败，创建新 Session
-  → TCP 连接超时（默认 5 秒）
+  → TCP 连接超时（默认 1 秒，`tcp-dial-timeout`）
   → 返回错误
 
 10 分钟内的影响：
   → 每秒 100 个查询请求
-  → 每个请求等待 5 秒超时
-  → 总共浪费：100 × 5 × 600 = 300,000 秒的等待时间
+  → 每个请求等待 1 秒超时
+  → 总共浪费：100 × 1 × 600 = 60,000 秒的等待时间
   → 用户体验极差
 
 优化方案：指数退避
@@ -2331,8 +2321,8 @@ sequenceDiagram
     Note over FSM: ESTABLISHED_STATE → FIN_SENT_STATE
     Session->>Store: 发送 FIN
 
-    Store-->>Session: 返回 FIN
-    Session->>FSM: ProcessEvent(RECV_FIN_EVENT, nil)
+    Store-->>Session: 返回 RST（收到 FIN 后 SendRst）
+    Session->>FSM: ProcessEvent(RECV_RST_EVENT, nil)
     Note over FSM: FIN_SENT_STATE → CLOSED_STATE
 ```
 

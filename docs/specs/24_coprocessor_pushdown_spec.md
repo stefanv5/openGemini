@@ -1,5 +1,7 @@
 # Module 24: Coprocessor / 计算下推深度审计报告（庖丁解牛版）
 
+> 基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11，main + 19 commits）。
+
 > CoProcessor 有两套语境：Executor 层的 Chunk CoProcessor 是流水线内的列计算框架；Storage/Engine 层的 Record CoProcessor 才和聚合下推、Record 级归约直接相关。不要把普通 filter 统一称为 CoProcessor 下推。
 
 ---
@@ -51,6 +53,8 @@ type Routine interface {
     WorkOnChunk(Chunk, Chunk, *IteratorParams)
 }
 
+...
+
 type CoProcessor interface {
     WorkOnChunk(Chunk, Chunk, *IteratorParams)
 }
@@ -77,6 +81,8 @@ type Reducer interface {
 type Routine interface {
     WorkOnRecord(*record.Record, *record.Record, *ReducerParams)
 }
+
+...
 
 type CoProcessor interface {
     WorkOnRecord(*record.Record, *record.Record, *ReducerParams)
@@ -106,15 +112,16 @@ mapping.mapCalls["last"] = struct{}{}
 mapping.mapCalls["mean"] = struct{}{}
 ```
 
-**说明**：这是查询 Schema 层用于判断预聚合/模板快速路径的一组基础聚合函数。不要把 `median`、`mode`、`top`、`bottom`、`distinct`、`stddev`、`sample`、`absent` 等统称为已支持存储下推。
+**说明**：这是 `QuerySchema.HasNonPreCall()` 用于判断预聚合白名单（`MatchPreAgg()` 的条件之一）的一组基础聚合函数。不要把 `median`、`mode`、`top`、`bottom`、`distinct`、`stddev`、`sample`、`absent` 等统称为已支持存储下推。
 
 ### 3.2 TSSP 读取侧预聚合
 
 **代码位置**：`engine/immutable/reader.go`
 
 ```go
-func readMinMax(...)
-func readSumCount(...)
+func readMinMax(cm *ChunkMeta, ref *record.Field, dst *record.Record, ctx *ReadContext, cr ColumnReader, copied bool, isMin bool, ioPriority int) error
+...
+func readSumCount(cm *ChunkMeta, ref *record.Field, dst *record.Record, ctx *ReadContext, cr ColumnReader, copied, isSum bool, ioPriority int) error
 ```
 
 **说明**：
@@ -125,7 +132,7 @@ func readSumCount(...)
 
 ### 3.3 OGSketch 路径
 
-`percentile_approx` 对应的可优化路径是 OGSketch 复合算子：
+`percentile_ogsketch` 对应的可优化路径是 OGSketch 复合算子：
 
 ```
 percentile_ogsketch
@@ -134,11 +141,11 @@ percentile_ogsketch
   -> ogsketch_percentile
 ```
 
-这和普通 `percentile`、`median` 不是一回事，也不应扩大描述为所有分位数函数都能下推。
+这和普通 `percentile`、`median` 不是一回事，也不应扩大描述为所有分位数函数都能下推。注意：含子查询时 `RewritePercentileOGSketch` 会把 `percentile_ogsketch` 改写为 `percentile_approx`（`lib/util/lifted/influx/influxql/ast.go:3907-3930`），此时不再走复合算子路径。
 
 ### 3.4 filter 的边界
 
-filter 谓词优化是把条件尽量推近 Reader 或索引读取侧，减少后续 Chunk/Record 处理量。它可以和聚合下推配合，但不要把“WHERE 条件下推”都称为 `CoProcessor` 下推；CoProcessor 关注的是列/Record 计算框架，filter 是计划与读取路径的筛选能力。
+filter 谓词优化是把条件尽量推近 Reader 或索引读取侧，减少后续 Chunk/Record 处理量。它可以和聚合下推配合，但不要把“WHERE 条件下推”都称为 `CoProcessor` 下推；CoProcessor 关注的是列/Record 计算框架，filter 是计划与读取路径的筛选能力（可参见 `engine/executor/filter_transform.go:166` 的 `filterHelper`：谓词由 `ValuerEval` 逐行求值，`WorkOnChunk` 只负责结果列投影）。
 
 ---
 
@@ -155,7 +162,8 @@ sequenceDiagram
     participant Out as 结果
 
     Plan->>Schema: 收集 calls / 判断 CanCallsPushdown()
-    Schema->>Schema: 检查基础聚合、OGSketch、Prom 函数等能力
+    Schema->>Schema: 分别判定 CanCallsPushdown / MatchPreAgg / OGSketch
+    Note over Schema: MatchPreAgg 还要求 PreAggEnabled、无 interval/字段条件、非 PromQL
     Plan->>Rule: 应用聚合下推规则
     alt 可走存储预聚合
         Rule->>Reader: 下推 min/max/sum/count 等读取
@@ -189,10 +197,11 @@ WHERE time > now() - 1h
    min / max / sum / count 均命中 PreAggregateCallMapping
 
 2. 规划器判断可下推:
-   CanCallsPushdown() == true
+   CanCallsPushdown() == true 且 MatchPreAgg() == true
+   （需 PreAggEnabled 开启、无 interval、无字段条件、非 PromQL、函数全在白名单）
 
 3. 存储读取侧:
-   若时间范围完整覆盖对应 ColumnMeta 范围，min/max 尝试走 readMinMax，
+   若时间范围完整覆盖对应 ChunkMeta 范围，min/max 尝试走 readMinMax，
    sum/count 尝试走 readSumCount；否则回退读取数据列计算
 
 4. 上层合并:
@@ -204,7 +213,7 @@ WHERE time > now() - 1h
 ### 5.2 OGSketch 近似分位数
 
 ```sql
-SELECT percentile_approx(value, 99)
+SELECT percentile_ogsketch(value, 99)
 FROM cpu
 WHERE time > now() - 1h
 GROUP BY time(1m)
@@ -239,5 +248,5 @@ max(value) 才进入聚合下推判断。
 | Chunk CoProcessor | Executor 内部 Chunk 列处理 | 向量化执行、复用 Iterator |
 | Record CoProcessor | Engine/Storage Record 级归约 | 降低 Chunk 转换与上层计算成本 |
 | TSSP 预聚合 | `min/max/sum/count` 等基础统计 | 减少原始点读取 |
-| OGSketch | `percentile_approx` 特定优化路径 | 支持近似分位数优化 |
+| OGSketch | `percentile_ogsketch` 特定优化路径 | 支持近似分位数优化 |
 | filter 推近 Reader | 计划/读取侧筛选，不等同 CoProcessor 聚合下推 | 减少参与计算的数据量 |

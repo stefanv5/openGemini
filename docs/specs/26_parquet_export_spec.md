@@ -1,5 +1,7 @@
 # Module 26: Parquet 导出深度审计报告（庖丁解牛版）
 
+> 基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11，main + 19 commits）。
+
 > openGemini 支持将 TSSP 文件异步导出为 Apache Parquet 格式，用于与大数据生态（Spark、Presto、Hive）集成。
 
 ---
@@ -35,9 +37,10 @@ sequenceDiagram
     participant Writer as ParquetWriter
     participant Disk as .parquet 文件
 
-    Comp->>Event: OnReplaceFile(oldFiles, newFiles)
+    Comp->>Event: OnReplaceFile(shardDir, lockFile)
     Event->>Log: 持久化 TSSP2ParquetPlan
-    Event->>Task: 调度 ParquetTask
+    Event->>Task: 创建 ParquetTask + LockFiles()
+    Event->>Task: OnFinish → scheduler.Execute(ParquetTask)
 
     Task->>Task: 打开 TSSP 文件
     Task->>Task: ChunkIterator 遍历
@@ -99,6 +102,8 @@ sequenceDiagram
 /tsdb/node1/parquet/mydb/autogen/cpu/dt=2024-01-15/1_00000001-0001-00010001.parquet
 ```
 
+其中 `dt` 由 `time.FixedZone("CST", 8*3600)` 计算，固定按 UTC+8（CST）取日期，不是 UTC 或机器本地时区。
+
 ---
 
 ## 5. 配置
@@ -114,11 +119,15 @@ sequenceDiagram
   reliability-log-dir = "/data/openGemini/parquet_reliability_log"
 ```
 
+以上 `max-group-len`/`page-size` 为代码默认值（`DefaultMaxRowGroupLen`/`DefaultPageSize` = 64*1024）；仓库随附的 `config/openGemini.conf` 样例写的是 `65535`，两者不同。
+
 **代码位置**：`lib/config/store.go`, `lib/config/parquet_task.go`
 
 ```go
 type Store struct {
+    ...
     ParquetTask *ParquetTaskConfig `toml:"parquet-task"`
+    ...
 }
 
 type ParquetTaskConfig struct {
@@ -202,17 +211,21 @@ func InParquetProcess(files ...string) bool {
 行存 `ParquetTask.LockFiles()` 和列存 `CSParquetTask.LockFiles()` 都会调用 `AddTSSP2ParquetProcess`。merge/compact 侧会检查这个状态：
 
 ```go
+// engine/immutable/merge_out_of_order.go:75
 if InParquetProcess(item.unordered.path...) {
-    // in parquet process skip merge
+    m.logger.Info("in parquet process skip merge", zap.String("mst", item.mst))
     continue
 }
 
+// engine/immutable/mms_tables.go:1140
 if m.busy(group.group) || InParquetProcess(group.group...) {
+    group.release()
     return nil
 }
 
+// engine/immutable/cs_mms_tables.go:308
 if InParquetProcess(group.oldFids...) {
-    // in parquet process skip compact
+    m.logger.Info("in parquet process skip compact", zap.String("mst", group.name))
     return nil
 }
 ```

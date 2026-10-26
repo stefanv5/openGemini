@@ -1,4 +1,5 @@
 # Module 28: SPDY Network Transport 深度审计报告（庖丁解牛版）
+> 基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）。本文所有 `file:line`、代码摘录均以该快照为准。
 
 > 时序图 + 核心代码逐行解释。先画图，再对照代码，一步一步拆解。
 
@@ -31,8 +32,8 @@ sequenceDiagram
 - 注意区分两套 Raft 传输：ts-meta 的元数据 Raft 使用 Hashicorp `raft.NetworkTransport`；ts-store 的分区级 Raft 才通过 `msgservice.RaftMessagesRequest` 包装后走 SPDY `RaftMsgRequest`
 
 **为什么不用 gRPC？**
-- SPDY 更轻量，减少了序列化/反序列化开销
-- 自定义协议头只有 16 字节，比 HTTP/2 帧头更紧凑
+- SPDY 协议更简单，省去了优先级、HPACK 头压缩等机制
+- 自定义帧头固定 16 字节（HTTP/2 为 9 字节），把 8 字节 ConnID 与长度放在同一个头里
 - 支持 Snappy 压缩和 TLS 加密
 - 专为 openGemini 的 RPC 模式优化
 
@@ -61,9 +62,9 @@ packet-beta
     128-191: "Payload (变长示意)"
 ```
 
-**SPDY 帧头只有 16 字节**，比 HTTP/2 的 9 字节帧头多了连接 ID 和长度字段，但省去了流控和优先级等复杂机制。
+**SPDY 帧头固定 16 字节**：由 8 字节 ConnID、4 字节长度等字段组成，比 HTTP/2 的 9 字节帧头更长；它省去了优先级、HPACK 头压缩等机制，但**流控并未省略**——会话层通过 DATA_ACK 实现窗口流控（见第 6 节）。
 
-**核心代码**：`lib/spdy/multiplexed_connection.go:37-55`
+**核心代码**：`lib/spdy/multiplexed_connection.go:37-63`
 
 ```go
 // 第 37 行：协议版本常量
@@ -124,6 +125,7 @@ func (h header) CheckVersion() bool {
     return h[0] == SPDY_VERSION
 }
 
+// ...（省略 Type()/CheckType()/String()，见 multiplexed_connection.go:80-103）
 // 第 88 行：获取标志位（BigEndian 编码）
 func (h header) Flags() uint16 {
     return binary.BigEndian.Uint16(h[2:4])
@@ -191,7 +193,7 @@ classDiagram
         +nextSessionId: uint64
         +accept: chan *MultiplexedSession
         +openTimeout: time.Duration
-        +closed: chan struct{}
+        +closed: chan struct
         +closeOnce: sync.Once
         +ListenAndServed() error
         +Write(hdr, data []byte) error
@@ -264,7 +266,7 @@ func NewMultiplexedConnection(cfg config.Spdy, underlying io.ReadWriteCloser, cl
         input:       bufio.NewReader(underlying),           // 4KB 缓冲读取
         output:      bufio.NewWriter(underlying),           // 4KB 缓冲写入
         handlers:    make([]handlerFunc, UNKNOWN_TYPE),     // 帧类型处理器数组
-        dataBp:      *bufferpool.NewByteBufferPool(...),    // 字节缓冲池
+        dataBp:      *bufferpool.NewByteBufferPool(cfg.ByteBufferPoolDefaultSize, cpu.GetCpuNum(), bufferpool.MaxLocalCacheLen),  // 字节缓冲池
         accept:      make(chan *MultiplexedSession, cfg.ConcurrentAcceptSession),
         client:      client,
         openTimeout: cfg.GetOpenSessionTimeout(),
@@ -451,7 +453,7 @@ func (c *MultiplexedConnection) handleData(hdr []byte) error {
 **逐行解释**：
 - **第 272 行**：`SYN_FLAG` 表示新会话请求，服务端创建 `MultiplexedSession`
 - **第 278 行**：非 SYN 帧，根据 ConnID 查找已有会话
-- **第 281 行**：会话不存在（可能已关闭），丢弃载荷避免数据泄漏
+- **第 281 行**：会话不存在（可能已关闭），跳过该帧载荷以保持帧边界/流同步
 - **第 294 行**：将帧交给 Session 的状态机处理
 
 ### 3.6 写入 — Write（原子性保证）
@@ -700,9 +702,9 @@ classDiagram
         +recvQueue: chan []byte
         +hdr: header
         +dataAck: *DataACK
-        +ackRecvSig: chan struct{}
+        +ackRecvSig: chan struct
         +selectTimeout: time.Duration
-        +closed: chan struct{}
+        +closed: chan struct
         +closeOnce: sync.Once
         +onClose: []func()
         +Open(ackSig) error
@@ -816,24 +818,68 @@ func (s *MultiplexedSession) initFSM() {
     closedState   := NewFSMState(CLOSED_STATE, s.enterClosed, nil)  // 进入 CLOSED 时触发回调
 
     // 第 109 行：定义状态转换
-    s.fsm.Build(initState,      SEND_SYN_EVENT,  synSentState,   s.sendSyn)
-    s.fsm.Build(initState,      RECV_SYN_EVENT,  synRecvState,   s.recvSyn)
-    s.fsm.Build(synRecvState,   SEND_ACK_EVENT,  establishState, s.sendAck)
-    s.fsm.Build(synSentState,   RECV_ACK_EVENT,  establishState, s.recvAck)
+    s.fsm.Build(initState,
+        SEND_SYN_EVENT,
+        synSentState,
+        s.sendSyn)
+
+    s.fsm.Build(initState,
+        RECV_SYN_EVENT,
+        synRecvState,
+        s.recvSyn)
+
+    s.fsm.Build(synRecvState,
+        SEND_ACK_EVENT,
+        establishState,
+        s.sendAck)
+
+    s.fsm.Build(synSentState,
+        RECV_ACK_EVENT,
+        establishState,
+        s.recvAck)
 
     // 第 129 行：数据传输（ESTABLISHED → ESTABLISHED）
-    s.fsm.Build(establishState, SEND_DATA_EVENT, establishState, s.sendData)
-    s.fsm.Build(establishState, RECV_DATA_EVENT, establishState, s.recvData)
+    s.fsm.Build(establishState,
+        SEND_DATA_EVENT,
+        establishState,
+        s.sendData)
+
+    s.fsm.Build(establishState,
+        RECV_DATA_EVENT,
+        establishState,
+        s.recvData)
 
     // 第 139 行：数据确认（流控）
-    s.fsm.Build(establishState, SEND_DATA_ACK_EVENT, establishState, s.sendDataACK)
-    s.fsm.Build(establishState, RECV_DATA_ACK_EVENT, establishState, s.recvDataACK)
+    s.fsm.Build(establishState,
+        SEND_DATA_ACK_EVENT,
+        establishState,
+        s.sendDataACK)
+
+    s.fsm.Build(establishState,
+        RECV_DATA_ACK_EVENT,
+        establishState,
+        s.recvDataACK)
 
     // 第 149 行：关闭连接
-    s.fsm.Build(establishState, SEND_FIN_EVENT, finSentState, s.sendFin)
-    s.fsm.Build(establishState, RECV_FIN_EVENT, finRecvState, s.recvFin)
-    s.fsm.Build(finRecvState,   SEND_RST_EVENT, closedState, s.sendRst)
-    s.fsm.Build(finSentState,   RECV_RST_EVENT, closedState, s.recvRst)
+    s.fsm.Build(establishState,
+        SEND_FIN_EVENT,
+        finSentState,
+        s.sendFin)
+
+    s.fsm.Build(establishState,
+        RECV_FIN_EVENT,
+        finRecvState,
+        s.recvFin)
+
+    s.fsm.Build(finRecvState,
+        SEND_RST_EVENT,
+        closedState,
+        s.sendRst)
+
+    s.fsm.Build(finSentState,
+        RECV_RST_EVENT,
+        closedState,
+        s.recvRst)
 }
 ```
 
@@ -897,29 +943,45 @@ func (s *MultiplexedSession) handle(flags Flags, data []byte) error {
 
     // 第 221 行：SYN 标志（连接建立）
     if flags.has(SYN_FLAG) {
-        if err := s.RecvSyn(); err != nil { return err }
-        if err := s.SendAck(nil); err != nil { return err }
-        if err := s.RecvData(data); err != nil { return err }
+        if err := s.RecvSyn(); err != nil {
+            return err
+        }
+        if err := s.SendAck(nil); err != nil {
+            return err
+        }
+        if err := s.RecvData(data); err != nil {
+            return err
+        }
         return nil
     }
 
     // 第 234 行：ACK 标志（连接确认）
     if flags.has(ACK_FLAG) {
-        if err := s.RecvAck(); err != nil { return err }
-        if err := s.RecvData(data); err != nil { return err }
+        if err := s.RecvAck(); err != nil {
+            return err
+        }
+        if err := s.RecvData(data); err != nil {
+            return err
+        }
         return nil
     }
 
     // 第 244 行：FIN 标志（关闭请求）
     if flags.has(FIN_FLAG) {
-        if err := s.RecvFin(); err != nil { return err }
-        if err := s.SendRst(nil); err != nil { return err }
+        if err := s.RecvFin(); err != nil {
+            return err
+        }
+        if err := s.SendRst(nil); err != nil {
+            return err
+        }
         return nil
     }
 
     // 第 254 行：RST 标志（重置）
     if flags.has(RST_FLAG) {
-        if err := s.RecvRst(); err != nil { return err }
+        if err := s.RecvRst(); err != nil {
+            return err
+        }
         return nil
     }
 
@@ -936,7 +998,7 @@ func (s *MultiplexedSession) handle(flags Flags, data []byte) error {
 - **第 214 行**：`flags == 0` 表示纯数据帧（ESTABLISHED 状态下的正常数据传输）
 - **第 221 行**：`SYN_FLAG` 表示新会话请求，需要回复 ACK
 - **第 234 行**：`ACK_FLAG` 表示连接确认，可能携带初始数据
-- **第 244 行**：`FIN_FLAG` 表示关闭请求，回复 RST 完成四次挥手
+- **第 244 行**：`FIN_FLAG` 表示关闭请求，收到后回 RST 并进入 CLOSED（FIN/RST 两次交互）；主动关闭方发送 FIN 后立即本地 `close()`，不等待对端 RST
 - **第 261 行**：`DATA_ACK_FLAG` 表示数据确认，用于流控
 
 ### 4.5 发送数据 — Send
@@ -1126,8 +1188,8 @@ const (
 ```
 
 **逐行解释**：
-- **事件**：12 种事件，覆盖连接建立、数据传输、连接关闭的完整生命周期
-- **状态**：7 种状态，类似 TCP 的状态机设计
+- **事件**：13 个事件常量（12 个有效事件 + UNKNOWN_EVENT 哨兵），覆盖连接建立、数据传输、连接关闭的完整生命周期
+- **状态**：8 个状态常量（7 个有效状态 + UNKNOWN_STATE 哨兵），类似 TCP 的状态机设计
 
 ### 5.2 状态转换表
 
@@ -1245,7 +1307,7 @@ func (fsm *FSM) ProcessEvent(event event, data []byte) error {
 **逐行解释**：
 - **第 171 行**：`stateGuard.Lock()` 保证状态转换的原子性
 - **第 178 行**：查找 `(当前状态, 事件)` 对应的转换规则
-- **第 183 行**：执行退出动作（如清理资源）
+- **第 183 行**：执行退出动作；本实现所有状态的 exitAction 均为 nil，`NewFSMState` 会填入空实现 `defaultFSMStateAction`，因此不会清理资源（资源清理在 CLOSED 的 enterAction 中完成）
 - **第 190 行**：执行转换动作（如发送帧）
 - **第 199 行**：更新当前状态
 
@@ -1278,7 +1340,7 @@ sequenceDiagram
 - **问题**：发送端发送太快，接收端处理不过来，导致数据积压
 - **解决方案**：基于窗口的流控机制
   - 发送端每发送 `size`（窗口大小）个数据帧后，阻塞等待 ACK
-  - 接收端每接收 `size` 个数据帧后，发送一个 ACK 帧
+  - 接收端每被应用消费 `size` 条消息（`Select()` 从 `recvQueue` 取走）后，发送一个 ACK 帧
   - 发送端收到 ACK 后，解除阻塞继续发送
 
 **核心代码**：`lib/spdy/data_ack.go:33-41`
@@ -1316,7 +1378,7 @@ func (a *DataACK) Dispatch() {
 
 **逐行解释**：
 - **第 85 行**：只有启用且是客户端角色时才发送 ACK
-- **第 90 行**：每接收 `size` 个数据帧，触发一次 ACK 发送
+- **第 90 行**：每消费 `size` 条消息（`Dispatch()` 在 `Select()` 取走数据时调用），触发一次 ACK 发送
 - **第 91 行**：`go a.handler()` 异步发送，不阻塞接收循环
 
 ### 6.3 服务端：发送数据前检查窗口 — Block
@@ -1403,6 +1465,7 @@ func (a *DataACK) Disable() {
 - `Enable()` 重置计数器和信号通道，启用流控
 - `Disable()` 只设置标志位，不清理资源
 - 在 `SessionPool.Put()` 时调用 `Disable()`，因为归还的会话不需要流控
+- **启用条件**：DataACK 默认关闭，`Block()`/`Dispatch()` 在 `!enable` 时直接返回。业务上仅查询链路调用 `EnableDataACK()`：SQL 客户端（`engine/executor/rpc_client.go:161`）与 ts-store 的 Select handler（`app/ts-store/transport/handler/processor.go:178`）；写入、Raft 等路径不启用，不受该窗口约束
 
 ---
 
@@ -1636,7 +1699,7 @@ classDiagram
         +factories: []EventHandlerFactory
         +stopped: bool
         +stopGuard: sync.Mutex
-        +stopSignal: chan struct{}
+        +stopSignal: chan struct
         +err: error
         +RegisterEHF(factory)
         +Start() error
@@ -1719,7 +1782,10 @@ func (s *RRCServer) run() {
             ms.Start()  // 启动会话接受循环
 
             if err := conn.ListenAndServed(); err != nil {  // 启动帧读取循环
-                s.logger.Warn(err.Error(), ...)
+                s.logger.Warn(err.Error(),
+                    zap.String("remote_addr", conn.RemoteAddr().String()),
+                    zap.String("local_addr", conn.LocalAddr().String()),
+                    zap.String("SPDY", "RRCServer"))
             }
 
             ms.Stop()  // 停止 MultiplexedServer
@@ -1850,17 +1916,23 @@ func (r *Reactor) HandleEvents() {
         header := ProtocolHeader(data)
 
         if header.Version() != ProtocolVersion {
+            r.reactorLogger.Error(ErrorInvalidProtocolVersion.Error(), zap.Error(ErrorInvalidProtocolVersion),
+                zap.String("SPDY", "Reactor"))
             r.closeWithErr(ErrorInvalidProtocolVersion)
             return
         }
 
         if header.Type() >= Unknown || header.Type() < Prototype {
+            r.reactorLogger.Error(ErrorInvalidProtocolType.Error(), zap.Error(ErrorInvalidProtocolType),
+                zap.String("SPDY", "Reactor"))
             r.closeWithErr(ErrorInvalidProtocolType)
             return
         }
 
         // 第 113 行：校验请求标志
         if header.Flags()&ReqFlag != ReqFlag {
+            r.reactorLogger.Error(ErrorUnexpectedRequest.Error(), zap.Error(ErrorUnexpectedRequest),
+                zap.String("SPDY", "Reactor"))
             r.closeWithErr(ErrorUnexpectedRequest)
             return
         }
@@ -1882,7 +1954,7 @@ func (r *Reactor) HandleEvents() {
             responser := requester.WarpResponser()
             err := handler.Handle(requester, responser)
             if err != nil {
-                r.reactorLogger.Error("failed to handler response", ...)
+                r.reactorLogger.Error("failed to handler response", zap.Error(err), zap.String("SPDY", "Reactor"))
             }
         }
     }
@@ -1962,6 +2034,11 @@ func NewWriteTransport(nodeId uint64, typ uint8, callback Callback) (*Transport,
 
 // 第 90 行：内部创建 Transport
 func newTransport(node *Node, typ uint8, callback Callback, timeout time.Duration) (*Transport, error) {
+    failpoint.Inject("node-fault", func(val failpoint.Value) {
+        if strings.ContainsInterface(val, node.address) {
+            failpoint.Return(nil, errno.NewError(errno.NoConnectionAvailable, node.nodeID, node.address))
+        }
+    })
     p := node.GetPool()  // 获取连接池
     if p == nil || !p.Available() {
         return nil, errno.NewError(errno.NoConnectionAvailable, node.nodeID, node.address)
@@ -1991,6 +2068,7 @@ func newTransport(node *Node, typ uint8, callback Callback, timeout time.Duratio
 - **第 52 行**：`NewTransport` 用于查询请求，超时 30 分钟
 - **第 74 行**：`NewWriteTransport` 用于写入请求，超时 10 秒
 - **第 90 行**：`newTransport` 从连接池获取会话，创建 Requester 和 Responser
+- 另有 `NewTransportByAddress`/`NewMetaTransport`（30 分钟）与 `NewRaftMsgTransport`（`config.RaftMsgTimeout`，默认 15s）
 
 ### 9.3 发送请求 — Send
 
@@ -2206,7 +2284,7 @@ const (
 ```mermaid
 flowchart LR
     subgraph Meta["ts-meta 元数据 Raft"]
-        M1[Store.Apply / Hashicorp raft] --> M2[newRaftTrans]
+        M1["Store.ApplyCmd / Hashicorp raft"] --> M2[newRaftTrans]
         M2 --> M3["raft.NewNetworkTransport(layer, 3, 10s, nil)"]
         M3 --> M4[TCP listener]
     end
@@ -2227,10 +2305,10 @@ flowchart LR
 **案例**：
 ```
 创建数据库:
-  ts-meta Store.Apply()
-    -> Hashicorp raft.Apply()
+  ts-meta Store.ApplyCmd()
+    -> Store.apply() -> Hashicorp raft.Apply()
     -> raft.NetworkTransport 复制日志
-    -> storeFSM.Apply() 修改 metadata.Data
+    -> storeFSM.Apply() 修改 Store.data（*meta.Data）
 
 写入分区副本:
   ts-store RaftNode 产生 raftpb.Message
@@ -2285,9 +2363,17 @@ var mnm = &NodeManager{
 }
 
 // 第 44 行：获取节点管理器
-func NewNodeManager() *NodeManager { return nm }        // 查询/DDL
-func NewWriteNodeManager() *NodeManager { return wnm }  // 写入
-func NewMetaNodeManager() *NodeManager { return mnm }   // 元数据
+func NewNodeManager() *NodeManager {
+    return nm        // 查询/DDL
+}
+
+func NewWriteNodeManager() *NodeManager {
+    return wnm  // 写入
+}
+
+func NewMetaNodeManager() *NodeManager {
+    return mnm   // 元数据
+}
 ```
 
 **逐行解释**：
@@ -2404,6 +2490,9 @@ sequenceDiagram
     participant MS as MultiplexedServer
     participant Reactor as Reactor
     participant Handler as EventHandler
+    participant Session as MultiplexedSession
+    participant Transport as Transport
+    participant Responser as Responser
 
     Note over SQL,Store: 1. 建立连接（启动时）
     SQL->>Pool: Dial()
@@ -2438,14 +2527,14 @@ sequenceDiagram
     Session->>Session: recvData(data)
     Session->>Session: recvQueue <- data
 
-    MS->>Reactor: AcceptSession()
+    MS->>Conn: AcceptSession()
     Reactor->>Session: Select()
     Session->>Reactor: 返回 data
     Reactor->>Handler: WarpRequester(seq, data)
     Handler->>Handler: Decode(data)
     Handler->>Handler: Handle(requester, responser)
-    Handler->>Session: Response(data, full=true)
-    Session->>Conn: sendDataInternal(RspFlag, data)
+    Handler->>Responser: Response(data, full=true)
+    Session->>Conn: sendDataInternal(0, data)（RPC 头含 RspFlag|FullFlag）
     Conn->>SQL: 发送 RSP 帧
 
     Note over SQL,Store: 4. 接收响应
@@ -2453,10 +2542,10 @@ sequenceDiagram
     Conn->>Session: Handle(0, data)
     Session->>Session: recvQueue <- data
 
-    Pool->>Session: Select()
-    Session->>Pool: 返回 data
-    Pool->>Pool: Apply() 解码响应
-    Pool->>Pool: release() 归还会话
+    Transport->>Responser: Apply()
+    Responser->>Session: Select()
+    Session-->>Responser: 返回 data
+    Transport->>Pool: Put(session) 归还会话
 
     Note over SQL,Store: 5. 关闭连接（关闭时）
     SQL->>Pool: Close()
@@ -2496,8 +2585,8 @@ sequenceDiagram
    Transport.Wait()
    → BaseResponser.Apply()
    → MultiplexedSession.Select()
-   → recvQueue <- data
-   → ProtocolHeader.Parse()
+   → data := <-recvQueue
+   → ProtocolHeader(data) 逐字段校验（Sequence/Version/Type/Flags）
    → Codec.Decode()
    → Callback.Handle(response)
 
@@ -2514,10 +2603,10 @@ sequenceDiagram
 
 ### 14.1 错误类型
 
-**核心代码**：`lib/spdy/errors.go:30-114`
+**核心代码**：`lib/spdy/errors.go:25-114`
 
 ```go
-// 第 30 行：错误码常量
+// 第 25 行：错误码常量
 const (
     INTERNAL_ERROR = iota  // 0: 内部错误
     FSM_ERROR              // 1: 状态机错误
@@ -2531,6 +2620,7 @@ var (
     ErrorUnexpectedRequest      = NewInternalError(INTERNAL_ERROR, "unexpected request")
 )
 
+// ...（省略 MultiplexedError/BaseError/InternalError 定义，见 lib/spdy/errors.go:37-79）
 // 第 81 行：FSM 错误
 type FSMError struct {
     BaseError
@@ -2601,7 +2691,7 @@ func (n *Node) dial(idx uint64) error {
 
 **逐行解释**：
 - **第 66 行**：检查连接池是否可用，可用则直接返回
-- **第 70 行**：超过 TCP 超时时间则返回错误
+- **第 70 行**：`(fasttime.UnixTimestamp() - start)` 只含加锁耗时（`start` 在 `n.mu.Lock()` 之前取），几乎不会触发；真正的拨号超时由 `pool.dail()` 的 `net.Dialer.Timeout` 控制，且此处没有重试/退避
 - **第 75 行**：创建新的连接池，替换旧的
 
 ### 14.3 连接错误处理
@@ -2777,22 +2867,23 @@ func InitStatistics(app int) {
 type Spdy struct {
     ByteBufferPoolDefaultSize uint64  // 字节缓冲池默认大小
 
-    RecvWindowSize          int  // 接收窗口大小（默认 8）
-    ConcurrentAcceptSession int  // 并发接受会话数（默认 4096）
-    ConnPoolSize            int  // 连接池大小（默认 4）
+    RecvWindowSize          int `toml:"recv-window-size"`  // 接收窗口大小（默认 8）
+    ConcurrentAcceptSession int `toml:"concurrent-accept-session"`  // 并发接受会话数（默认 4096）
+    ConnPoolSize            int `toml:"conn-pool-size"`  // 连接池大小（默认 4）
 
-    OpenSessionTimeout   toml.Duration  // 打开会话超时（默认 2 秒）
-    SessionSelectTimeout toml.Duration  // 会话选择超时（默认 300 秒）
-    TCPDialTimeout       toml.Duration  // TCP 拨号超时（默认 1 秒）
-    DataAckTimeout       toml.Duration  // 数据确认超时
+    OpenSessionTimeout   toml.Duration `toml:"open-session-timeout"`  // 打开会话超时（默认 2 秒）
+    SessionSelectTimeout toml.Duration `toml:"session-select-timeout"`  // 会话选择超时（默认 300 秒）
+    TCPDialTimeout       toml.Duration `toml:"tcp-dial-timeout"`  // TCP 拨号超时（默认 1 秒）
+    DataAckTimeout       toml.Duration `toml:"data-ack-timeout"`  // 数据确认超时（默认 60 秒）
 
-    CompressEnable bool  // 启用 Snappy 压缩
-    TLSEnable      bool  // 启用 TLS
+    CompressEnable bool `toml:"compress-enable"`  // 启用 Snappy 压缩
+    TLSEnable      bool `toml:"tls-enable"`  // 启用 TLS
     // ... TLS 配置 ...
 }
 
 // 第 52 行：默认值
 const (
+    // ...（省略 Second 与 Min* 常量，见 lib/config/spdy.go:53-60）
     DefaultRecvWindowSize          = 8
     DefaultConcurrentAcceptSession = 4096
     DefaultOpenSessionTimeout      = 2 * Second
@@ -2814,6 +2905,7 @@ const (
 | ConnPoolSize | 4 | 每个节点的连接池大小 |
 | OpenSessionTimeout | 2s | SYN-ACK 握手超时时间 |
 | SessionSelectTimeout | 300s | 等待数据的超时时间 |
+| DataAckTimeout | 60s（配置 ≤0 时） | 服务端等待 DATA_ACK 的阻塞上限 |
 | TCPDialTimeout | 1s | TCP 连接建立超时 |
 | TCPWriteTimeout | 120s | TCP 写操作超时 |
 | TCPReadTimeout | 300s | TCP 读操作超时 |
@@ -2926,24 +3018,24 @@ graph TB
 
 | 文件 | 行数 | 说明 |
 |------|------|------|
-| `lib/spdy/multiplexed_connection.go` | 550 | 连接多路复用核心 |
-| `lib/spdy/multiplexed_session.go` | 528 | 会话管理 |
-| `lib/spdy/fsm.go` | 222 | 有限状态机 |
-| `lib/spdy/data_ack.go` | 143 | 流控机制 |
-| `lib/spdy/multiplexed_session_pool.go` | 193 | 连接池 |
-| `lib/spdy/multiplexed_server.go` | 132 | 服务端会话管理 |
-| `lib/spdy/reactor.go` | 151 | 事件处理循环 |
-| `lib/spdy/rrc_server.go` | 160 | RPC 服务器 |
-| `lib/spdy/mux.go` | 367 | RPC 协议头和 Requester/Responser |
-| `lib/spdy/errors.go` | 115 | 错误处理 |
-| `lib/spdy/configuration.go` | 47 | 配置管理 |
-| `lib/spdy/transport/transport.go` | 168 | Transport 层 |
-| `lib/spdy/transport/node.go` | 116 | 节点管理 |
-| `lib/spdy/transport/node_manager.go` | 98 | 节点管理器 |
-| `lib/spdy/transport/requester.go` | 72 | 请求发送 |
-| `lib/spdy/transport/responser.go` | 74 | 响应接收 |
-| `lib/spdy/transport/codec.go` | 51 | 编解码接口 |
-| `lib/spdy/transport/event_handler.go` | 68 | 事件处理器 |
+| `lib/spdy/multiplexed_connection.go` | 549 | 连接多路复用核心 |
+| `lib/spdy/multiplexed_session.go` | 527 | 会话管理 |
+| `lib/spdy/fsm.go` | 221 | 有限状态机 |
+| `lib/spdy/data_ack.go` | 142 | 流控机制 |
+| `lib/spdy/multiplexed_session_pool.go` | 192 | 连接池 |
+| `lib/spdy/multiplexed_server.go` | 131 | 服务端会话管理 |
+| `lib/spdy/reactor.go` | 150 | 事件处理循环 |
+| `lib/spdy/rrc_server.go` | 159 | RPC 服务器 |
+| `lib/spdy/mux.go` | 366 | RPC 协议头和 Requester/Responser |
+| `lib/spdy/errors.go` | 114 | 错误处理 |
+| `lib/spdy/configuration.go` | 46 | 配置管理 |
+| `lib/spdy/transport/transport.go` | 167 | Transport 层 |
+| `lib/spdy/transport/node.go` | 115 | 节点管理 |
+| `lib/spdy/transport/node_manager.go` | 97 | 节点管理器 |
+| `lib/spdy/transport/requester.go` | 71 | 请求发送 |
+| `lib/spdy/transport/responser.go` | 73 | 响应接收 |
+| `lib/spdy/transport/codec.go` | 50 | 编解码接口 |
+| `lib/spdy/transport/event_handler.go` | 67 | 事件处理器 |
 | `lib/spdy/transport/statistics.go` | 38 | 统计监控 |
-| `lib/spdy/rpc/message.go` | 96 | RPC 消息封装 |
-| `lib/config/spdy.go` | 216 | 配置结构体 |
+| `lib/spdy/rpc/message.go` | 95 | RPC 消息封装 |
+| `lib/config/spdy.go` | 215 | 配置结构体 |

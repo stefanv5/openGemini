@@ -1,5 +1,7 @@
 # Module 30: Metadata Client 深度设计文档
 
+> 基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）。本文所有 `file:line` 与行号均以该快照为准。
+
 > 元数据客户端是 openGemini 三层架构中连接 ts-sql/ts-store 与 ts-meta 的核心桥梁。每个流程都配有 Mermaid 时序图 + 核心代码逐行解释。
 
 ---
@@ -113,8 +115,8 @@ classDiagram
         +DBBriefInfos map
         -mu sync.RWMutex
         -metaServers []string
-        -closing chan struct{}
-        -changed chan chan struct{}
+        -closing chan
+        -changed chan chan
         -cacheData *Data
         -auth *Auth
         -weakPwdPath string
@@ -183,7 +185,7 @@ type Client struct {
 - **第 70 行**：`changed` 是一个 channel 的 channel，用于通知等待数据变更的 goroutine
 - **第 71 行**：`cacheData *meta2.Data` 是整个元数据缓存的核心，包含所有数据库、RP、Shard、节点信息
 - **第 74 行**：`auth` 负责密码哈希、认证缓存、登录失败锁定
-- **第 82 行**：`UseSnapshotV2` 启用 Snapshot V2 协议，优先传输增量命令；当服务端 OpsMap 无法覆盖客户端 index 时，返回 AllClear 全量数据兜底
+- **第 80-81 行**：`UseSnapshotV2` 启用 Snapshot V2 协议，优先传输增量命令；当服务端 OpsMap 无法覆盖客户端 index 时，返回 AllClear 全量数据兜底
 
 **通俗解释**：
 Client 就像一个"元数据秘书"：
@@ -302,7 +304,7 @@ func (c *Client) OpenAtStore() error {
 **逐行解释**：
 - **第 199-208 行**：V2 协议使用 `retryUntilSnapshotV2`，优先传输增量变更；如果增量链不可用，则通过 AllClear 全量数据替换缓存
 - **第 209-212 行**：V1 协议使用 `retryUntilSnapshot`，传输全量元数据快照
-- **第 229 行**：`verifyDataNodeStatus` 是 ts-store 特有的，定期验证本节点在 ts-meta 中的状态，防止网络分区后数据不一致
+- **第 232 行**：`verifyDataNodeStatus` 是 ts-store 特有的，定期验证本节点在 ts-meta 中的状态，防止网络分区后数据不一致
 
 **通俗解释**：
 - **Open()** 是 ts-sql 节点的初始化，从 ts-meta 加载全量元数据，然后后台持续同步
@@ -424,10 +426,10 @@ func (c *Client) pollForUpdates(role Role) {
 ```
 
 **逐行解释**：
-- **第 2416 行**：`retryUntilSnapshot` 从 ts-meta 获取最新快照，自动重试直到成功
-- **第 2423 行**：比较 Index，只有新快照的 Index 更大才更新（防止旧数据覆盖新数据）
-- **第 2424 行**：直接替换整个 `cacheData`（原子操作）
-- **第 2427-2430 行**：通过 `close(notifyC)` 通知所有调用 `WaitForDataChanged()` 的 goroutine
+- **第 2415 行**：`retryUntilSnapshot` 从 ts-meta 获取最新快照，自动重试直到成功
+- **第 2425 行**：比较 Index，只有新快照的 Index 更大才更新（防止旧数据覆盖新数据）
+- **第 2426 行**：直接替换整个 `cacheData`（原子操作）
+- **第 2429-2432 行**：通过 `close(notifyC)` 通知所有调用 `WaitForDataChanged()` 的 goroutine
 
 ### 4.2 V2 增量更新轮询
 
@@ -512,8 +514,28 @@ func (c *Client) applyDataOps(dataOps []string, index uint64, MaxCQChangeID uint
 **逐行解释**：
 - **第 2694 行**：先更新 Index 和 MaxCQChangeID
 - **第 2696-2713 行**：遍历每条变更命令，查找对应的 `applyFunc` 处理器执行
-- **第 2700 行**：`applyFunc` 是一个 map，映射 `Command_Type` 到处理函数（约 50 种命令类型）
+- **第 2701 行**：`applyFunc` 是一个 map，映射 `Command_Type` 到处理函数（约 56 种命令类型）
 - **第 2704 行**：`ApplyFuncErr` 是非致命错误（如数据库已存在），跳过继续处理
+
+**核心代码**：`lib/metaclient/meta_client_impl.go:2673-2685` — NoClear / AllClear 的实际分派点
+
+```go
+        if dataOps.Len() == 0 && dataOps.GetState() == int(meta2.NoClear) {
+            c.mu.Lock()
+            c.cacheData.Index = dataOps.GetIndex()
+            c.cacheData.MaxCQChangeID = dataOps.MaxCQChangeID
+            c.mu.Unlock()
+        } else if dataOps.Len() == 0 && dataOps.GetState() == int(meta2.AllClear) {
+            data := &meta2.Data{ExpandShardsEnable: c.cacheData.ExpandShardsEnable}
+            dataPb := dataOps.GetData()
+            data.Unmarshal(dataPb)
+            c.mu.Lock()
+            c.cacheData = data
+            c.mu.Unlock()
+        }
+```
+
+- 这段分支在 `getDataOps` 反序列化 `DataOps` 之后执行，**不在** `pollForUpdatesV2` 或 `applyDataOps` 内部；`retryUntilSnapshotV2` 随后只根据 `dataOps.Len()` 是否为 0 决定 `continue` 还是 `applyDataOps`
 
 **通俗解释**：
 - **V1（全量快照）**：每次轮询都传输完整的元数据，简单但网络开销大
@@ -597,7 +619,7 @@ func (c *Client) CreateDatabase(name string, enableTagArray bool, replicaN uint3
 ```
 
 **逐行解释**：
-- **第 1041 行**：数据库名称最长 256 字符
+- **第 1041 行**：数据库名称长度上限为 255 字符（`maxDbOrRpName` 为 256，判断写作 `strings.Count(name, "") > maxDbOrRpName`；`strings.Count` 返回长度为 +1，故实际允许 255 字符）
 - **第 1044 行**：`checkAndUpdateReplication` 校验副本数：必须为奇数，且与 HA 策略兼容
 - **第 1049 行**：先查本地缓存，如果已存在直接返回（幂等性）
 - **第 1063 行**：`retryUntilExec` 是核心方法，发送命令到 ts-meta 并等待本地缓存更新
@@ -740,7 +762,7 @@ var applyFunc = map[proto2.Command_Type]func(c *Client, op *proto2.Command) erro
     proto2.Command_CreateDbPtViewCommand:            applyCreateDbPtView,
     proto2.Command_UpdatePtInfoCommand:              applyUpdatePtInfo,
     proto2.Command_UpdateReplicationCommand:         applyUpdateReplication,
-    // ... 共约 50 种命令类型
+    // ... 共约 56 种命令类型
 }
 ```
 
@@ -1119,23 +1141,37 @@ func (c *Client) DataNode(id uint64) (*meta2.DataNode, error) {
     return nil, meta2.ErrNodeNotFound
 }
 
-// AliveReadNodes 返回可用的读节点列表（优先 Reader → Default → Writer）
 func (c *Client) AliveReadNodes() ([]meta2.DataNode, error) {
     c.mu.RLock()
     defer c.mu.RUnlock()
-    var aliveReaders, aliveDefault, aliveWriters []meta2.DataNode
+    var aliveReaders []meta2.DataNode
+    var aliveDefault []meta2.DataNode
+    var aliveWriters []meta2.DataNode
     for _, n := range c.cacheData.DataNodes {
-        if n.Status != serf.StatusAlive { continue }
-        switch n.Role {
-        case meta2.NodeReader:  aliveReaders = append(aliveReaders, n)
-        case meta2.NodeDefault: aliveDefault = append(aliveDefault, n)
-        case meta2.NodeWriter:  aliveWriters = append(aliveWriters, n)
+        if n.Status != serf.StatusAlive {
+            continue
+        }
+        if n.Role == meta2.NodeReader {
+            aliveReaders = append(aliveReaders, n)
+        } else if n.Role == meta2.NodeDefault {
+            aliveDefault = append(aliveDefault, n)
+        } else if n.Role == meta2.NodeWriter {
+            aliveWriters = append(aliveWriters, n)
         }
     }
-    // 优先级：Reader > Default > Writer
-    if len(aliveReaders) != 0 { return aliveReaders, nil }
-    if len(aliveDefault) != 0 { return aliveDefault, nil }
-    if len(aliveWriters) != 0 { return aliveWriters, nil }
+
+    if len(aliveReaders) != 0 {
+        sort.Sort(meta2.DataNodeInfos(aliveReaders))
+        return aliveReaders, nil
+    }
+    if len(aliveDefault) != 0 {
+        sort.Sort(meta2.DataNodeInfos(aliveDefault))
+        return aliveDefault, nil
+    }
+    if len(aliveWriters) != 0 {
+        sort.Sort(meta2.DataNodeInfos(aliveWriters))
+        return aliveWriters, nil
+    }
     return nil, fmt.Errorf("there is no data nodes for querying")
 }
 ```
@@ -1339,18 +1375,17 @@ sequenceDiagram
     participant SQL as ts-sql
     participant Auth as Auth 模块
     participant Cache as AuthCache
-    participant Meta as MetaClient 缓存
+    participant Meta as MetaClient
 
     User->>SQL: LOGIN admin password123
-    SQL->>Auth: Authenticate("admin", "password123")
-
-    Auth->>Auth: IsLockedUser("admin")?
+    SQL->>Meta: Authenticate("admin", "password123")
+    Meta->>Meta: IsLockedUser("admin")?
     alt 用户被锁定
-        Auth-->>SQL: ErrUserLocked
+        Meta-->>SQL: ErrUserLocked
     end
 
-    Auth->>Meta: GetUser("admin")
-    Meta-->>Auth: UserInfo{Hash: "#Ver:002#..."}
+    Meta->>Meta: GetUser("admin")
+    Meta->>Auth: Authenticate(userInfo, "password123")
     Auth->>Auth: CompareHashAndPlainPwd(hash, password)
 
     alt 密码匹配
@@ -1397,37 +1432,45 @@ func (a *Auth) authenticate(user *meta.UserInfo, password string) error {
 
 ### 10.2 密码哈希算法
 
-**核心代码**：`lib/metaclient/auth.go:263-286` — PBKDF2 哈希
+**核心代码**：`lib/metaclient/auth.go:265-286` — PBKDF2 哈希
 
 ```go
-// GenPbkdf2PwdVal 使用 PBKDF2 生成密码哈希
+// GenPbkdf2PwdVal generates the salted hash value of the password (using PBKDF2)
 func (a *Auth) GenPbkdf2PwdVal(password string) (string, error) {
+    // step 1. generate a salt and hash of the password for the cache
     salt, hashed, err := a.saltedPbkdf2(password, a.optAlgoVer)
     if err != nil {
+        logger.GetLogger().Error("saltedHash fail", zap.Error(err))
         return "", err
     }
 
+    // step 2. assemble (verFlag + salt + hashedVal(PBKDF2))
     var rstVal string
     switch a.optAlgoVer {
     case algoVer02:
-        rstVal = hashAlgoVerTwo    // "#Ver:002#" — PBKDF2 4096 次迭代
+        rstVal = hashAlgoVerTwo
     case algoVer03:
-        rstVal = hashAlgoVerThree  // "#Ver:003#" — PBKDF2 1000 次迭代
+        rstVal = hashAlgoVerThree
     default:
         rstVal = hashAlgoVerTwo
     }
-    rstVal += fmt.Sprintf("%02X", salt)   // 盐值（32 字节，十六进制编码）
-    rstVal += fmt.Sprintf("%02X", hashed) // 哈希值（32 字节，十六进制编码）
+    rstVal += fmt.Sprintf("%02X", salt)   // convert to  hex string
+    rstVal += fmt.Sprintf("%02X", hashed) // convert to hex string
     return rstVal, nil
 }
 ```
 
+- `algoVer02` 取 `pbkdf2Iter4096`（4096 次），`algoVer03` 取 `pbkdf2Iter1000`（1000 次），见 `lib/metaclient/auth.go:245-252`
+- `SaltBytes = 32`、`pbkdf2KeyLen = 32`，两者都以十六进制编码写入
+
 **三种哈希算法**：
 | 版本 | 标识 | 算法 | 迭代次数 |
 |------|------|------|---------|
-| V1 | `#Ver:001#` | SHA-256 + Salt | 1 |
+| V1 | `#Ver:001#` | SHA-256 + Salt（见下注） | 1 |
 | V2 | `#Ver:002#` | PBKDF2-SHA256 | 4096 |
 | V3 | `#Ver:003#` | PBKDF2-SHA256 | 1000 |
+
+> 注：V1 的 `hashWithSalt`（`lib/metaclient/auth.go:201-207`）写作 `hasher.Sum(buf)`，并没有把 salt+password 写入摘要，实际输出等价于 `salt || password || SHA256("")`，与函数名/注释表达的意图不符，疑似缺陷（未确认修复意图）。
 
 ### 10.3 登录失败锁定
 
@@ -1475,10 +1518,10 @@ classDiagram
     }
 
     class ReplicaInfo {
-        +Master PeerInfo
-        +Peers []PeerInfo
-        +ReplicaStatus uint32
-        +ReplicaRole uint32
+        +Master *PeerInfo
+        +Peers []*PeerInfo
+        +ReplicaStatus RGStatus
+        +ReplicaRole Role
         +Term uint64
     }
 
@@ -1697,33 +1740,42 @@ sequenceDiagram
 **核心代码**：`lib/metaclient/meta_client_impl.go:3699-3735`
 
 ```go
-// verifyDataNodeStatus 定期验证本节点在 ts-meta 中的状态
 func (c *Client) verifyDataNodeStatus(t time.Duration) {
-    if !VerifyNodeEn { return }
+    if !VerifyNodeEn {
+        return
+    }
+    tries := 0
+    triesPt := 0
+    begin := time.Now()
 
     var check = func() {
         err := c.retryVerifyDataNodeStatus()
         if err == nil {
-            return  // 状态正常
+            tries = 0
+            triesPt = 0
+            return
         }
-
         if errno.Equal(err, errno.PtNotFound) {
-            // Pt 未找到，可能是网络分区后数据迁移
-            // 超过配置的时间后自杀重启
+            if triesPt == 0 {
+                begin = time.Now()
+            }
+            triesPt++
+            checkTime := config.GetStoreConfig().RetryPtCheckTime
+
             if time.Since(begin) >= (time.Duration(checkTime) * time.Minute) {
+                c.logger.Error("Verify retry for pt", zap.String("duration", time.Since(begin).String()), zap.Error(err))
                 c.Suicide(err)
             }
             return
         }
-
-        // 连续 3 次失败，自杀重启
         tries++
+        c.logger.Error("Verify retry for node", zap.Int("tries", tries), zap.Error(err))
         if tries >= 3 {
             c.Suicide(err)
         }
     }
     check()
-    util.TickerRun(t, c.closing, check, func(){})
+    util.TickerRun(t, c.closing, check, func() {})
 }
 ```
 

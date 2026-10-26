@@ -1,5 +1,7 @@
 # Module 21: OpenTelemetry 集成深度审计报告（庖丁解牛版）
 
+> 基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）；代码快照：`_spec_verify_20260616/snapshots/spec-md-chinese`。
+
 > openGemini 原生支持 OpenTelemetry 协议（OTLP），可以直接接收 Traces、Metrics、Logs 三种信号，无需外部转换器。
 
 ---
@@ -58,28 +60,53 @@ graph TB
 **代码位置**：`lib/opentelemetry/otlp_metrics_writer.go`
 
 ```go
+// 第 142 行：enqueueMetrics — 按 Metric 类型分发到 enqueueGauges/Sums/Histogram/Summary
 func (c *OtlpMetricWriter) enqueueMetrics(ctx context.Context, resource pcommon.Resource, scope pcommon.InstrumentationScope, metrics pmetric.MetricSlice, batch otel2influx.InfluxWriterBatch) error {
-    // 遍历 ResourceMetrics → ScopeMetrics → Metric
-    for _, sm := range scopeMetrics {
+    metricTags := make(map[string]map[string]string)
+    metricFields := make(map[string]map[string]interface{})
+    metricTs := make(map[string]time.Time)
+    var err error
+    for i := 0; i < metrics.Len(); i++ {
+        metric := metrics.At(i)
         switch metric.Type() {
         case pmetric.MetricTypeGauge:
-            // Gauge: 每个数据点 → 一个 influx.Row
-            // tags = 数据点属性 + resource 属性 + instrumentation scope tags
-            // field = metricName → value (float64/int64)
+            err = c.enqueueGauges(ctx, resource, scope, metric.Name(), metric.Gauge(), metricTags, metricFields, metricTs, batch)
+            if err != nil {
+                return err
+            }
         case pmetric.MetricTypeSum:
-            // Sum: 同 Gauge，但有 cumulative/delta 区分
+            err = c.enqueueSums(ctx, resource, scope, metric.Name(), metric.Sum(), metricTags, metricFields, metricTs, batch)
+            if err != nil {
+                return err
+            }
         case pmetric.MetricTypeHistogram:
-            // Histogram: count, sum, min, max + 每个 bound 的累计 bucket count
+            err = c.enqueueHistogram(ctx, resource, scope, metric.Name(), metric.Histogram(), batch)
+            if err != nil {
+                return err
+            }
         case pmetric.MetricTypeSummary:
-            // Summary: count, sum + 每个 quantile 的值
+            err = c.enqueueSummary(ctx, resource, scope, metric.Name(), metric.Summary(), batch)
+            if err != nil {
+                return err
+            }
+        default:
+            return fmt.Errorf("unknown metric type %q", metric.Type())
         }
     }
+    for k, tags := range metricTags {
+        fields := metricFields[k]
+        ts := metricTs[k]
+        if err = batch.EnqueuePoint(ctx, scope.Name(), tags, fields, ts, common.InfluxMetricValueTypeUntyped); err != nil {
+            return fmt.Errorf("failed to write point for metrics: %w", err)
+        }
+    }
+    return nil
 }
 ```
 
 **真实写入规则**：
 
-- Gauge/Sum：`enqueueGauges()`、`enqueueSums()` 先按 datapoint attributes + resource attributes + instrumentation scope tags 分组，把多个 metric name 合并为同一行的多个 field；最后通过 `batch.EnqueuePoint(ctx, scope.Name(), tags, fields, ts, ...)` 写入，因此 measurement 是 `scope.Name()`。
+- Gauge/Sum：`enqueueGauges()`、`enqueueSums()` 先按 datapoint attributes 分组，再补 resource attributes 与 instrumentation scope tags，把多个 metric name 合并为同一行的多个 field；最后通过 `batch.EnqueuePoint(ctx, scope.Name(), tags, fields, ts, ...)` 写入，因此 measurement 是 `scope.Name()`（其中的 `/` 会被替换为 `-`，见 `lib/opentelemetry/otlp_writer.go:174`）。当前实现不区分 Sum 的 cumulative/delta。
 - Histogram/Summary：`enqueueHistogram()`、`enqueueSummary()` 直接以 `metric.Name()` 作为 measurement；Histogram 写 count、sum、min/max 以及每个 bound 的累计 bucket count，Summary 写 count、sum 和 quantile 字段。
 - Resource attributes、datapoint attributes 和 instrumentation scope tags 会进入 tags；`scope.Name()` 同时用于 Gauge/Sum 的 measurement。
 
@@ -92,7 +119,7 @@ OTLP Metric 输入:
   value: 1000
   labels: {method="GET", status="200"}
   scope: {name="runtime"}
-  resource: {service.name="my-service"}
+  resource: {service.name="my-service", telemetry.sdk.language="go"}
 
 转换后的 influx.Row:
   Name: "runtime"             ← Gauge/Sum 使用 scope.Name() 作为 measurement
@@ -100,7 +127,8 @@ OTLP Metric 输入:
     {method, GET},
     {status, 200},
     {service.name, my-service},
-    {telemetry.sdk.language, go}
+    {telemetry.sdk.language, go},
+    {otel.library.name, runtime}
   ]
   Fields: [
     {http_requests_total, 1000, INTEGER}
@@ -120,11 +148,11 @@ OTLP Histogram 输入:
 
 转换后的 influx.Row:
   Name: "http_request_duration_seconds"   ← Histogram 使用 metric.Name()
-  Fields: count, sum, min/max(若存在), "0.05", "0.1", "0.2", "Inf"
+  Fields: count, sum, min/max(若存在), "0.05", "0.1", "0.2", "+Inf"
 ```
 
-Histogram 的 bucket 字段名直接使用 bound 字符串，最后一个正无穷 bucket 使用 `Inf` key；当前实现不会添加 Prometheus 风格的 `le_` 前缀。
-字段值是累计 bucket count：`"0.05"=24054`，`"0.1"=24054+9390`，`"0.2"=24054+9390+66948`，`"Inf"=145320`。
+Histogram 的 bucket 字段名直接使用 bound 字符串，最后一个正无穷 bucket 使用 `+Inf` key；当前实现不会添加 Prometheus 风格的 `le_` 前缀。
+字段值是累计 bucket count：`"0.05"=24054`，`"0.1"=24054+9390`，`"0.2"=24054+9390+66948`，`"+Inf"=145320`。
 
 ---
 

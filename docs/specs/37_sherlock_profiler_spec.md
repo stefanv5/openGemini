@@ -1,5 +1,7 @@
 # Module 37: Sherlock 性能剖析器深度审计报告
 
+> 代码基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）；本文行号与代码摘录均以 `_spec_verify_20260616/snapshots/spec-md-chinese` 为准。
+
 > Sherlock 是 openGemini 内置的自动性能剖析（Profiling）模块。它默认关闭；只有配置 `sherlock-enable = true` 并启用具体 profile 类型后，才会持续监控 CPU 使用率、内存占用和 goroutine 数量，并在指标满足预设规则时自动 dump pprof 文件。
 
 ---
@@ -24,7 +26,7 @@ sequenceDiagram
         alt 满足规则且不在冷却期
             Rule->>Dump: 触发 profile dump
             Dump->>Disk: 写入 .pb.gz 文件
-            Note over Disk: cpu.20240101120000.pb.gz<br/>mem.20240101120000.pb.gz<br/>goroutine.20240101120000.pb.gz
+            Note over Disk: openGemini.cpu.20240101120000.000.pb.gz<br/>openGemini.mem.20240101120000.000.pb.gz<br/>openGemini.goroutine.20240101120000.000.pb.gz
         else 不满足或在冷却期
             Note over S: 跳过本轮
         end
@@ -105,6 +107,7 @@ func New(opts ...Option) *Sherlock {
 
 ```go
 s := sherlock.New(
+    sherlock.WithLogger(logger.NewLogger(errno.ModuleUnknown)),  // 必须注入：Start() 首行就会使用 logger
     sherlock.WithMonitorInterval(10 * time.Second),
     sherlock.WithCPUMax(90),
     sherlock.WithSavePath("/tmp"),
@@ -125,7 +128,7 @@ defer s.Stop()
 
 ### 3.1 全局选项
 
-**代码位置**：`lib/sherlock/options.go:51-87`
+**代码位置**：`lib/sherlock/options.go:51-64`
 
 ```go
 type options struct {
@@ -186,9 +189,9 @@ type commonOption struct {
 |------|-----------|-------------|------------|----------|
 | CPU | 10% | 25% | 70% | 1 分钟 |
 | 内存 | 10% | 25% | 80% | 1 分钟 |
-| goroutine | 3000 | 20% | 200000 | 10 分钟 |
+| goroutine | 3000 | 20% | 200000 | 10 分钟（`lib/sherlock` 默认）；经 openGemini 配置启动时为 **1 分钟** |
 
-以上是规则阈值默认值；CPU、内存、goroutine 三类 dump 的 `enable` 默认都是 false。
+以上是规则阈值默认值；CPU、内存、goroutine 三类 dump 的 `enable` 默认都是 false。注意上表是 `lib/sherlock` 的库默认：`config.NewSherlockConfig()` 给 CPU/Memory/Goroutine 三者的 `CoolDown` 都赋 `defaultCoolDown`（1 分钟），`services/sherlock` 再用 `WithGrtRule(..., c.GoroutineConfig.CoolDown)` 覆盖，因此以服务方式运行时 goroutine 冷却默认是 1 分钟。
 
 ---
 
@@ -255,17 +258,31 @@ func collectMetrics(cpuCore int, memoryLimit uint64) (int, int, int, error) {
 
 ```go
 func getUsage() (float64, uint64, int, error) {
-    p, _ := process.NewProcess(int32(os.Getpid()))
+    p, err := process.NewProcess(int32(os.Getpid()))
+    if err != nil {
+        return 0, 0, 0, err
+    }
 
     var cpuPercent float64
     if isContainer() {
-        cpuUsage, _ := cgroup2.GetUsage(time.Second)
+        var cpuUsage float64
+        cpuUsage, err = cgroup2.GetUsage(time.Second)
+        if err != nil {
+            return 0, 0, 0, err
+        }
         cpuPercent = cpuUsage * 100  // 容器环境使用 cgroup 采集
     } else {
-        cpuPercent, _ = p.Percent(time.Second)  // 物理机使用 gopsutil
+        cpuPercent, err = p.Percent(time.Second)  // 物理机使用 gopsutil
+        if err != nil {
+            return 0, 0, 0, err
+        }
     }
 
-    mem, _ := p.MemoryInfo()
+    mem, err := p.MemoryInfo()
+    if err != nil {
+        return 0, 0, 0, err
+    }
+
     rss := mem.RSS
     gNum := runtime.NumGoroutine()
     return cpuPercent, rss, gNum, nil
@@ -276,9 +293,20 @@ func getUsage() (float64, uint64, int, error) {
 
 ```go
 func getUsage() (float64, uint64, int, error) {
-    p, _ := process.NewProcess(int32(os.Getpid()))
-    cpuPercent, _ := p.Percent(time.Second)
-    mem, _ := p.MemoryInfo()
+    p, err := process.NewProcess(int32(os.Getpid()))
+    if err != nil {
+        return 0, 0, 0, err
+    }
+    cpuPercent, err := p.Percent(time.Second)
+    if err != nil {
+        return 0, 0, 0, err
+    }
+
+    mem, err := p.MemoryInfo()
+    if err != nil {
+        return 0, 0, 0, err
+    }
+
     rss := mem.RSS
     gNum := runtime.NumGoroutine()
     return cpuPercent, rss, gNum, nil
@@ -290,13 +318,16 @@ func getUsage() (float64, uint64, int, error) {
 ```go
 func isContainer() bool {
     // 检查 /.dockerenv 文件
-    _, err := os.Stat("/.dockerenv")
+    _, err := os.Stat(FileDotDockerEnv)
     if err == nil {
         return true
     }
     // 检查 /proc/1/cgroup 中的容器标识
-    content, _ := os.ReadFile("/proc/1/cgroup")
-    return containerRegexp.Match(content)
+    content, err := os.ReadFile(FileCgroup)
+    if err != nil {
+        return false
+    }
+    return containerRegexp.FindString(string(content)) != ""
 }
 ```
 
@@ -306,7 +337,7 @@ func isContainer() bool {
 
 ### 5.1 数据结构
 
-**代码位置**：`lib/sherlock/circle.go:17-65`
+**代码位置**：`lib/sherlock/circle.go:17-22`
 
 ```go
 type MetricCircle struct {
@@ -419,22 +450,23 @@ flowchart TD
     B -->|否| C[不触发: RuleHistoryLessMin]
     B -->|是| D{当前值 > Abs?}
     D -->|是| E[触发: RuleCurGreaterAbs]
-    D -->|否| F{当前值 >= 均值 * 100+Diff/100?}
+    D -->|否| F{"当前值 >= 均值*(100+Diff)/100?"}
     F -->|是| G[触发: RuleDiff]
     F -->|否| H[不触发: RuleCurlGreaterMin]
 ```
 
 **通俗解释**：
-规则匹配就像"报警器"，有两个触发条件（满足任一即触发）：
+规则匹配就像"报警器"。**共同前提**：最近 10 次采样（含本次）必须全部 >= 最小阈值，否则直接返回不触发——这个前提同时压制下面两个条件（启动初期即使当前值超过 Abs 也不会 dump）。
 
 **条件 1：绝对阈值**
-- 当前值 > 绝对阈值 → 立即报警
+- 当前值 > 绝对阈值 → 触发
 - 例：内存使用率 > 80% → dump 内存 profile
 
 **条件 2：相对增长**
-- 前提：最近 10 次采样全部 >= 最小阈值（排除启动初期的噪声）
-- 当前值 >= 历史均值 * (100 + diff) / 100 → 报警
+- 当前值 >= 历史均值 * (100 + diff) / 100 → 触发（均值是最近 10 次含本次的整数均值）
 - 例：CPU 使用率 >= 历史均值的 125% → dump CPU profile
+
+两个条件满足任一即触发；都不满足时返回 `RuleCurlGreaterMin`。
 
 **具体例子**：
 
@@ -443,35 +475,34 @@ flowchart TD
 含义：Min=10%, Diff=25%, Abs=80%
 
 场景 1：启动初期
-  历史数据 = [2, 3, 5, 4, 3, 2, 4, 3, 5, 4]
-  当前值 = 15%
+  窗口内最近 10 次（含本次）= [2, 3, 5, 4, 3, 2, 4, 3, 5, 15]
   → 检查：历史数据不全部 >= 10%（有 2, 3, 5...）
   → 结果：不触发（RuleHistoryLessMin）
 
 场景 2：正常运行，小幅波动
-  历史数据 = [30, 32, 31, 33, 30, 32, 31, 33, 30, 32]
-  当前值 = 35%
+  窗口内最近 10 次（含本次）= [30, 32, 31, 33, 30, 32, 31, 33, 30, 32]
   → 检查：历史数据全部 >= 10% ✓
-  → 当前值 35% < 80%（Abs）
-  → 均值 = 31.4，阈值 = 31.4 * 1.25 = 39.25
-  → 当前值 35% < 39.25%
+  → 当前值 32% < 80%（Abs）
+  → 均值 = 314 / 10 = 31（int），阈值 = 31 * 125 / 100 = 38（整数除法）
+  → 当前值 32% < 38%
   → 结果：不触发（RuleCurlGreaterMin）
 
 场景 3：内存飙升
-  历史数据 = [30, 32, 31, 33, 30, 32, 31, 33, 30, 32]
-  当前值 = 85%
+  窗口内最近 10 次（含本次）= [30, 32, 31, 33, 30, 32, 31, 33, 30, 85]
   → 检查：历史数据全部 >= 10% ✓
   → 当前值 85% > 80%（Abs）
   → 结果：触发（RuleCurGreaterAbs）→ dump 内存 profile
 
 场景 4：内存持续增长
-  历史数据 = [50, 52, 51, 53, 50, 52, 51, 53, 50, 52]
-  当前值 = 68%
+  窗口内最近 10 次（含本次）= [50, 52, 51, 53, 50, 52, 51, 53, 50, 52]
   → 检查：历史数据全部 >= 10% ✓
-  → 当前值 68% < 80%（Abs）
-  → 均值 = 51.4，阈值 = 51.4 * 1.25 = 64.25
-  → 当前值 68% >= 64.25%
-  → 结果：触发（RuleDiff）→ dump 内存 profile
+  → 当前值 52% < 80%（Abs）
+  → 均值 = 514 / 10 = 51（int），阈值 = 51 * 125 / 100 = 63（整数除法）
+  → 当前值 52% < 63% → 不触发（RuleCurlGreaterMin）
+
+  若当前值升到 68%（窗口变为 [52, 51, 53, 50, 52, 51, 53, 50, 52, 68]）：
+  → 均值 = 532 / 10 = 53，阈值 = 53 * 125 / 100 = 66
+  → 当前值 68% >= 66% → 触发（RuleDiff）→ dump 内存 profile
 ```
 
 ---
@@ -540,16 +571,38 @@ func (s *Sherlock) startDumpLoop() {
     for {
         select {
         case <-s.stop:
+            s.opts.logger.Info("[Sherlock] dump loop stopped")
             return
         case <-ticker.C:
         }
 
         // 获取 CPU 核数和内存限制
-        cpuCore, memoryLimit := s.getSystemResources()
+        var cpuCore int
+        if s.isContainer {
+            limit, err := cgroup.GetCPULimit()
+            if err != nil {
+                s.opts.logger.Error("[Sherlock] get CPU core from container env failed", zap.Error(err))
+                return
+            }
+            cpuCore = int(limit)
+        } else {
+            cpuCore = cpu.GetCpuNum()
+        }
+        if cpuCore == 0 {
+            s.opts.logger.Error("[Sherlock] get CPU core failed", zap.Int("core", cpuCore))
+            return
+        }
+
+        memoryLimit, err := s.getMemoryLimit()
+        if memoryLimit == 0 || err != nil {
+            s.opts.logger.Error("[Sherlock] get memory limit failed", zap.Uint64("memory", memoryLimit), zap.Error(err))
+            return
+        }
 
         // 采集指标
         cpuN, memN, gNum, err := s.collectFn(cpuCore, memoryLimit)
         if err != nil {
+            s.opts.logger.Error("[Sherlock] failed to collect metrics usage", zap.Error(err))
             continue
         }
 
@@ -565,6 +618,7 @@ func (s *Sherlock) startDumpLoop() {
 
         // CPU 过高则禁止 dump
         if err = s.enableDump(cpuN); err != nil {
+            s.opts.logger.Info("[Sherlock] unable to dump", zap.Error(err))
             continue
         }
 
@@ -597,7 +651,7 @@ sequenceDiagram
     participant Rule as memProfile()
     participant Match as matchRule()
     participant pprof as pprof.Lookup("heap")
-    participant File as writeFile()
+    participant File as writeProfileDataToFile()
 
     Check->>Cool: 检查冷却时间
     alt 在冷却期内
@@ -613,7 +667,7 @@ sequenceDiagram
             Rule->>pprof: Lookup("heap").WriteTo(&buf, 0)
             pprof-->>Rule: heap profile 数据
             Rule->>File: writeProfileDataToFile(buf, Memory)
-            File-->>Rule: filename
+            File-->>Rule: 无返回值（内部写文件并记日志）
             Rule-->>Check: true
             Check->>Check: 更新冷却时间
             Check->>Check: memTriggerCount++
@@ -631,6 +685,7 @@ func (s *Sherlock) memCheckAndDump(mem int) {
     }
     // 冷却检查
     if s.memCoolDownTime.After(time.Now()) {
+        // ...
         return
     }
     // 规则匹配
@@ -643,8 +698,10 @@ func (s *Sherlock) memCheckAndDump(mem int) {
 func (s *Sherlock) memProfile(rss int, c commonOption) bool {
     match, _ := matchRule(s.memStats, rss, c.TriggerMin, c.TriggerDiff, c.TriggerAbs)
     if !match {
+        // ...
         return false
     }
+    // ...
     var buf bytes.Buffer
     err := pprof.Lookup("heap").WriteTo(&buf, 0)  // dump heap profile
     if err != nil {
@@ -661,8 +718,8 @@ func (s *Sherlock) memProfile(rss int, c commonOption) bool {
 - **第 210 行**：`memProfile` 执行规则匹配和 dump
 - **第 211 行**：触发后更新冷却时间
 - **第 218 行**：`matchRule` 检查是否满足触发条件
-- **第 224 行**：`pprof.Lookup("heap")` 获取 heap profile
-- **第 228 行**：写入文件
+- **第 231 行**：`pprof.Lookup("heap")` 获取 heap profile
+- **第 236 行**：写入文件
 
 ---
 
@@ -679,6 +736,7 @@ func (s *Sherlock) cpuCheckAndDump(cpu int) {
         return
     }
     if s.cpuCoolDownTime.After(time.Now()) {
+        // ...
         return
     }
     if triggered := s.cpuProfile(cpu, cpuOpts); triggered {
@@ -690,9 +748,10 @@ func (s *Sherlock) cpuCheckAndDump(cpu int) {
 func (s *Sherlock) cpuProfile(curCPUUsage int, c commonOption) bool {
     match, _ := matchRule(s.cpuStats, curCPUUsage, c.TriggerMin, c.TriggerDiff, c.TriggerAbs)
     if !match {
+        // ...
         return false
     }
-
+    // ...
     bf, filename, err := createAndGetFileInfo(s.opts.dumpOptions, CPU)
     if err != nil {
         return false
@@ -705,6 +764,7 @@ func (s *Sherlock) cpuProfile(curCPUUsage int, c commonOption) bool {
     }
     time.Sleep(defaultCPUSamplingTime)  // 采样 10 秒
     pprof.StopCPUProfile()
+    // ...
     return true
 }
 ```
@@ -735,9 +795,10 @@ func (s *Sherlock) goroutineProfile(gNum int, c grtOptions) bool {
         match = false
     }
     if !match {
+        // ...
         return false
     }
-
+    // ...
     var buf bytes.Buffer
     err := pprof.Lookup("goroutine").WriteTo(&buf, 0)  // dump goroutine profile
     if err != nil {
@@ -775,7 +836,7 @@ func formatFilename(filePath string, dumpType configureType, pName string) strin
 **文件名格式**：
 
 ```
-格式：{进程名}.{类型}.{时间戳}.pb.gz
+格式：{进程名}.{类型}.{YYYYMMDDHHMMSS.mmm}.pb.gz（时间段来自 `20060102150405.000`，含毫秒）
 
 示例：
   openGemini.cpu.20240101120000.123.pb.gz
@@ -798,7 +859,7 @@ func rotateProfilesFiles(directory string, dumpType configureType, maxNum int, m
     if err != nil {
         return err
     }
-    // 删除多余文件
+    // 删除多余文件（files 仍包含刚被删除的过期项）
     err = deleteRedundantProfileFiles(files, directory, maxNum)
     return err
 }
@@ -813,8 +874,8 @@ flowchart TD
     C --> D{文件修改时间 > maxAge?}
     D -->|是| E[os.Remove 删除]
     D -->|否| F[保留]
-    B --> G[删除多余文件]
-    G --> H{文件数 > maxNum?}
+    C --> G[删除多余文件]
+    G --> H{"文件数 > maxNum?（files 含已删项）"}
     H -->|是| I[按修改时间排序<br/>删除最旧的]
     H -->|否| J[保留]
 ```
@@ -849,33 +910,35 @@ func deleteRedundantProfileFiles(files []os.FileInfo, directory string, maxNum i
 **具体例子**：
 
 ```
-配置：maxNum=5, maxAge=7天
+配置：maxNum=5, maxAge=7天（maxNum / maxAge 都按类型分别生效）
 
 当前文件列表（按修改时间排序）：
-  1. openGemini.cpu.20231220120000.pb.gz  ← 12天前，过期
-  2. openGemini.cpu.20231225120000.pb.gz  ← 7天前，过期
-  3. openGemini.cpu.20231227120000.pb.gz  ← 5天前
-  4. openGemini.cpu.20231229120000.pb.gz  ← 3天前
-  5. openGemini.cpu.20231230120000.pb.gz  ← 2天前
-  6. openGemini.cpu.20231231120000.pb.gz  ← 1天前
-  7. openGemini.mem.20231231120000.pb.gz  ← 1天前
-  8. openGemini.mem.20231231180000.pb.gz  ← 6小时前
+  1. openGemini.cpu.20231220120000.000.pb.gz  ← 12天前，过期
+  2. openGemini.cpu.20231224120000.000.pb.gz  ← 8天前，过期
+  3. openGemini.cpu.20231227120000.000.pb.gz  ← 5天前
+  4. openGemini.cpu.20231229120000.000.pb.gz  ← 3天前
+  5. openGemini.cpu.20231230120000.000.pb.gz  ← 2天前
+  6. openGemini.cpu.20231231120000.000.pb.gz  ← 1天前
+  7. openGemini.mem.20231231120000.000.pb.gz  ← 1天前
+  8. openGemini.mem.20231231180000.000.pb.gz  ← 6小时前
 
-清理过程：
-  步骤 1: 删除过期文件（>7天）
-    → 删除 #1, #2
+清理过程（CPU、Mem 各自独立轮转）：
+  步骤 1: 删除过期文件（ModTime 超过 maxAge）
+    → CPU 删除 #1, #2；Mem 无过期文件
 
-  步骤 2: 删除多余文件（>5个）
-    → 剩余 6 个 CPU 文件 + 2 个 Mem 文件
-    → CPU 文件数 6 > 5，删除最旧的 #3
-    → Mem 文件数 2 <= 5，不删除
+  步骤 2: 删除多余文件（len(files) > maxNum，排序后删最旧）
+    → CPU 剩 4 个（#3-#6），4 <= 5，不删除
+    → Mem 2 个 <= 5，不删除
+    → 注意：删除过期文件后 files 切片并未移除这些条目；一旦数量超限，
+      排序后最旧的正是刚删掉的项，os.Remove 静默失败，本轮实际文件数可能仍多于 maxNum
 
-最终结果：
-  openGemini.cpu.20231229120000.pb.gz
-  openGemini.cpu.20231230120000.pb.gz
-  openGemini.cpu.20231231120000.pb.gz
-  openGemini.mem.20231231120000.pb.gz
-  openGemini.mem.20231231180000.pb.gz
+最终结果（CPU 4 个 + Mem 2 个）：
+  openGemini.cpu.20231227120000.000.pb.gz
+  openGemini.cpu.20231229120000.000.pb.gz
+  openGemini.cpu.20231230120000.000.pb.gz
+  openGemini.cpu.20231231120000.000.pb.gz
+  openGemini.mem.20231231120000.000.pb.gz
+  openGemini.mem.20231231180000.000.pb.gz
 ```
 
 ---
@@ -896,6 +959,8 @@ func (s *Sherlock) DisableMemDump() { s.opts.memOpts.Enable = false }
 func (s *Sherlock) EnableGrtDump()  { s.opts.grtOpts.Enable = true }
 func (s *Sherlock) DisableGrtDump() { s.opts.grtOpts.Enable = false }
 ```
+
+**注意**：这些方法直接写 `opts.*.Enable`，而 `startDumpLoop` 在另一个 goroutine 里无锁读取同一字段；只应在 `Start()` 之前调用，运行期调用会构成数据竞争。
 
 ### 12.2 CPUMaxPercent 保护
 
@@ -989,34 +1054,36 @@ sequenceDiagram
     end
 
     Note over Sherlock: ===== 第 3 天 14:00：触发 dump =====
-    Sherlock->>Sherlock: matchRule(历史均值=50%, 当前=68%)
-    Note over Sherlock: 68% >= 50% * 1.25 = 62.5% → 触发！
+    Sherlock->>Sherlock: matchRule(历史均值=53, 当前=68)
+    Note over Sherlock: 68 >= 53 * 125 / 100 = 66（整数除法）→ 触发！
     Sherlock->>App: pprof.Lookup("heap").WriteTo()
     App-->>Sherlock: heap profile 数据
-    Sherlock->>Disk: 写入 openGemini.mem.20240103140000.pb.gz
+    Sherlock->>Disk: 写入 openGemini.mem.20240103140000.000.pb.gz
 
     Note over Sherlock: ===== 第 3 天 14:01：绝对阈值触发 =====
     Sherlock->>App: 采集内存使用率
     App-->>Sherlock: 82%
     Sherlock->>Sherlock: matchRule(82% > 80% Abs)
     Sherlock->>App: pprof.Lookup("heap").WriteTo()
-    Sherlock->>Disk: 写入 openGemini.mem.20240103140100.pb.gz
+    Sherlock->>Disk: 写入 openGemini.mem.20240103140100.000.pb.gz
 
     Note over Sherlock: ===== 第 4 天：开发人员分析 =====
     Dev->>Disk: 下载 .pb.gz 文件
-    Dev->>Dev: go tool pprof openGemini.mem.20240103140000.pb.gz
+    Dev->>Dev: go tool pprof openGemini.mem.20240103140000.000.pb.gz
     Dev->>Dev: 分析 top/list/web
     Note over Dev: 发现：series 缓存未释放<br/>根因：某个 map 的 key 未清理
 ```
 
 ### 14.2 分析 Profile 文件
 
+> 输出为示意：`SeriesCache` 等符号在快照中并不存在，仅用于演示 pprof 的阅读方式。
+
 ```bash
-# 下载 dump 文件
-scp server:/tmp/openGemini.mem.20240103140000.pb.gz ./
+# 下载 dump 文件（服务默认路径为 <openGeminiDir>/sherlock）
+scp server:<openGeminiDir>/sherlock/openGemini.mem.20240103140000.000.pb.gz ./
 
 # 分析内存 profile
-go tool pprof openGemini.mem.20240103140000.pb.gz
+go tool pprof openGemini.mem.20240103140000.000.pb.gz
 
 # 查看 top 热点
 (pprof) top
@@ -1085,20 +1152,23 @@ func rotateProfilesFiles(directory string, dumpType configureType, maxNum int, m
 ```
 
 **隐患**：
-- `listProfileFiles` 只列出匹配特定 glob 模式的文件
-- 如果文件名格式变化，旧文件可能不会被清理
-- 建议：添加更通用的清理策略
+- `listProfileFiles` 只列出匹配特定 glob 模式的文件；文件名格式变化时旧文件不会被清理
+- `deleteOldProfileFiles` 删除过期文件后没有从 `files` 切片移除这些条目，`deleteRedundantProfileFiles` 仍按旧长度取 `files[:len(files)-maxNum]`，排序后最旧的正是刚被删掉的项，`os.Remove` 静默失败，本轮实际文件数可能仍超过 maxNum
+- 建议：删过期后重新列目录，或先过滤切片再按数量裁剪
 
 ### 15.4 容器环境检测不可靠
 
 ```go
 func isContainer() bool {
-    _, err := os.Stat("/.dockerenv")
+    _, err := os.Stat(FileDotDockerEnv)
     if err == nil {
         return true
     }
-    content, _ := os.ReadFile("/proc/1/cgroup")
-    return containerRegexp.Match(content)
+    content, err := os.ReadFile(FileCgroup)
+    if err != nil {
+        return false
+    }
+    return containerRegexp.FindString(string(content)) != ""
 }
 ```
 

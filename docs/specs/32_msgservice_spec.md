@@ -1,5 +1,7 @@
 # Module 32: Service Message Bus 深度审计报告（庖丁解牛版）
 
+> 基线：openGemini `origin/docs/spec-md-chinese` @ `9717d662`（2026-04-11）。本文所有 `file:line` 与行号均以该快照为准。
+
 > openGemini 的 `lib/msgservice/` 是集群内部服务间通信的消息总线。它定义了统一的消息注册、序列化、路由和异步响应机制，是 ts-sql 与 ts-store / ts-meta 之间 DDL 操作、数据写入、Raft 消息传递等核心 RPC 的基础设施。
 
 ---
@@ -110,11 +112,11 @@ const (
 
     // ... 更多消息类型 ...
 
-    RaftMessagesRequestMessage            // 25
-    RaftMessagesResponseMessage           // 26
+    RaftMessagesRequestMessage            // 23
+    RaftMessagesResponseMessage           // 24
 
-    DropSeriesRequestMessage              // 27
-    DropSeriesResponseMessage             // 28
+    DropSeriesRequestMessage              // 25
+    DropSeriesResponseMessage             // 26
 )
 ```
 
@@ -190,8 +192,8 @@ func init() {
 
 ```go
 type BinaryCodec interface {
-    MarshalBinary() ([]byte, error)
-    UnmarshalBinary(buf []byte) error
+    MarshalBinary() (data []byte, err error)
+    UnmarshalBinary(data []byte) error
 }
 ```
 
@@ -213,6 +215,10 @@ type BaseMessage struct {
 
 func (bm *BaseMessage) Marshal(buf []byte) ([]byte, error) {
     marshal, err := bm.Data.MarshalBinary()
+    if err != nil {
+        return nil, err
+    }
+
     buf = append(buf, bm.Typ)    // 第 1 字节：类型 ID
     buf = append(buf, marshal...) // 剩余字节：序列化数据
     return buf, err
@@ -251,6 +257,9 @@ type DDLMessage struct {
 }
 
 func (m *DDLMessage) Unmarshal(buf []byte) error {
+    if len(buf) == 0 {
+        return errno.NewError(errno.ShortBufferSize, 0, 0)
+    }
     m.Typ = buf[0]                          // 读取类型 ID
 
     msgFn, ok := MessageBinaryCodec[m.Typ]  // 查找工厂函数
@@ -294,7 +303,7 @@ func (r *WritePointsRequest) Unmarshal(buf []byte) error {
 
 ### 4.4 RaftMessagesRequest — Raft 消息传递
 
-**代码位置**：`lib/msgservice/request.go:511-548`
+**代码位置**：`lib/msgservice/request.go:511-525`
 
 ```go
 type RaftMessagesRequest struct {
@@ -319,14 +328,18 @@ Raft 节点之间需要交换投票、日志复制等消息。RaftMessagesReques
 
 ### 4.5 WriteStreamPointsRequest — 流式写入请求
 
-**代码位置**：`lib/msgservice/message.go:433-515`
+**代码位置**：`lib/msgservice/message.go:433-436` — WriteStreamPointsRequest
 
 ```go
 type WriteStreamPointsRequest struct {
     points     []byte         // 序列化后的行数据
     streamVars []*StreamVar   // 流式变量（StreamOnly 标记 + StreamId 列表）
 }
+```
 
+**代码位置**：`lib/msgservice/message.go:399-402` — StreamVar
+
+```go
 type StreamVar struct {
     Only bool     // 是否仅为流任务数据
     Id   []uint64 // 关联的 Stream 任务 ID
@@ -342,7 +355,7 @@ type StreamVar struct {
 
 ### 5.1 结构体
 
-**代码位置**：`lib/msgservice/requester.go:32-49`
+**代码位置**：`lib/msgservice/requester.go:32-40`
 
 ```go
 type Requester struct {
@@ -480,16 +493,15 @@ type Callback interface {
 classDiagram
     class Callback {
         <<interface>>
-        +Handle(interface{}) error
+        +Handle(any) error
         +GetCodec() Codec
-        +GetResponse() interface{}
     }
 
     class DDLCallback {
-        +data interface{}
+        +data any
         +Handle(data) error
         +GetCodec() DDLMessage
-        +GetResponse() interface{}
+        +GetResponse() any
     }
 
     class WritePointsCallback {
@@ -498,22 +510,34 @@ classDiagram
         +GetCodec() WritePointsResponse
     }
 
+    class WriteBlobsCallback {
+        +data *WriteBlobsResponse
+        +Handle(data) error
+        +GetCodec() WriteBlobsResponse
+    }
+
+    class WriteStreamPointsCallback {
+        +data *WriteStreamPointsResponse
+        +Handle(data) error
+        +GetCodec() WriteStreamPointsResponse
+    }
+
     class RaftMsgCallback {
-        +data interface{}
+        +data any
         +Handle(data) error
         +GetCodec() RaftMsgMessage
-        +GetResponse() interface{}
+        +GetResponse() any
     }
 
     class SysCtrlCallback {
-        +data interface{}
+        +data any
         +Handle(data) error
         +GetCodec() SysCtrlResponse
-        +GetResponse() interface{}
+        +GetResponse() any
     }
 
     class MigratePtCallback {
-        +data interface{}
+        +data any
         +fn func(error)
         +Handle(data) error
         +SetCallbackFn(fn)
@@ -521,6 +545,8 @@ classDiagram
 
     Callback <|.. DDLCallback
     Callback <|.. WritePointsCallback
+    Callback <|.. WriteBlobsCallback
+    Callback <|.. WriteStreamPointsCallback
     Callback <|.. RaftMsgCallback
     Callback <|.. SysCtrlCallback
     Callback <|.. MigratePtCallback
@@ -572,6 +598,10 @@ type MigratePtCallback struct {
 
 func (c *MigratePtCallback) Handle(data interface{}) error {
     msg, ok := data.(*PtResponse)
+    if !ok {
+        return errno.NewInvalidTypeError("*msgservice.PtMessage", data)
+    }
+
     c.data = msg
     c.fn(msg.Error())  // 调用回调函数
     return nil
@@ -603,13 +633,13 @@ sequenceDiagram
     Req->>Req: DDL()
 
     Req->>DDL: NewDDLMessage(DeleteRequestMessage, req)
-    DDL->>DDL: Marshal → [1B:14][NB:protobuf]
+    DDL->>DDL: Marshal → [1B:13][NB:protobuf]
 
     Req->>SP: NewTransport(nodeID, DDLRequest, cb)
     SP->>SP: Send(marshalled)
     SP->>Store: 网络传输
 
-    Store->>Store: Unmarshal → Typ=14 → DeleteRequest
+    Store->>Store: Unmarshal → Typ=13 → DeleteRequest
     Store->>Store: 执行删除操作
     Store-->>SP: DeleteResponse
 
@@ -713,7 +743,7 @@ sequenceDiagram
 
 ### 8.1 统一错误序列化
 
-**代码位置**：`lib/msgservice/message_types.go:275-300`
+**代码位置**：`lib/msgservice/request.go:275-300`
 
 ```go
 func NormalizeError(errStr *string) error {
@@ -736,10 +766,11 @@ func MarshalError(e error) *string {
     switch stdErr := e.(type) {
     case *errno.Error:
         dst = encoding.MarshalUint16(dst, uint16(stdErr.Errno()))
+        return proto.String(bytesutil.ToUnsafeString(dst) + e.Error())
     default:
-        dst = encoding.MarshalUint16(dst, 0)  // 通用错误码为 0
+        dst = encoding.MarshalUint16(dst, 0)
+        return proto.String(bytesutil.ToUnsafeString(dst) + e.Error())
     }
-    return proto.String(bytesutil.ToUnsafeString(dst) + e.Error())
 }
 ```
 
@@ -791,7 +822,7 @@ func (e PartialWriteError) Error() string {
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `retryInterval` | 100ms | 重试间隔 |
+| `retryInterval` | 100ms | 已声明但当前 `lib/msgservice/` 内无任何引用（未使用） |
 | `defaultTimeout` | 30s | `Requester.timeout` 字段默认值；当前 `Request()` 不消费 |
 | `RaftMsgTimeout` | 15s | Raft 消息超时 |
 | `readTimeOut` | 30min | `NewTransport` 有效超时（查询/DDL 等普通请求） |
